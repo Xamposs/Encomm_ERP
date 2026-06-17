@@ -43,14 +43,43 @@ def main():
 
     logging.info("=== ENCOMM ERP STARTED ===")
     logging.info(f"Database location: {config['db_path']}")
-    logging.info(f"VAT rate configured: {config['vat_rate'] * 100}%")
-    logging.info(f"Low Stock warning limit: {config['low_stock_threshold']} units")
-    logging.info(f"Expiry date warning limit: {config['expiry_alert_days']} days")
 
     try:
         # 1. Initialize SQLite Database Infrastructure
         db_service = DatabaseService(db_path=config["db_path"])
-        
+
+        # 2. Hydrate config from DB (persisted values take priority over env defaults)
+        #    Seed DB with env defaults on first run if no persisted values exist.
+        db_config = db_service.get_all_config()
+        if db_config:
+            logging.info(f"Loaded {len(db_config)} config keys from database.")
+        else:
+            logging.info("No persisted config found — seeding database with env defaults.")
+            db_service.bulk_set_config({
+                "vat_rate": str(config["vat_rate"]),
+                "low_stock_threshold": str(config["low_stock_threshold"]),
+                "expiry_alert_days": str(config["expiry_alert_days"]),
+            })
+            db_config = db_service.get_all_config()
+
+        # DB-prioritized config merge: DB value wins, env is fallback
+        def _cfg_db_or_env(key: str, cast=float):
+            db_val = db_config.get(key)
+            if db_val is not None:
+                try:
+                    return cast(db_val)
+                except (ValueError, TypeError):
+                    logging.warning(f"Invalid DB value for '{key}': {db_val!r}, falling back to env default.")
+            return config[key]
+
+        config["vat_rate"] = _cfg_db_or_env("vat_rate", float)
+        config["low_stock_threshold"] = _cfg_db_or_env("low_stock_threshold", int)
+        config["expiry_alert_days"] = _cfg_db_or_env("expiry_alert_days", int)
+
+        logging.info(f"Final config — VAT: {config['vat_rate']*100}%, "
+                     f"LowStock: {config['low_stock_threshold']}, "
+                     f"ExpiryAlert: {config['expiry_alert_days']}d")
+
         # 2. Instantiate MainWindow — renders empty window immediately via internal update_idletasks()
         app = MainWindow(db_service=db_service, config=config)
         app.update_idletasks()  # belt-and-suspenders: ensure window pixels are on screen

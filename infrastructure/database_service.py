@@ -62,6 +62,9 @@ class DatabaseService:
             if row and row['count'] == 0:
                 self._insert_dummy_data(cursor)
                 conn.commit()
+
+            # Verify WAL journal mode is active
+            self._verify_wal(conn)
         except sqlite3.Error as e:
             logging.error(f"Database initialization error: {e}")
             raise RuntimeError(f"Failed to initialize database at '{self.db_path}': {e}") from e
@@ -493,3 +496,112 @@ class DatabaseService:
         finally:
             if conn:
                 conn.close()
+
+    # =================================================================
+    # TYPED CONFIG ACCESS & FIRST-RUN SEEDING
+    # =================================================================
+    def get_config_typed(self, key: str, default, type_fn):
+        """Read a config string from DB and convert it via type_fn.
+        Returns default if key is missing or conversion fails.
+        Logs a warning on conversion failure.
+        """
+        raw = self.get_config(key)
+        if raw is None:
+            return default
+        try:
+            return type_fn(raw)
+        except (ValueError, TypeError) as e:
+            logging.warning(
+                f"Config '{key}' value '{raw}' could not be converted "
+                f"using {type_fn.__name__}: {e}"
+            )
+            return default
+
+    def seed_default_config(self, defaults: dict):
+        """Insert default config values for keys that do not already exist.
+        Uses INSERT OR IGNORE in a single transaction for atomicity.
+        This prevents overwriting user-saved settings on restart.
+        """
+        if not defaults:
+            return
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("BEGIN TRANSACTION")
+            try:
+                cursor.executemany(
+                    "INSERT OR IGNORE INTO SystemConfig (Key, Value) VALUES (?, ?)",
+                    list(defaults.items()),
+                )
+                conn.commit()
+                logging.info(
+                    f"Seeded {len(defaults)} default config keys "
+                    f"(existing keys preserved)."
+                )
+            except Exception:
+                conn.rollback()
+                logging.exception("Failed to seed default config — rolled back.")
+                raise
+        except sqlite3.Error as e:
+            logging.error(f"Error seeding default config: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def config_exists(self, key: str) -> bool:
+        """Return True if the given config key exists in the database."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM SystemConfig WHERE Key = ?", (key,))
+            return cursor.fetchone() is not None
+        except sqlite3.Error as e:
+            logging.error(f"Error checking config existence for '{key}': {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def bulk_set_config(self, items: dict):
+        """Atomically upsert multiple config key-value pairs
+        in a single transaction using executemany."""
+        if not items:
+            return
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("BEGIN TRANSACTION")
+            try:
+                cursor.executemany(
+                    "INSERT INTO SystemConfig (Key, Value) VALUES (?, ?) "
+                    "ON CONFLICT(Key) DO UPDATE SET Value = excluded.Value",
+                    list(items.items()),
+                )
+                conn.commit()
+                logging.info(f"Bulk set {len(items)} config keys.")
+            except Exception:
+                conn.rollback()
+                logging.exception("Bulk set config failed — rolled back.")
+                raise
+        except sqlite3.Error as e:
+            logging.error(f"Error in bulk_set_config: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def _verify_wal(self, conn: sqlite3.Connection):
+        """Check that WAL journal mode is active and log confirmation."""
+        try:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode")
+            row = cursor.fetchone()
+            mode = row[0] if row else "unknown"
+            if mode.upper() == "WAL":
+                logging.info("WAL journal mode is active — confirmed.")
+            else:
+                logging.warning(f"Expected WAL journal mode but got '{mode}'.")
+        except sqlite3.Error as e:
+            logging.warning(f"Could not verify WAL journal mode: {e}")

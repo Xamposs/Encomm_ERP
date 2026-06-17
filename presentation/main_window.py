@@ -668,6 +668,8 @@ class MainWindow(customtkinter.CTk):
 
     def refresh_dashboard(self):
         """Fetch statistics from DB via native SQL in a background thread."""
+        if not hasattr(self, 'dashboard_frame') or self.dashboard_frame is None:
+            return
         threshold = int(self.config["low_stock_threshold"])
         alert_days = int(self.config["expiry_alert_days"])
 
@@ -826,8 +828,8 @@ class MainWindow(customtkinter.CTk):
         bg = _ttk_bg()
         fg = _ttk_fg()
         sel_bg = _ttk_selected_bg()
-        _style.configure("Treeview", background=bg, foreground=fg, fieldbackground=bg, rowheight=32)
-        _style.configure("Treeview.Heading", background=bg, foreground=fg, font=("Segoe UI", 11, "bold"))
+        _style.configure("Treeview", background=bg, foreground=fg, fieldbackground=bg, rowheight=30, font=("Segoe UI", 13))
+        _style.configure("Treeview.Heading", background=bg, foreground=fg, font=("Segoe UI", 14, "bold"))
         _style.map("Treeview", background=[("selected", sel_bg)], foreground=[("selected", "#ffffff")])
 
     def _on_tree_double_click(self, event):
@@ -873,6 +875,8 @@ class MainWindow(customtkinter.CTk):
         """Fetch ONE page of filtered products via threaded SQL — only when frame is visible."""
         # Strict guard: block fetches unless the inventory tab is mapped on screen
         if not getattr(self, 'inventory_frame', None) or not self.inventory_frame.winfo_ismapped():
+            return
+        if not hasattr(self, 'inv_tree') or self.inv_tree is None:
             return
         if self._inv_fetching:
             return
@@ -1153,6 +1157,10 @@ class MainWindow(customtkinter.CTk):
         self.clear_cart_btn.pack(padx=20, pady=5, fill="x")
 
     def refresh_invoice_view(self):
+        if not hasattr(self, 'invoices_frame') or self.invoices_frame is None:
+            return
+        if not hasattr(self, 'cart_scroll') or self.cart_scroll is None:
+            return
         if hasattr(self, 'pos_prod_menu'):
             try:
                 self.pos_prod_menu.delete(0, tk.END)
@@ -1327,9 +1335,12 @@ class MainWindow(customtkinter.CTk):
         self.refresh_cart_list()
 
     def process_checkout(self):
-        """Perform transactional check-out."""
+        """Perform transactional checkout with accumulated failure reporting."""
         if not self.invoice_cart:
-            messagebox.showwarning("Προειδοποίηση", "Αδύνατη η ολοκλήρωση: Το καλάθι είναι κενό.")
+            messagebox.showwarning(
+                "Προειδοποίηση",
+                "Αδύνατη η ολοκλήρωση: Το καλάθι είναι κενό.",
+            )
             return
 
         vat_rate = float(self.config["vat_rate"])
@@ -1338,42 +1349,83 @@ class MainWindow(customtkinter.CTk):
         invoice_id = f"INV-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         invoice_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        success = True
-        failed_item = ""
+        succeeded: List[Tuple[Product, int]] = []
+        failed_items: List[Tuple[str, str]] = []  # (name, reason)
+
         for p, qty in self.invoice_cart:
             db_p = self.db_service.get_product(p.barcode)
-            if not db_p or db_p.stock < qty:
-                messagebox.showerror("Σύγκρουση Αποθέματος", f"Αποτυχία: Το προϊόν '{p.name}' δεν έχει επαρκές απόθεμα.")
-                return
+            if not db_p:
+                failed_items.append((p.name, "Το προϊόν δεν βρέθηκε στη βάση δεδομένων."))
+                continue
+            if db_p.stock < qty:
+                failed_items.append((
+                    p.name,
+                    f"Απαιτούνται {qty} τεμ., διαθέσιμα μόνο {db_p.stock}.",
+                ))
+                continue
             new_stock = db_p.stock - qty
-            res = self.db_service.update_stock(p.barcode, new_stock)
-            if not res:
-                success = False
-                failed_item = p.name
-                break
+            if not self.db_service.update_stock(p.barcode, new_stock):
+                failed_items.append((p.name, "Σφάλμα εγγραφής αποθέματος (DB)."))
+                continue
+            succeeded.append((p, qty))
 
-        if not success:
-            messagebox.showerror("Σφάλμα Συναλλαγής", f"Αποτυχία κατά την εγγραφή αποθέματος για το '{failed_item}'. Η σύνδεση διακόπηκε.")
+        # --- Handle partial / total failure ---
+        if failed_items:
+            summary_lines = [
+                "Τα παρακάτω είδη ΔΕΝ ολοκληρώθηκαν:\n",
+            ]
+            for name, reason in failed_items:
+                summary_lines.append(f"  • {name}: {reason}")
+            messagebox.showerror(
+                "Αδυναμία Ολοκλήρωσης Παραστατικού",
+                "\n".join(summary_lines),
+            )
+            # Keep only the failed items in the cart; remove succeeded ones
+            failed_barcodes = set()
+            for name, _ in failed_items:
+                for p, _ in self.invoice_cart:
+                    if p.name == name:
+                        failed_barcodes.add(p.barcode)
+            self.invoice_cart = [
+                (p, q) for p, q in self.invoice_cart
+                if p.barcode in failed_barcodes
+            ]
+            self.refresh_cart_list()
             return
 
-        receipt = f"==================================\n"
-        receipt += f"       ΑΠΟΔΕΙΞΗ ENCOMM       \n"
-        receipt += f"==================================\n"
-        receipt += f"Αριθμός Παραστατικού: {invoice_id}\n"
-        receipt += f"Ημερομηνία: {invoice_date}\n"
-        receipt += f"----------------------------------\n"
-        for p, qty in self.invoice_cart:
-            receipt += f"{p.name[:20]:<20} x{qty:<2}  €{(p.price*qty):.2f}\n"
-        receipt += f"----------------------------------\n"
-        receipt += f"Υποσύνολο:               €{subtotal:.2f}\n"
-        receipt += f"ΦΠΑ ({vat_rate*100:.1f}%):            €{vat_amount:.2f}\n"
-        receipt += f"ΣΥΝΟΛΟ:                  €{grand_total:.2f}\n"
-        receipt += f"==================================\n"
-        receipt += f"Ευχαριστούμε για την αγορά!\n"
+        # --- Full success: destroy tracked rows, clear cart, show receipt ---
+        for row in self.cart_rows_tracked:
+            try:
+                row.destroy()
+            except Exception:
+                pass
+        self.cart_rows_tracked.clear()
+
+        receipt = (
+            "==================================\n"
+            "       ΑΠΟΔΕΙΞΗ ENCOMM       \n"
+            "==================================\n"
+            f"Αριθμός Παραστατικού: {invoice_id}\n"
+            f"Ημερομηνία: {invoice_date}\n"
+            "----------------------------------\n"
+        )
+        for p, qty in succeeded:
+            receipt += f"{p.name[:20]:<20} x{qty:<2}  €{(p.price * qty):.2f}\n"
+        receipt += (
+            "----------------------------------\n"
+            f"Υποσύνολο:               €{subtotal:.2f}\n"
+            f"ΦΠΑ ({vat_rate * 100:.1f}%):            €{vat_amount:.2f}\n"
+            f"ΣΥΝΟΛΟ:                  €{grand_total:.2f}\n"
+            "==================================\n"
+            "Ευχαριστούμε για την αγορά!\n"
+        )
 
         messagebox.showinfo("Παραστατικό Καταχωρήθηκε", receipt)
 
         self.invoice_cart = []
+        self.refresh_cart_list()
+        self.refresh_dashboard()
+        self.refresh_inventory_list()
         self.refresh_invoice_view()
 
     # =========================================================================
@@ -1381,7 +1433,7 @@ class MainWindow(customtkinter.CTk):
     # =========================================================================
     def _init_settings_frame(self):
         self.settings_frame = customtkinter.CTkFrame(self.main_container, fg_color="transparent")
-        self.settings_card = customtkinter.CTkFrame(self.settings_frame)
+        self.settings_card = customtkinter.CTkScrollableFrame(self.settings_frame, label_text="")
         self.settings_card.pack(padx=20, pady=20, fill="both", expand=True)
 
         self.set_title = customtkinter.CTkLabel(self.settings_card, text="Ρυθμίσεις Συστήματος", font=customtkinter.CTkFont(size=18, weight="bold"))
@@ -1439,13 +1491,26 @@ class MainWindow(customtkinter.CTk):
         )
         self.set_theme_menu.pack(padx=30, pady=(0, 25), anchor="w")
 
+        self.settings_btn_frame = customtkinter.CTkFrame(self.settings_card, fg_color="transparent")
+        self.settings_btn_frame.pack(padx=30, pady=10, anchor="w")
+
         self.save_settings_btn = customtkinter.CTkButton(
-            self.settings_card, text="💾 Αποθήκευση Ρυθμίσεων",
+            self.settings_btn_frame, text="💾 Αποθήκευση Ρυθμίσεων",
             font=customtkinter.CTkFont(weight="bold"),
             fg_color="#34C759", hover_color="#289A47",
             command=self.save_settings_values
         )
-        self.save_settings_btn.pack(padx=30, pady=10, anchor="w")
+        self.save_settings_btn.pack(side="left", padx=(0, 10))
+
+        self.refresh_settings_btn = customtkinter.CTkButton(
+            self.settings_btn_frame, text="🔄 Επαναφορά",
+            font=customtkinter.CTkFont(size=12),
+            fg_color="transparent", hover_color=("gray85", "gray25"),
+            command=self.load_settings_values
+        )
+        self.refresh_settings_btn.pack(side="left")
+
+        self.load_settings_values()
 
     def _add_section_label(self, text: str):
         separator = customtkinter.CTkFrame(self.settings_card, height=1, fg_color=("gray70", "gray30"))
@@ -1457,20 +1522,33 @@ class MainWindow(customtkinter.CTk):
         self.set_vat_entry.delete(0, tk.END)
         self.set_vat_entry.insert(0, str(self.config.get("vat_rate", 0.24)))
 
+        self.set_stock_entry.configure(state="normal")
         self.set_stock_entry.delete(0, tk.END)
         self.set_stock_entry.insert(0, str(self.config.get("low_stock_threshold", 10)))
 
+        self.set_exp_entry.configure(state="normal")
         self.set_exp_entry.delete(0, tk.END)
         self.set_exp_entry.insert(0, str(self.config.get("expiry_alert_days", 30)))
 
+        self.set_license_entry.configure(state="normal")
         self.set_license_entry.delete(0, tk.END)
         self.set_license_entry.insert(0, self.db_service.get_config("license_key", ""))
 
+        self.set_mydata_entry.configure(state="normal")
         self.set_mydata_entry.delete(0, tk.END)
         self.set_mydata_entry.insert(0, self.db_service.get_config("mydata_user", ""))
 
+        self.set_hdika_entry.configure(state="normal")
         self.set_hdika_entry.delete(0, tk.END)
         self.set_hdika_entry.insert(0, self.db_service.get_config("hdika_code", ""))
+
+        self.set_hwid_entry.configure(state="normal")
+        self.set_hwid_entry.delete(0, tk.END)
+        if self.cached_hwid:
+            self.set_hwid_entry.insert(0, self.cached_hwid)
+        else:
+            self.set_hwid_entry.insert(0, "⏳ Υπολογισμός αναγνωριστικού...")
+        self.set_hwid_entry.configure(state="disabled", text_color="gray50")
 
         current = customtkinter.get_appearance_mode()
         self.set_theme_menu.set("Σκούρο" if current == "Dark" else "Φωτεινό")
@@ -1484,17 +1562,58 @@ class MainWindow(customtkinter.CTk):
         self.update_idletasks()
 
     def save_settings_values(self):
+        # --- VAT validation (0.0–1.0, supports Greek decimal comma) ---
         try:
-            vat = float(self.set_vat_entry.get())
-            stock = int(self.set_stock_entry.get())
-            expiry = int(self.set_exp_entry.get())
-
-            if vat < 0 or vat > 1 or stock < 0 or expiry < 0:
-                raise ValueError()
-        except ValueError:
-            messagebox.showerror("Σφάλμα", "Μη έγκυρες τιμές. Ο ΦΠΑ πρέπει να είναι δεκαδικός μεταξύ 0 και 1.\nΤα όρια πρέπει να είναι θετικοί ακέραιοι.")
+            vat_str = self.set_vat_entry.get().strip().replace(",", ".")
+            vat = float(vat_str)
+            if vat < 0 or vat > 1:
+                messagebox.showerror(
+                    "Σφάλμα",
+                    "Το ΦΠΑ πρέπει να είναι δεκαδικός (π.χ. 0.24 για 24%, όχι 24)",
+                )
+                return
+        except (ValueError, ArithmeticError):
+            messagebox.showerror(
+                "Σφάλμα",
+                "Το ΦΠΑ πρέπει να είναι δεκαδικός (π.χ. 0.24 για 24%, όχι 24)",
+            )
             return
 
+        # --- Low stock threshold validation (integer 0–99999) ---
+        try:
+            stock_str = self.set_stock_entry.get().strip()
+            stock = int(stock_str)
+            if stock < 0 or stock > 99999:
+                messagebox.showerror(
+                    "Σφάλμα",
+                    "Το όριο χαμηλού αποθέματος πρέπει να είναι ακέραιος 0–99999",
+                )
+                return
+        except (ValueError, ArithmeticError):
+            messagebox.showerror(
+                "Σφάλμα",
+                "Το όριο χαμηλού αποθέματος πρέπει να είναι ακέραιος αριθμός (π.χ. 10)",
+            )
+            return
+
+        # --- Expiry alert days validation (integer 1–3650) ---
+        try:
+            expiry_str = self.set_exp_entry.get().strip()
+            expiry = int(expiry_str)
+            if expiry < 1 or expiry > 3650:
+                messagebox.showerror(
+                    "Σφάλμα",
+                    "Οι ημέρες προειδοποίησης λήξης πρέπει να είναι ακέραιος 1–3650",
+                )
+                return
+        except (ValueError, ArithmeticError):
+            messagebox.showerror(
+                "Σφάλμα",
+                "Οι ημέρες προειδοποίησης λήξης πρέπει να είναι ακέραιος αριθμός (π.χ. 30)",
+            )
+            return
+
+        # --- Save numeric configs ---
         self.config["vat_rate"] = vat
         self.config["low_stock_threshold"] = stock
         self.config["expiry_alert_days"] = expiry
@@ -1502,6 +1621,7 @@ class MainWindow(customtkinter.CTk):
         self.db_service.set_config("low_stock_threshold", str(stock))
         self.db_service.set_config("expiry_alert_days", str(expiry))
 
+        # --- Trimmed text configs ---
         license_key = self.set_license_entry.get().strip()
         mydata_user = self.set_mydata_entry.get().strip()
         hdika_code = self.set_hdika_entry.get().strip()
@@ -1510,6 +1630,7 @@ class MainWindow(customtkinter.CTk):
         self.db_service.set_config("mydata_user", mydata_user)
         self.db_service.set_config("hdika_code", hdika_code)
 
+        # --- License key verification ---
         if license_key:
             hwid = self.cached_hwid or generate_hwid()
             is_valid, expires_at = verify_local_license(license_key, hwid)
@@ -1522,13 +1643,15 @@ class MainWindow(customtkinter.CTk):
                 messagebox.showwarning(
                     "Άδεια Χρήσης",
                     "Το License Key δεν είναι έγκυρο για αυτό το σύστημα.\n"
-                    "Οι ρυθμίσεις αποθηκεύτηκαν, αλλά η άδεια δεν ενεργοποιήθηκε."
+                    "Οι ρυθμίσεις αποθηκεύτηκαν, αλλά η άδεια δεν ενεργοποιήθηκε.",
                 )
                 self.load_settings_values()
                 return
 
         messagebox.showinfo("Επιτυχία", "Οι ρυθμίσεις συστήματος αποθηκεύτηκαν και εφαρμόστηκαν.")
         self.load_settings_values()
+        self.refresh_dashboard()
+        self.refresh_inventory_list()
 
     # =========================================================================
     # AI COMMAND BAR — Asynchronous Intent Processing
@@ -1607,6 +1730,155 @@ class MainWindow(customtkinter.CTk):
     # =========================================================================
     # DIALOG ACTIONS
     # =========================================================================
+    def _show_commercial_review(self, flagged_items, products):
+        """Display price-hike review modal (>8% increase safety gate)."""
+        self._hide_import_progress()
+        self._review_modal = customtkinter.CTkToplevel(self)
+        self._review_modal.title("⚠️ Εμπορικός Έλεγχος Ανατιμήσεων (>8%)")
+        self._review_modal.geometry("650x500")
+        self._review_modal.resizable(False, False)
+        self._review_modal.transient(self)
+        self._review_modal.grab_set()
+        self._review_modal.deiconify()
+        self._review_modal.update_idletasks()
+        px = self.winfo_x() + (self.winfo_width() - 650) // 2
+        py = self.winfo_y() + (self.winfo_height() - 500) // 2
+        self._review_modal.geometry(f"650x500+{px}+{py}")
+
+        customtkinter.CTkLabel(
+            self._review_modal, text="⚠️ Εμπορικός Έλεγχος Ανατιμήσεων (>8%)",
+            font=customtkinter.CTkFont(size=16, weight="bold"),
+            text_color="#E67E22",
+        ).pack(pady=(20, 5))
+        customtkinter.CTkLabel(
+            self._review_modal,
+            text="Encomm AI Safety Gate — Εντοπίστηκαν ανατιμήσεις άνω του 8%",
+            font=customtkinter.CTkFont(size=12),
+            text_color=("gray50", "gray60"),
+        ).pack(pady=(0, 15))
+
+        scroll = customtkinter.CTkScrollableFrame(self._review_modal, width=600, height=300)
+        scroll.pack(padx=25, pady=10, fill="both", expand=True)
+
+        headers = ["Όνομα", "Παλιά Τιμή", "Νέα Τιμή", "Αύξηση %"]
+        for col, h in enumerate(headers):
+            customtkinter.CTkLabel(
+                scroll, text=h,
+                font=customtkinter.CTkFont(size=12, weight="bold"),
+                text_color=("gray40", "gray50"),
+            ).grid(row=0, column=col, padx=10, pady=5, sticky="w")
+
+        for i, item in enumerate(flagged_items):
+            bg = ("#FFF3E0", "#2B1A0A") if i % 2 == 0 else ("#FFE0B2", "#1E1208")
+            customtkinter.CTkLabel(
+                scroll, text=item["name"][:30],
+                font=customtkinter.CTkFont(size=12), fg_color=bg, corner_radius=4,
+            ).grid(row=i + 1, column=0, padx=10, pady=2, sticky="ew")
+            customtkinter.CTkLabel(
+                scroll, text=f'€{item["old_price"]:.2f}',
+                font=customtkinter.CTkFont(size=12), fg_color=bg, corner_radius=4,
+            ).grid(row=i + 1, column=1, padx=10, pady=2, sticky="e")
+            customtkinter.CTkLabel(
+                scroll, text=f'€{item["new_price"]:.2f}',
+                font=customtkinter.CTkFont(size=12, weight="bold"),
+                fg_color=bg, corner_radius=4, text_color="#E74C3C",
+            ).grid(row=i + 1, column=2, padx=10, pady=2, sticky="e")
+            customtkinter.CTkLabel(
+                scroll, text=f'+{item["pct_increase"]:.1f}%',
+                font=customtkinter.CTkFont(size=12, weight="bold"),
+                fg_color=bg, corner_radius=4, text_color="#E74C3C",
+            ).grid(row=i + 1, column=3, padx=10, pady=2, sticky="e")
+
+        btn_frame = customtkinter.CTkFrame(self._review_modal, fg_color="transparent")
+        btn_frame.pack(pady=20)
+        customtkinter.CTkButton(
+            btn_frame, text="✅ Έγκριση από Στέφανο (OK)",
+            font=customtkinter.CTkFont(weight="bold"),
+            fg_color="#34C759", hover_color="#289A47",
+            command=lambda: self._approve_commercial_review(products),
+        ).pack(side="left", padx=10)
+        customtkinter.CTkButton(
+            btn_frame, text="❌ Απόρριψη / Ακύρωση",
+            font=customtkinter.CTkFont(weight="bold"),
+            fg_color="#E74C3C", hover_color="#C0392B",
+            command=self._reject_commercial_review,
+        ).pack(side="left", padx=10)
+
+    def _approve_commercial_review(self, products):
+        """Destroy review modal and proceed with bulk import in background."""
+        if hasattr(self, '_review_modal') and self._review_modal is not None:
+            self._review_modal.destroy()
+            self._review_modal = None
+        self._show_import_progress()
+
+        def bg_commit():
+            try:
+                st = time.time()
+                self.db_service.bulk_upsert_products(products)
+                dur = round(time.time() - st, 2)
+                self.after(0, lambda: [
+                    self._hide_import_progress(),
+                    messagebox.showinfo(
+                        "Επιτυχία",
+                        f"Επεξεργάστηκαν {len(products)} προϊόντα "
+                        f"με επιτυχία σε {dur} δευτερόλεπτα!",
+                    ),
+                    self.refresh_inventory_list(),
+                    self.refresh_dashboard(),
+                    self.refresh_invoice_view(),
+                ])
+            except Exception as exc:
+                logging.exception("Εγκεκριμένη εισαγωγή απέτυχε")
+                self.after(0, lambda: [
+                    self._hide_import_progress(),
+                    messagebox.showerror(
+                        "Σφάλμα Εισαγωγής",
+                        f"Αποτυχία κατά την εισαγωγή:\n{exc}",
+                    ),
+                ])
+
+        threading.Thread(target=bg_commit, daemon=True).start()
+
+    def _reject_commercial_review(self):
+        """Dismiss the review modal without importing."""
+        if hasattr(self, '_review_modal') and self._review_modal is not None:
+            self._review_modal.destroy()
+            self._review_modal = None
+
+    def _show_import_progress(self):
+        """Display a modal progress overlay during bulk data import."""
+        self._import_modal = customtkinter.CTkToplevel(self)
+        self._import_modal.title("Επεξεργασία Τιμολογίου")
+        self._import_modal.geometry("400x150")
+        self._import_modal.resizable(False, False)
+        self._import_modal.transient(self)
+        self._import_modal.grab_set()
+        self._import_modal.deiconify()
+        self._import_modal.update_idletasks()
+        # Centre overlay on parent window
+        px = self.winfo_x() + (self.winfo_width() - 400) // 2
+        py = self.winfo_y() + (self.winfo_height() - 150) // 2
+        self._import_modal.geometry(f"400x150+{px}+{py}")
+        customtkinter.CTkLabel(
+            self._import_modal, text="Γίνεται επεξεργασία του αρχείου...",
+            font=customtkinter.CTkFont(size=14, weight="bold"),
+        ).pack(pady=(30, 10))
+        customtkinter.CTkLabel(
+            self._import_modal, text="Παρακαλώ περιμένετε",
+            font=customtkinter.CTkFont(size=12),
+        ).pack()
+        self._import_progress = customtkinter.CTkProgressBar(
+            self._import_modal, mode="indeterminate", width=300,
+        )
+        self._import_progress.pack(pady=15)
+        self._import_progress.start()
+
+    def _hide_import_progress(self):
+        """Safely tear down the import progress modal from the main thread."""
+        if hasattr(self, '_import_modal') and self._import_modal is not None:
+            self._import_modal.destroy()
+            self._import_modal = None
+
     def import_supplier_invoice(self):
         file_path = filedialog.askopenfilename(
             title="Εισαγωγή Τιμολογίων Προμηθευτή",
@@ -1615,26 +1887,74 @@ class MainWindow(customtkinter.CTk):
         if not file_path:
             return
 
-        start_time = time.time()
-        try:
-            parser = ExcelParserService()
-            products = parser.parse_supplier_file(file_path)
+        self._show_import_progress()
 
-            if not products:
-                messagebox.showwarning("Προειδοποίηση", "Δεν βρέθηκαν έγκυρα προϊόντα στο αρχείο.")
-                return
+        def bg_import():
+            try:
+                parser = ExcelParserService()
+                products = parser.parse_supplier_file(file_path)
 
-            self.db_service.bulk_upsert_products(products)
-            duration = round(time.time() - start_time, 2)
-            messagebox.showinfo("Επιτυχία", f"Επεξεργάστηκαν {len(products)} προϊόντα με επιτυχία σε {duration} δευτερόλεπτα!")
+                if not products:
+                    self.after(0, lambda: [
+                        self._hide_import_progress(),
+                        messagebox.showwarning(
+                            "Προειδοποίηση",
+                            "Δεν βρέθηκαν έγκυρα προϊόντα στο αρχείο.",
+                        )
+                    ])
+                    return
 
-            self.refresh_inventory_list()
-            self.refresh_dashboard()
-            self.refresh_invoice_view()
+                # ── Commercial Review: cross-reference prices against DB baselines ──
+                existing = self.db_service.get_all_products()
+                price_lookup = {p.barcode: p.price for p in existing}
 
-        except Exception as exc:
-            logging.exception("Αποτυχία εισαγωγής τιμολογίου")
-            messagebox.showerror("Σφάλμα Εισαγωγής", f"Αποτυχία κατά την εισαγωγή του αρχείου:\n{exc}")
+                flagged_items = []
+                for prod in products:
+                    barcode = prod[0]  # products list uses tuple format for bulk_upsert
+                    old_price = price_lookup.get(barcode)
+                    if old_price is not None and old_price > 0:
+                        new_price = prod[4]  # Price is index 4 in tuple
+                        pct = (new_price - old_price) / old_price
+                        if pct > 0.08:
+                            flagged_items.append({
+                                "name": prod[1][:30],
+                                "barcode": barcode,
+                                "old_price": old_price,
+                                "new_price": new_price,
+                                "pct_increase": pct * 100,
+                            })
+
+                if flagged_items:
+                    self.after(0, lambda fi=flagged_items, pr=products:
+                        self._show_commercial_review(fi, pr))
+                    return
+
+                start_time = time.time()
+                self.db_service.bulk_upsert_products(products)
+                duration = round(time.time() - start_time, 2)
+
+                self.after(0, lambda: [
+                    self._hide_import_progress(),
+                    messagebox.showinfo(
+                        "Επιτυχία",
+                        f"Επεξεργάστηκαν {len(products)} προϊόντα "
+                        f"με επιτυχία σε {duration} δευτερόλεπτα!",
+                    ),
+                    self.refresh_inventory_list(),
+                    self.refresh_dashboard(),
+                    self.refresh_invoice_view(),
+                ])
+            except Exception as exc:
+                logging.exception("Αποτυχία εισαγωγής τιμολογίου")
+                self.after(0, lambda: [
+                    self._hide_import_progress(),
+                    messagebox.showerror(
+                        "Σφάλμα Εισαγωγής",
+                        f"Αποτυχία κατά την εισαγωγή του αρχείου:\n{exc}",
+                    )
+                ])
+
+        threading.Thread(target=bg_import, daemon=True).start()
 
 
 class ProductFormDialog(customtkinter.CTkToplevel):
