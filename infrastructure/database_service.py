@@ -81,6 +81,22 @@ class DatabaseService:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS suppliers (
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name    TEXT    NOT NULL UNIQUE,
+                    phone   TEXT,
+                    email   TEXT,
+                    address TEXT
+                )
+            """)
+
+            # Safely add supplier_id column to ProductMaster if it doesn't exist
+            try:
+                cursor.execute("ALTER TABLE ProductMaster ADD COLUMN supplier_id INTEGER")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
             # Add customer_id to invoices if it doesn't exist (migration-safe)
             try:
                 cursor.execute("ALTER TABLE invoices ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
@@ -217,10 +233,11 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
+            sid = getattr(product, 'supplier_id', None)
             cursor.execute("""
-                INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price)
-                VALUES (?, ?, ?, ?, ?)
-            """, (product.barcode, product.name, product.stock, product.expiry_date, product.price))
+                INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (product.barcode, product.name, product.stock, product.expiry_date, product.price, sid))
             conn.commit()
             return True
         except sqlite3.Error as e:
@@ -236,11 +253,12 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
+            sid = getattr(product, 'supplier_id', None)
             cursor.execute("""
                 UPDATE ProductMaster
-                SET Name = ?, Stock = ?, ExpiryDate = ?, Price = ?
+                SET Name = ?, Stock = ?, ExpiryDate = ?, Price = ?, supplier_id = ?
                 WHERE Barcode = ?
-            """, (product.name, product.stock, product.expiry_date, product.price, product.barcode))
+            """, (product.name, product.stock, product.expiry_date, product.price, sid, product.barcode))
             conn.commit()
             return True
         except sqlite3.Error as e:
@@ -358,7 +376,7 @@ class DatabaseService:
                 conn.close()
 
     def get_critical_products_sliced(self, threshold: int, alert_days: int, limit: int = 100) -> List[Tuple[Product, str]]:
-        """Return up to `limit` most critical products sorted by severity (expired → near-expiry → low-stock)."""
+        """Return up to `limit` most critical products sorted by severity (expired -> near-expiry -> low-stock)."""
         conn = None
         try:
             conn = self._get_connection()
@@ -724,6 +742,86 @@ class DatabaseService:
         except sqlite3.Error as e:
             logging.error("Error adding customer: %s", e)
             return False
+        finally:
+            if conn:
+                conn.close()
+
+    # ── Supplier CRUD ──
+    def get_all_suppliers(self) -> List[Dict]:
+        """Return all suppliers as a list of dicts."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            rows = conn.execute("SELECT id, name, phone, email, address FROM suppliers ORDER BY name").fetchall()
+            return [{"id": r["id"], "name": r["name"], "phone": r["phone"] or "",
+                     "email": r["email"] or "", "address": r["address"] or ""} for r in rows]
+        except sqlite3.Error as e:
+            logging.error("Error fetching suppliers: %s", e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def add_supplier(self, name: str, phone: str = "", email: str = "", address: str = "") -> bool:
+        """Add a new supplier. Returns True on success."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute("INSERT INTO suppliers (name, phone, email, address) VALUES (?, ?, ?, ?)",
+                         (name, phone, email, address))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("Error adding supplier '%s': %s", name, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def delete_supplier(self, supplier_id: int) -> bool:
+        """Delete a supplier by ID. Returns True on success."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute("DELETE FROM suppliers WHERE id = ?", (supplier_id,))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("Error deleting supplier %s: %s", supplier_id, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def get_low_stock_by_supplier(self) -> Dict[int, List[Dict]]:
+        """Return low-stock products grouped by supplier_id. Reads threshold from SystemConfig."""
+        conn = None
+        try:
+            threshold = self.get_config_typed("low_stock_threshold", 10, int)
+            conn = self._get_connection()
+            rows = conn.execute("""
+                SELECT p.Barcode, p.Name, p.Stock, p.supplier_id, s.name as supplier_name
+                FROM ProductMaster p
+                LEFT JOIN suppliers s ON p.supplier_id = s.id
+                WHERE p.Stock <= ? AND p.supplier_id IS NOT NULL
+                ORDER BY s.name, p.Name
+            """, (threshold,)).fetchall()
+            result = {}
+            for r in rows:
+                sid = r["supplier_id"]
+                if sid not in result:
+                    result[sid] = []
+                result[sid].append({
+                    "barcode": r["Barcode"],
+                    "name": r["Name"],
+                    "stock": r["Stock"],
+                    "supplier_id": sid,
+                    "supplier_name": r["supplier_name"] or "\u0386\u03b3\u03bd\u03c9\u03c3\u03c4\u03bf\u03c2",
+                })
+            return result
+        except sqlite3.Error as e:
+            logging.error("Error fetching low-stock by supplier: %s", e)
+            return {}
         finally:
             if conn:
                 conn.close()

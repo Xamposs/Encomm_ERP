@@ -146,6 +146,17 @@ class MainWindow(customtkinter.CTk):
         # ── Defer ALL heavy UI construction to the event loop ──
         self.after(0, self._post_init)
 
+        # ── Root-window focus + global click-to-unfocus ──
+        self.configure(takefocus=True)
+        self.bind_all("<Button-1>", self._on_global_click)
+
+    def _on_global_click(self, event):
+        try:
+            if "entry" not in str(event.widget).lower():
+                self.focus_set()
+        except Exception:
+            pass
+
     def _post_init(self):
         """Build the full UI inside the event loop, after the window is visible."""
         # Global ttk style — configure once before any Treeview is created
@@ -241,6 +252,18 @@ class MainWindow(customtkinter.CTk):
         )
         self.nav_buttons["inventory"].grid(row=2, column=0, padx=20, pady=8, sticky="ew")
 
+        self.nav_buttons["suppliers"] = customtkinter.CTkButton(
+            self.sidebar_frame,
+            text="🏭  Προμηθευτές",
+            anchor="w",
+            fg_color="transparent",
+            text_color=_nav_text(),
+            hover_color=_nav_hover(),
+            font=customtkinter.CTkFont(family="Outfit", size=13, weight="normal"),
+            command=lambda: self.select_frame("suppliers")
+        )
+        self.nav_buttons["suppliers"].grid(row=3, column=0, padx=20, pady=8, sticky="ew")
+
         self.nav_buttons["invoices"] = customtkinter.CTkButton(
             self.sidebar_frame,
             text="🧾  Ταμείο / Πωλήσεις",
@@ -251,7 +274,7 @@ class MainWindow(customtkinter.CTk):
             font=customtkinter.CTkFont(family="Outfit", size=13, weight="normal"),
             command=lambda: self.select_frame("invoices")
         )
-        self.nav_buttons["invoices"].grid(row=3, column=0, padx=20, pady=8, sticky="ew")
+        self.nav_buttons["invoices"].grid(row=4, column=0, padx=20, pady=8, sticky="ew")
 
         self.nav_buttons["customers"] = customtkinter.CTkButton(
             self.sidebar_frame,
@@ -263,7 +286,7 @@ class MainWindow(customtkinter.CTk):
             font=customtkinter.CTkFont(family="Outfit", size=13, weight="normal"),
             command=lambda: self.select_frame("customers")
         )
-        self.nav_buttons["customers"].grid(row=4, column=0, padx=20, pady=8, sticky="ew")
+        self.nav_buttons["customers"].grid(row=5, column=0, padx=20, pady=8, sticky="ew")
 
         self.nav_buttons["invoice_history"] = customtkinter.CTkButton(
             self.sidebar_frame,
@@ -275,7 +298,7 @@ class MainWindow(customtkinter.CTk):
             font=customtkinter.CTkFont(family="Outfit", size=13, weight="normal"),
             command=lambda: self.select_frame("invoice_history")
         )
-        self.nav_buttons["invoice_history"].grid(row=5, column=0, padx=20, pady=8, sticky="ew")
+        self.nav_buttons["invoice_history"].grid(row=6, column=0, padx=20, pady=8, sticky="ew")
 
         self.nav_buttons["settings"] = customtkinter.CTkButton(
             self.sidebar_frame,
@@ -287,7 +310,7 @@ class MainWindow(customtkinter.CTk):
             font=customtkinter.CTkFont(family="Outfit", size=13, weight="normal"),
             command=lambda: self.select_frame("settings")
         )
-        self.nav_buttons["settings"].grid(row=6, column=0, padx=20, pady=8, sticky="ew")
+        self.nav_buttons["settings"].grid(row=7, column=0, padx=20, pady=8, sticky="ew")
 
         self.nav_buttons["ai_assistant"] = customtkinter.CTkButton(
             self.sidebar_frame,
@@ -299,7 +322,7 @@ class MainWindow(customtkinter.CTk):
             font=customtkinter.CTkFont(family="Outfit", size=13, weight="normal"),
             command=lambda: self.select_frame("ai_assistant")
         )
-        self.nav_buttons["ai_assistant"].grid(row=7, column=0, padx=20, pady=8, sticky="ew")
+        self.nav_buttons["ai_assistant"].grid(row=8, column=0, padx=20, pady=8, sticky="ew")
 
         # Footer branding
         self.version_label = customtkinter.CTkLabel(
@@ -442,22 +465,6 @@ class MainWindow(customtkinter.CTk):
         )
         self.ai_send_btn.grid(row=0, column=1)
 
-        # ── Invisible focus holder for defocusing entries ──
-        self._dummy_focus = tk.Frame(self, width=0, height=0, takefocus=1)
-        self._dummy_focus.place(x=0, y=0)
-
-        # ── Global click-to-unfocus handler ──
-        self.bind_all("<Button-1>", self._on_global_click)
-
-    def _on_global_click(self, event):
-        """Direct hijack: clicked widget steals focus away from CTkEntry."""
-        try:
-            widget_path = str(event.widget).lower()
-            if "entry" not in widget_path and event.widget is not None:
-                event.widget.focus_set()
-        except Exception:
-            pass
-
     def _append_chat_message(self, sender: str, message: str):
         """Append a styled message bubble to the chat log."""
         is_bot = sender == "ClawBot AI"
@@ -527,6 +534,7 @@ class MainWindow(customtkinter.CTk):
             "ai_assistant":    self._init_ai_assistant_frame,
             "customers":       self._init_customers_frame,
             "invoice_history": self._init_invoice_history_frame,
+            "suppliers":       self._init_suppliers_frame,
         }
         init_map[name]()
         frame = getattr(self, frame_attr)
@@ -575,6 +583,7 @@ class MainWindow(customtkinter.CTk):
             "ai_assistant":    "AI Βοηθός",
             "customers":       "Πελάτες",
             "invoice_history": "Ιστορικό Παραστατικών",
+            "suppliers":       "Μητρώο Προμηθευτών",
         }
         refresh_fns = {
             "dashboard":       self.refresh_dashboard,
@@ -584,6 +593,7 @@ class MainWindow(customtkinter.CTk):
             "ai_assistant":    None,
             "customers":       self.refresh_customer_list,
             "invoice_history": self.refresh_invoice_history_list,
+            "suppliers":       self.refresh_supplier_list,
         }
 
         self.section_title_label.configure(text=frame_titles[name])
@@ -743,6 +753,10 @@ class MainWindow(customtkinter.CTk):
         self.dash_export_filter.pack(side="left", padx=(0, 8))
         self.dash_export_limit = customtkinter.CTkEntry(self.dash_export_bar, width=100, placeholder_text="Ποσότητα (π.χ. 20 ή ALL)")
         self.dash_export_limit.pack(side="left", padx=(0, 8))
+        self.dash_export_start = customtkinter.CTkEntry(self.dash_export_bar, width=110, placeholder_text="Από (YYYY-MM-DD)")
+        self.dash_export_start.pack(side="left", padx=(0, 5))
+        self.dash_export_end = customtkinter.CTkEntry(self.dash_export_bar, width=110, placeholder_text="Έως (YYYY-MM-DD)")
+        self.dash_export_end.pack(side="left", padx=(0, 8))
         self.dash_export_format = customtkinter.CTkOptionMenu(self.dash_export_bar, values=["PDF (.txt style)", "Excel (.csv)"], width=140)
         self.dash_export_format.pack(side="left", padx=(0, 8))
         self.dash_export_btn = customtkinter.CTkButton(self.dash_export_bar, text="📤 Εξαγωγή", fg_color="#2980B9", hover_color="#1F618D",
@@ -750,9 +764,11 @@ class MainWindow(customtkinter.CTk):
         self.dash_export_btn.pack(side="left")
 
     def export_dashboard(self):
-        """Export dashboard alert items to Desktop in a background thread."""
+        """Export dashboard alert items to Desktop in a background thread (with date range filter)."""
         filter_text = self.dash_export_filter.get().strip().lower()
         limit_str = self.dash_export_limit.get().strip().upper()
+        start_date = self.dash_export_start.get().strip() if hasattr(self, 'dash_export_start') else ""
+        end_date = self.dash_export_end.get().strip() if hasattr(self, 'dash_export_end') else ""
         fmt = self.dash_export_format.get()
         is_csv = "csv" in fmt.lower()
 
@@ -764,6 +780,10 @@ class MainWindow(customtkinter.CTk):
                     rows.append({"name": str(vals[0]), "stock": str(vals[1]), "expiry": str(vals[2]), "reason": str(vals[3])})
                 if filter_text:
                     rows = [r for r in rows if filter_text in r["name"].lower()]
+                if start_date:
+                    rows = [r for r in rows if r["expiry"] >= start_date]
+                if end_date:
+                    rows = [r for r in rows if r["expiry"] <= end_date]
                 try:
                     limit = int(limit_str)
                     rows = rows[:limit]
@@ -779,13 +799,16 @@ class MainWindow(customtkinter.CTk):
                         f.write("\n".join(lines))
                 else:
                     dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Dashboard_Export_{ts}.txt")
-                    lines = ["=" * 50, "  ENCOMM DASHBOARD — ΚΡΙΣΙΜΑ ΠΡΟΪΟΝΤΑ", "=" * 50, f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}", "-" * 50]
+                    lines = ["=" * 50, "  ENCOMM DASHBOARD — ΚΡΙΣΙΜΑ ΠΡΟΪΟΝΤΑ", "=" * 50,
+                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+                             f"Εύρος ημ/νιών: {start_date or '—'} έως {end_date or '—'}", "-" * 50]
                     for r in rows:
                         lines.append(f"{r['name']:<30} | Στοκ: {r['stock']:<6} | Λήξη: {r['expiry']:<12} | {r['reason']}")
                     lines.append("=" * 50)
                     with open(dest, "w", encoding="utf-8") as f:
                         f.write("\n".join(lines))
-                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή", f"Το αρχείο αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
+                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
+                    "Το φιλτραρισμένο αρχείο βάσει ημερομηνιών αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
         threading.Thread(target=_write, daemon=True).start()
@@ -960,6 +983,10 @@ class MainWindow(customtkinter.CTk):
         self.inv_export_filter.pack(side="left", padx=(0, 8))
         self.inv_export_limit = customtkinter.CTkEntry(self.inv_export_bar, width=100, placeholder_text="Ποσότητα (π.χ. 20 ή ALL)")
         self.inv_export_limit.pack(side="left", padx=(0, 8))
+        self.inv_export_start = customtkinter.CTkEntry(self.inv_export_bar, width=110, placeholder_text="Από (YYYY-MM-DD)")
+        self.inv_export_start.pack(side="left", padx=(0, 5))
+        self.inv_export_end = customtkinter.CTkEntry(self.inv_export_bar, width=110, placeholder_text="Έως (YYYY-MM-DD)")
+        self.inv_export_end.pack(side="left", padx=(0, 8))
         self.inv_export_format = customtkinter.CTkOptionMenu(self.inv_export_bar, values=["PDF (.txt style)", "Excel (.csv)"], width=140)
         self.inv_export_format.pack(side="left", padx=(0, 8))
         self.inv_export_btn = customtkinter.CTkButton(self.inv_export_bar, text="📤 Εξαγωγή", fg_color="#2980B9", hover_color="#1F618D",
@@ -967,9 +994,11 @@ class MainWindow(customtkinter.CTk):
         self.inv_export_btn.pack(side="left")
 
     def export_inventory(self):
-        """Export inventory products to Desktop in a background thread."""
+        """Export inventory products to Desktop in a background thread (with date range filter)."""
         filter_text = self.inv_export_filter.get().strip().lower()
         limit_str = self.inv_export_limit.get().strip().upper()
+        start_date = self.inv_export_start.get().strip() if hasattr(self, 'inv_export_start') else ""
+        end_date = self.inv_export_end.get().strip() if hasattr(self, 'inv_export_end') else ""
         fmt = self.inv_export_format.get()
         is_csv = "csv" in fmt.lower()
 
@@ -978,6 +1007,10 @@ class MainWindow(customtkinter.CTk):
                 products = self.db_service.get_all_products()
                 if filter_text:
                     products = [p for p in products if filter_text in p.name.lower() or filter_text in p.barcode.lower()]
+                if start_date:
+                    products = [p for p in products if p.expiry_date >= start_date]
+                if end_date:
+                    products = [p for p in products if p.expiry_date <= end_date]
                 try:
                     limit = int(limit_str)
                     products = products[:limit]
@@ -993,7 +1026,9 @@ class MainWindow(customtkinter.CTk):
                         f.write("\n".join(lines))
                 else:
                     dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Inventory_Export_{ts}.txt")
-                    lines = ["=" * 60, "  ENCOMM INVENTORY — ΕΞΑΓΩΓΗ ΑΠΟΘΗΚΗΣ", "=" * 60, f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}  |  Προϊόντα: {len(products)}", "-" * 60]
+                    lines = ["=" * 60, "  ENCOMM INVENTORY — ΕΞΑΓΩΓΗ ΑΠΟΘΗΚΗΣ", "=" * 60,
+                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}  |  Προϊόντα: {len(products)}",
+                             f"Εύρος ημ/νιών λήξης: {start_date or '—'} έως {end_date or '—'}", "-" * 60]
                     lines.append(f"{'Barcode':<15} {'Όνομα':<30} {'Στοκ':<8} {'Λήξη':<12} {'Τιμή':<10}")
                     lines.append("-" * 60)
                     for p in products:
@@ -1001,7 +1036,8 @@ class MainWindow(customtkinter.CTk):
                     lines.append("=" * 60)
                     with open(dest, "w", encoding="utf-8") as f:
                         f.write("\n".join(lines))
-                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή", f"Το αρχείο αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
+                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
+                    "Το φιλτραρισμένο αρχείο βάσει ημερομηνιών αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
         threading.Thread(target=_write, daemon=True).start()
@@ -1174,7 +1210,8 @@ class MainWindow(customtkinter.CTk):
                 name=p_data["name"],
                 stock=p_data["stock"],
                 expiry_date=p_data["expiry_date"],
-                price=p_data["price"]
+                price=p_data["price"],
+                supplier_id=p_data.get("supplier_id")
             )
             success = self.db_service.add_product(new_prod)
             if success:
@@ -1193,7 +1230,8 @@ class MainWindow(customtkinter.CTk):
                 name=p_data["name"],
                 stock=p_data["stock"],
                 expiry_date=p_data["expiry_date"],
-                price=p_data["price"]
+                price=p_data["price"],
+                supplier_id=p_data.get("supplier_id")
             )
             success = self.db_service.update_product(updated_prod)
             if success:
@@ -1368,6 +1406,19 @@ class MainWindow(customtkinter.CTk):
             font=customtkinter.CTkFont(weight="bold"), command=self.export_cart)
         self.pos_export_btn.pack(side="left")
 
+        # ── POS Sales Date-Range Export bar ──
+        self.pos_sales_export_bar = customtkinter.CTkFrame(self.invoices_frame, fg_color="transparent")
+        self.pos_sales_export_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.pos_sales_export_start = customtkinter.CTkEntry(self.pos_sales_export_bar, width=120, placeholder_text="Από (YYYY-MM-DD)")
+        self.pos_sales_export_start.pack(side="left", padx=(0, 5))
+        self.pos_sales_export_end = customtkinter.CTkEntry(self.pos_sales_export_bar, width=120, placeholder_text="Έως (YYYY-MM-DD)")
+        self.pos_sales_export_end.pack(side="left", padx=(0, 8))
+        self.pos_sales_export_format = customtkinter.CTkOptionMenu(self.pos_sales_export_bar, values=["Excel (.csv)", "PDF (.txt style)"], width=140)
+        self.pos_sales_export_format.pack(side="left", padx=(0, 8))
+        self.pos_sales_export_btn = customtkinter.CTkButton(self.pos_sales_export_bar, text="📤 Εξαγωγή Πωλήσεων", fg_color="#2980B9", hover_color="#1F618D",
+            font=customtkinter.CTkFont(weight="bold"), command=self.export_pos_sales)
+        self.pos_sales_export_btn.pack(side="left")
+
     def export_cart(self):
         """Export current POS cart as proforma quote to Desktop in a background thread."""
         filter_text = self.pos_export_filter.get().strip().lower()
@@ -1416,6 +1467,52 @@ class MainWindow(customtkinter.CTk):
                     with open(dest, "w", encoding="utf-8") as f:
                         f.write("\n".join(lines))
                 self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή", f"Το αρχείο αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
+        threading.Thread(target=_write, daemon=True).start()
+
+    def export_pos_sales(self):
+        """Export POS sales from DB within date range to Desktop in a background thread."""
+        start_date = self.pos_sales_export_start.get().strip() if hasattr(self, 'pos_sales_export_start') else ""
+        end_date = self.pos_sales_export_end.get().strip() if hasattr(self, 'pos_sales_export_end') else ""
+        fmt = self.pos_sales_export_format.get()
+        is_csv = "csv" in fmt.lower()
+
+        def _write():
+            try:
+                invoices = self.db_service.get_all_invoices(
+                    search_id="", start_date=start_date or None, end_date=end_date or None)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                if is_csv:
+                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"POS_Sales_{ts}.csv")
+                    lines = ["Αρ.Παραστατικού,Ημερομηνία,Υποσύνολο,ΦΠΑ,Γενικό Σύνολο,Πελάτης"]
+                    for inv in invoices:
+                        lines.append(f'{inv["id"]},{inv["date"]},{inv["subtotal"]:.2f},{inv["vat"]:.2f},{inv["total"]:.2f},{inv["customer_name"]}')
+                    with open(dest, "w", encoding="utf-8-sig") as f:
+                        f.write("\n".join(lines))
+                else:
+                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"POS_Sales_{ts}.txt")
+                    lines = ["=" * 65, "  ENCOMM — ΑΝΑΦΟΡΑ ΠΩΛΗΣΕΩΝ", "=" * 65,
+                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}  |  Εύρος: {start_date or '—'} έως {end_date or '—'}",
+                             f"Παραστατικά: {len(invoices)}", "=" * 65]
+                    total_revenue = 0.0
+                    for inv in invoices:
+                        total_revenue += inv["total"]
+                        lines.append(f"\n📋 {inv['id']}  |  {inv['date']}  |  Πελάτης: {inv['customer_name'] or 'Λιανική'}")
+                        lines.append(f"   Υποσύνολο: €{inv['subtotal']:.2f}  |  ΦΠΑ: €{inv['vat']:.2f}  |  Σύνολο: €{inv['total']:.2f}")
+                        items = self.db_service.get_invoice_items(inv["id"])
+                        if items:
+                            for it in items:
+                                qty = it.get("quantity", 0)
+                                price = it.get("price", 0.0)
+                                lines.append(f"   - {it.get('name', '')[:35]:<35} x{qty:<4} €{qty*price:.2f}")
+                    lines.append(f"\n{'=' * 65}")
+                    lines.append(f"  ΣΥΝΟΛΟ ΕΣΟΔΩΝ: €{total_revenue:.2f}")
+                    lines.append(f"{'=' * 65}")
+                    with open(dest, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines))
+                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
+                    "Το φιλτραρισμένο αρχείο βάσει ημερομηνιών αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
         threading.Thread(target=_write, daemon=True).start()
@@ -1869,6 +1966,137 @@ class MainWindow(customtkinter.CTk):
             messagebox.showerror("Σφάλμα", "Αποτυχία διαγραφής πελάτη.")
 
     # =========================================================================
+    # VIEW: SUPPLIERS
+    # =========================================================================
+    def _init_suppliers_frame(self):
+        self.suppliers_frame = customtkinter.CTkFrame(self.main_container, fg_color="transparent")
+        self.suppliers_frame.grid_columnconfigure(0, weight=1)
+        self.suppliers_frame.grid_rowconfigure(2, weight=1)
+
+        # Search bar
+        search_bar = customtkinter.CTkFrame(self.suppliers_frame, fg_color="transparent")
+        search_bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.supp_search_entry = customtkinter.CTkEntry(search_bar, placeholder_text="Αναζήτηση προμηθευτή...", width=300)
+        self.supp_search_entry.pack(side="left", padx=(0, 10))
+        self.supp_search_entry.bind("<KeyRelease>", lambda e: self.refresh_supplier_list())
+        customtkinter.CTkButton(search_bar, text="🔍", width=40, command=self.refresh_supplier_list).pack(side="left")
+
+        # Form
+        form = customtkinter.CTkFrame(self.suppliers_frame, fg_color="transparent")
+        form.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        customtkinter.CTkLabel(form, text="Όνομα:", font=customtkinter.CTkFont(weight="bold")).grid(row=0, column=0, padx=(0,5))
+        self.supp_name_entry = customtkinter.CTkEntry(form, width=180)
+        self.supp_name_entry.grid(row=0, column=1, padx=5)
+        customtkinter.CTkLabel(form, text="Τηλέφωνο:", font=customtkinter.CTkFont(weight="bold")).grid(row=0, column=2, padx=5)
+        self.supp_phone_entry = customtkinter.CTkEntry(form, width=140)
+        self.supp_phone_entry.grid(row=0, column=3, padx=5)
+        customtkinter.CTkLabel(form, text="Email:", font=customtkinter.CTkFont(weight="bold")).grid(row=0, column=4, padx=5)
+        self.supp_email_entry = customtkinter.CTkEntry(form, width=160)
+        self.supp_email_entry.grid(row=0, column=5, padx=5)
+        customtkinter.CTkLabel(form, text="Διεύθυνση:", font=customtkinter.CTkFont(weight="bold")).grid(row=1, column=0, padx=(0,5), pady=(10,0))
+        self.supp_addr_entry = customtkinter.CTkEntry(form, width=300)
+        self.supp_addr_entry.grid(row=1, column=1, columnspan=3, padx=5, pady=(10,0), sticky="ew")
+        customtkinter.CTkButton(form, text="💾 Αποθήκευση", fg_color=("#2ecc71", "#27ae60"), hover_color=("#27ae60", "#1e8449"),
+            text_color=("#FFFFFF", "#FFFFFF"), command=self.save_supplier).grid(row=1, column=5, padx=(10, 0), pady=(10, 0))
+        customtkinter.CTkButton(form, text="❌ Διαγραφή", fg_color=("#E74C3C", "#C0392B"), hover_color=("#C0392B", "#A93226"),
+            text_color=("#FFFFFF", "#FFFFFF"), command=self.delete_supplier).grid(row=1, column=6, padx=(10, 0), pady=(10, 0))
+
+        # Treeview
+        self.supp_tree = ttk.Treeview(self.suppliers_frame,
+            columns=("id", "name", "phone", "email", "address"), show="headings", height=15)
+        self.supp_tree.heading("id", text="ID")
+        self.supp_tree.heading("name", text="Όνομα")
+        self.supp_tree.heading("phone", text="Τηλέφωνο")
+        self.supp_tree.heading("email", text="Email")
+        self.supp_tree.heading("address", text="Διεύθυνση")
+        self.supp_tree.column("id", width=40)
+        self.supp_tree.column("name", width=200)
+        self.supp_tree.column("phone", width=120)
+        self.supp_tree.column("email", width=180)
+        self.supp_tree.column("address", width=250)
+        self.supp_tree.grid(row=2, column=0, sticky="nsew")
+
+        # ── Automated Order Generation ──
+        self.supp_order_btn = customtkinter.CTkButton(
+            self.suppliers_frame, text="📋 Αυτόματη Λίστα Παραγγελίας",
+            fg_color="#8E44AD", hover_color="#7D3C98",
+            font=customtkinter.CTkFont(weight="bold"),
+            command=self.generate_automated_orders
+        )
+        self.supp_order_btn.grid(row=3, column=0, pady=(10, 0))
+
+    def refresh_supplier_list(self):
+        if not hasattr(self, 'suppliers_frame') or self.suppliers_frame is None:
+            return
+        query = self.supp_search_entry.get().strip().lower() if hasattr(self, 'supp_search_entry') else ""
+        rows = self.db_service.get_all_suppliers()
+        if query:
+            rows = [r for r in rows if query in r["name"].lower()]
+        self.supp_tree.delete(*self.supp_tree.get_children())
+        for r in rows:
+            self.supp_tree.insert("", "end", values=(r["id"], r["name"], r["phone"], r["email"], r["address"]))
+
+    def save_supplier(self):
+        name = self.supp_name_entry.get().strip()
+        phone = self.supp_phone_entry.get().strip()
+        email = self.supp_email_entry.get().strip()
+        address = self.supp_addr_entry.get().strip()
+        if not name:
+            messagebox.showwarning("Προειδοποίηση", "Το όνομα είναι υποχρεωτικό.")
+            return
+        if self.db_service.add_supplier(name, phone, email, address):
+            self.supp_name_entry.delete(0, "end")
+            self.supp_phone_entry.delete(0, "end")
+            self.supp_email_entry.delete(0, "end")
+            self.supp_addr_entry.delete(0, "end")
+            self.refresh_supplier_list()
+            messagebox.showinfo("Επιτυχία", f"Ο προμηθευτής '{name}' αποθηκεύτηκε.")
+        else:
+            messagebox.showerror("Σφάλμα", "Αποτυχία αποθήκευσης (πιθανό διπλότυπο όνομα).")
+
+    def delete_supplier(self):
+        sel = self.supp_tree.selection()
+        if not sel:
+            messagebox.showwarning("Προειδοποίηση", "Παρακαλώ επιλέξτε έναν προμηθευτή από τη λίστα.")
+            return
+        supplier_id = self.supp_tree.item(sel[0])["values"][0]
+        name = self.supp_tree.item(sel[0])["values"][1]
+        if not messagebox.askyesno("Επιβεβαίωση Διαγραφής", f"Είστε βέβαιοι ότι θέλετε να διαγράψετε τον προμηθευτή '{name}';", icon="warning"):
+            return
+        if self.db_service.delete_supplier(int(supplier_id)):
+            messagebox.showinfo("Επιτυχία", f"Ο προμηθευτής '{name}' διαγράφηκε επιτυχώς.")
+            self.refresh_supplier_list()
+        else:
+            messagebox.showerror("Σφάλμα", "Αποτυχία διαγραφής προμηθευτή.")
+
+    def generate_automated_orders(self):
+        """Generate per-supplier procurement CSV files in a background thread."""
+        def _write():
+            try:
+                grouped = self.db_service.get_low_stock_by_supplier()
+                if not grouped:
+                    self.after(0, lambda: messagebox.showinfo("Ενημέρωση",
+                        "Δεν βρέθηκαν προϊόντα με χαμηλό στοκ που να αντιστοιχούν σε προμηθευτή."))
+                    return
+                ts = datetime.now().strftime("%Y%m%d")
+                count = 0
+                for sid, items in grouped.items():
+                    sname = items[0]["supplier_name"].replace(" ", "_") if items else f"Supplier_{sid}"
+                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Order_{sname}_{ts}.csv")
+                    lines = ["Barcode,Όνομα Προϊόντος,Τρέχον Στοκ,Προτεινόμενη Ποσότητα Παραγγελίας"]
+                    for it in items:
+                        suggested = max(50, (10 - it["stock"]) * 5) if it["stock"] < 10 else 50
+                        lines.append(f'{it["barcode"]},{it["name"]},{it["stock"]},{suggested}')
+                    with open(dest, "w", encoding="utf-8-sig") as f:
+                        f.write("\n".join(lines))
+                    count += 1
+                self.after(0, lambda: messagebox.showinfo("Έτοιμες Παραγγελίες",
+                    "Οι λίστες ανεφοδιασμού δημιουργήθηκαν στο Desktop ομαδοποιημένες ανά προμηθευτή!"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Σφάλμα", str(e)))
+        threading.Thread(target=_write, daemon=True).start()
+
+    # =========================================================================
     # VIEW: INVOICE HISTORY
     # =========================================================================
     def _init_invoice_history_frame(self):
@@ -1908,6 +2136,63 @@ class MainWindow(customtkinter.CTk):
         self.hist_tree.column("customer", width=150)
         self.hist_tree.grid(row=1, column=0, sticky="nsew")
         self.hist_tree.bind("<Double-1>", self._on_invoice_double_click)
+
+        # ── Smart Export control bar ──
+        self.hist_export_bar = customtkinter.CTkFrame(self.invoice_history_frame, fg_color="transparent")
+        self.hist_export_bar.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.hist_export_start = customtkinter.CTkEntry(self.hist_export_bar, width=120, placeholder_text="Από (YYYY-MM-DD)")
+        self.hist_export_start.pack(side="left", padx=(0, 5))
+        self.hist_export_end = customtkinter.CTkEntry(self.hist_export_bar, width=120, placeholder_text="Έως (YYYY-MM-DD)")
+        self.hist_export_end.pack(side="left", padx=(0, 8))
+        self.hist_export_format = customtkinter.CTkOptionMenu(self.hist_export_bar, values=["Excel (.csv)", "PDF (.txt style)"], width=140)
+        self.hist_export_format.pack(side="left", padx=(0, 8))
+        self.hist_export_btn = customtkinter.CTkButton(self.hist_export_bar, text="📤 Εξαγωγή Ιστορικού", fg_color="#2980B9", hover_color="#1F618D",
+            font=customtkinter.CTkFont(weight="bold"), command=self.export_invoice_history)
+        self.hist_export_btn.pack(side="left")
+
+    def export_invoice_history(self):
+        """Export filtered invoice history to Desktop in a background thread (dedicated date entries)."""
+        fmt = self.hist_export_format.get()
+        is_csv = "csv" in fmt.lower()
+        start_date = self.hist_export_start.get().strip() if hasattr(self, 'hist_export_start') else ""
+        end_date = self.hist_export_end.get().strip() if hasattr(self, 'hist_export_end') else ""
+        sid = self.hist_id_entry.get().strip() if hasattr(self, 'hist_id_entry') else ""
+
+        def _write():
+            try:
+                invoices = self.db_service.get_all_invoices(
+                    search_id=sid, start_date=start_date or None, end_date=end_date or None)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                if is_csv:
+                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Invoices_Ledger_{ts}.csv")
+                    lines = ["Αρ.Παραστατικού,Ημερομηνία,Υποσύνολο,ΦΠΑ,Γενικό Σύνολο,Πελάτης"]
+                    for inv in invoices:
+                        lines.append(f'{inv["id"]},{inv["date"]},{inv["subtotal"]:.2f},{inv["vat"]:.2f},{inv["total"]:.2f},{inv["customer_name"]}')
+                    with open(dest, "w", encoding="utf-8-sig") as f:
+                        f.write("\n".join(lines))
+                else:
+                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Invoices_Ledger_{ts}.txt")
+                    lines = ["=" * 65, "  ENCOMM — ΚΑΘΟΛΙΚΟ ΠΑΡΑΣΤΑΤΙΚΩΝ", "=" * 65,
+                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}  |  Εύρος: {start_date or '—'} έως {end_date or '—'}",
+                             f"Παραστατικά: {len(invoices)}", "=" * 65]
+                    for inv in invoices:
+                        lines.append(f"\n📋 {inv['id']}  |  {inv['date']}  |  Πελάτης: {inv['customer_name'] or 'Λιανική'}")
+                        lines.append(f"   Υποσύνολο: €{inv['subtotal']:.2f}  |  ΦΠΑ: €{inv['vat']:.2f}  |  Σύνολο: €{inv['total']:.2f}")
+                        items = self.db_service.get_invoice_items(inv["id"])
+                        if items:
+                            lines.append(f"   {'Είδος':<30} {'Ποσ.':<6} {'Τιμή':<8} {'Σύνολο':<10}")
+                            for it in items:
+                                qty = it.get("quantity", 0)
+                                price = it.get("price", 0.0)
+                                lines.append(f"   {it.get('name', '')[:30]:<30} {qty:<6} €{price:<7.2f} €{qty*price:<9.2f}")
+                    lines.append("\n" + "=" * 65)
+                    with open(dest, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines))
+                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
+                    "Το φιλτραρισμένο αρχείο βάσει ημερομηνιών αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
+        threading.Thread(target=_write, daemon=True).start()
 
     def refresh_invoice_history_list(self):
         if not hasattr(self, 'invoice_history_frame') or self.invoice_history_frame is None:
@@ -2559,6 +2844,26 @@ class ProductFormDialog(customtkinter.CTkToplevel):
         if self.product:
             self.entry_p.insert(0, f"{product.price:.2f}")
 
+        # Supplier
+        customtkinter.CTkLabel(self, text="Προμηθευτής:", font=customtkinter.CTkFont(weight="bold")).pack(padx=25, pady=(5, 2), anchor="w")
+        self.supplier_var = tk.StringVar(value="Κανένας")
+        self.supplier_menu = customtkinter.CTkOptionMenu(self, variable=self.supplier_var, values=["Κανένας"], width=330)
+        self.supplier_menu.pack(padx=25, pady=(0, 20))
+        self._supplier_map = {}
+        try:
+            suppliers = parent.db_service.get_all_suppliers()
+            names = ["Κανένας"] + [s["name"] for s in suppliers]
+            self.supplier_menu.configure(values=names)
+            for s in suppliers:
+                self._supplier_map[s["name"]] = s["id"]
+            if self.product and getattr(self.product, 'supplier_id', None):
+                for s in suppliers:
+                    if s["id"] == self.product.supplier_id:
+                        self.supplier_var.set(s["name"])
+                        break
+        except Exception:
+            pass
+
         # Buttons
         btn_frame = customtkinter.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill="x", padx=25, pady=5)
@@ -2608,8 +2913,10 @@ class ProductFormDialog(customtkinter.CTkToplevel):
             messagebox.showerror("Σφάλμα", "Η Ημερομηνία Λήξης πρέπει να είναι στη μορφή YYYY-MM-DD.")
             return
 
+        supplier_name = self.supplier_var.get()
+        supplier_id = self._supplier_map.get(supplier_name, None) if supplier_name != "Κανένας" else None
         self.result = {
             "barcode": barcode, "name": name, "stock": stock,
-            "expiry_date": expiry, "price": price
+            "expiry_date": expiry, "price": price, "supplier_id": supplier_id
         }
         self.destroy()

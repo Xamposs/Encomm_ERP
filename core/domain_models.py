@@ -8,6 +8,7 @@ class Product:
     stock: int
     expiry_date: str  # Format: YYYY-MM-DD
     price: float
+    supplier_id: int = None
 
 @dataclass
 class Invoice:
