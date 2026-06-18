@@ -1,0 +1,31 @@
+2026-06-19 00:06:43 - [AUTOMATION ENGINE] - INFO - === Automation Engine Started ===
+2026-06-19 00:06:43 - [AUTOMATION ENGINE] - INFO - Suite: C:\Users\xampos\Desktop\ERP\tests\test_suite.py
+2026-06-19 00:06:43 - [AUTOMATION ENGINE] - INFO - Heartbeat: 300s
+2026-06-19 00:06:43 - [AUTOMATION ENGINE] - ERROR - HEALTH CHECK: FAIL (exit code 1)
+2026-06-19 00:06:43 - [AUTOMATION ENGINE] - ERROR - --- TEST FAILURE TRACEBACK ---
+2026-06-19 00:06:43 - [AUTOMATION ENGINE] - ERROR - C:\Users\xampos\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\python.exe: No module named pytest
+2026-06-19 00:06:43 - [AUTOMATION ENGINE] - ERROR - --- END TRACEBACK ---
+2026-06-19 00:10:55 - [AUTOMATION ENGINE] - INFO - === Automation Engine Started ===
+2026-06-19 00:10:55 - [AUTOMATION ENGINE] - INFO - Suite: C:\Users\xampos\Desktop\ERP\tests\test_suite.py
+2026-06-19 00:10:55 - [AUTOMATION ENGINE] - INFO - Heartbeat: 300s
+2026-06-19 00:10:55 - [AUTOMATION ENGINE] - ERROR - HEALTH CHECK: FAIL (exit code 1)
+2026-06-19 00:10:55 - [AUTOMATION ENGINE] - ERROR - --- TEST FAILURE TRACEBACK ---
+2026-06-19 00:10:55 - [AUTOMATION ENGINE] - ERROR - C:\Users\xampos\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\python.exe: No module named pytest
+2026-06-19 00:10:55 - [AUTOMATION ENGINE] - ERROR - --- END TRACEBACK ---
+2026-06-19 00:12:11 - [AUTOMATION ENGINE] - INFO - === Automation Engine Started ===
+2026-06-19 00:12:11 - [AUTOMATION ENGINE] - INFO - Suite: C:\Users\xampos\Desktop\ERP\tests\test_suite.py
+2026-06-19 00:12:11 - [AUTOMATION ENGINE] - INFO - Heartbeat: 300s
+2026-06-19 00:12:11 - [AUTOMATION ENGINE] - ERROR - HEALTH CHECK: FAIL (exit code 1)
+2026-06-19 00:12:11 - [AUTOMATION ENGINE] - ERROR - --- TEST FAILURE TRACEBACK ---
+2026-06-19 00:12:11 - [AUTOMATION ENGINE] - ERROR - C:\Users\xampos\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\python.exe: No module named pytest
+2026-06-19 00:12:11 - [AUTOMATION ENGINE] - ERROR - --- END TRACEBACK ---
+2026-06-19 00:12:28 - [AUTOMATION ENGINE] - INFO - === Automation Engine Started ===
+2026-06-19 00:12:28 - [AUTOMATION ENGINE] - INFO - Suite: C:\Users\xampos\Desktop\ERP\tests\test_suite.py
+2026-06-19 00:12:28 - [AUTOMATION ENGINE] - INFO - Heartbeat: 300s
+2026-06-19 00:12:28 - [AUTOMATION ENGINE] - ERROR - HEALTH CHECK: FAIL (exit code 1)
+2026-06-19 00:12:28 - [AUTOMATION ENGINE] - ERROR - --- TEST FAILURE TRACEBACK ---
+2026-06-19 00:12:28 - [AUTOMATION ENGINE] - ERROR - C:\Users\xampos\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\python.exe: No module named pytest
+2026-06-19 00:12:28 - [AUTOMATION ENGINE] - ERROR - --- END TRACEBACK ---
+2026-06-19 00:16:29 - [AUTOMATION ENGINE] - INFO - === Automation Engine Started ===
+2026-06-19 00:16:29 - [AUTOMATION ENGINE] - INFO - Suite: C:\Users\xampos\Desktop\ERP\tests\test_suite.py
+2026-06-19 00:16:29 - [AUTOMATION ENGINE] - INFO - Heartbeat: 300s

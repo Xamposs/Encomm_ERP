@@ -9,9 +9,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # ---------------------------------------------------------------------------
 # Logging Configuration – Console + File (with milliseconds)
 # ---------------------------------------------------------------------------
-_LOG_FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s"
+_LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 _LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
-_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "encomm_erp.log")
+_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
 
 _logger = logging.getLogger()
 _logger.setLevel(logging.INFO)

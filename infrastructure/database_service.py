@@ -4,8 +4,11 @@ import logging
 from typing import List, Optional, Dict, Tuple
 from core.domain_models import Product
 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "encomm_erp.db")
+
 class DatabaseService:
-    def __init__(self, db_path: str = "pharmacy.db"):
+    def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._initialize_db()
 
@@ -96,6 +99,11 @@ class DatabaseService:
                 cursor.execute("ALTER TABLE ProductMaster ADD COLUMN supplier_id INTEGER")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+            # ── Performance Indexes ──
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_product_expiry ON ProductMaster(ExpiryDate)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_product_supplier ON ProductMaster(supplier_id)")
 
             # Add customer_id to invoices if it doesn't exist (migration-safe)
             try:
