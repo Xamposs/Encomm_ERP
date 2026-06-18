@@ -14,6 +14,7 @@ class DatabaseService:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         # PRAGMA optimizations for high-performance bulk operations
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-64000")
@@ -48,12 +49,52 @@ class DatabaseService:
                     Value TEXT NOT NULL
                 )
             """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS invoices (
+                    id           TEXT PRIMARY KEY,
+                    invoice_date TEXT    NOT NULL,
+                    subtotal     REAL    NOT NULL,
+                    vat_amount   REAL    NOT NULL,
+                    grand_total  REAL    NOT NULL
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS invoice_items (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    invoice_id TEXT    NOT NULL,
+                    barcode    TEXT    NOT NULL,
+                    name       TEXT    NOT NULL,
+                    quantity   INTEGER NOT NULL,
+                    price      REAL    NOT NULL,
+                    FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS customers (
+                    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name  TEXT    NOT NULL,
+                    amka  TEXT    UNIQUE,
+                    phone TEXT
+                )
+            """)
+
+            # Add customer_id to invoices if it doesn't exist (migration-safe)
+            try:
+                cursor.execute("ALTER TABLE invoices ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
             conn.commit()
 
             # Performance indexes for 100K+ row queries
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_product_name ON ProductMaster(Name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_product_stock ON ProductMaster(Stock)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_product_expiry ON ProductMaster(ExpiryDate)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_inv_items_invoice ON invoice_items(invoice_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id)")
             conn.commit()
 
             # Check if table is empty, and insert premium mock data for demonstration
@@ -605,3 +646,244 @@ class DatabaseService:
                 logging.warning(f"Expected WAL journal mode but got '{mode}'.")
         except sqlite3.Error as e:
             logging.warning(f"Could not verify WAL journal mode: {e}")
+
+    # =================================================================
+    # INVOICE TRANSACTION LOGGING
+    # =================================================================
+    def save_invoice_transaction(
+        self,
+        invoice_id: str,
+        subtotal: float,
+        vat_amount: float,
+        grand_total: float,
+        items_list,
+        customer_id: int = None,
+    ) -> bool:
+        """Atomically persist an invoice master row and its line items.
+
+        ``items_list`` is a list of ``(Product, quantity)`` tuples matching
+        the cart signature used throughout the POS layer.
+        ``customer_id`` optionally links the invoice to a customers row.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                conn.execute(
+                    "INSERT INTO invoices (id, invoice_date, subtotal, "
+                    "vat_amount, grand_total, customer_id) "
+                    "VALUES (?, datetime('now'), ?, ?, ?, ?)",
+                    (invoice_id, subtotal, vat_amount, grand_total, customer_id),
+                )
+                conn.executemany(
+                    "INSERT INTO invoice_items "
+                    "(invoice_id, barcode, name, quantity, price) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (invoice_id, p.barcode, p.name, qty, p.price)
+                        for p, qty in items_list
+                    ],
+                )
+                conn.commit()
+                logging.info(
+                    "Invoice %s saved with %d items.",
+                    invoice_id, len(items_list),
+                )
+                return True
+            except Exception:
+                conn.rollback()
+                logging.exception(
+                    "Failed to save invoice %s — rolled back.", invoice_id
+                )
+                return False
+        except sqlite3.Error as e:
+            logging.error("DB error saving invoice %s: %s", invoice_id, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    # =================================================================
+    # CUSTOMER REGISTRY
+    # =================================================================
+    def add_customer(self, name: str, amka: str = "", phone: str = "") -> bool:
+        """Insert a new customer; AMKA is optional but unique when provided."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute(
+                "INSERT INTO customers (name, amka, phone) VALUES (?, ?, ?)",
+                (name, amka or None, phone or None),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            logging.warning("Customer with AMKA '%s' already exists.", amka)
+            return False
+        except sqlite3.Error as e:
+            logging.error("Error adding customer: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def get_all_customers(self) -> List[Dict]:
+        """Return all customers ordered by name."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            rows = conn.execute(
+                "SELECT id, name, amka, phone FROM customers ORDER BY name ASC"
+            ).fetchall()
+            return [{"id": r["id"], "name": r["name"], "amka": r["amka"] or "", "phone": r["phone"] or ""} for r in rows]
+        except sqlite3.Error as e:
+            logging.error("Error fetching customers: %s", e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def search_customers(self, query: str) -> List[Dict]:
+        """Search customers by name, AMKA, or phone."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            like = f"%{query}%"
+            rows = conn.execute(
+                "SELECT id, name, amka, phone FROM customers "
+                "WHERE name LIKE ? OR amka LIKE ? OR phone LIKE ? "
+                "ORDER BY name ASC LIMIT 50",
+                (like, like, like),
+            ).fetchall()
+            return [{"id": r["id"], "name": r["name"], "amka": r["amka"] or "", "phone": r["phone"] or ""} for r in rows]
+        except sqlite3.Error as e:
+            logging.error("Error searching customers: %s", e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def delete_customer(self, customer_id: int) -> bool:
+        """Delete a customer by ID. Returns True on success, False on failure."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("Error deleting customer %s: %s", customer_id, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    # =================================================================
+    # INVOICE HISTORY
+    # =================================================================
+    def get_all_invoices(
+        self,
+        search_id: str = "",
+        start_date: str = None,
+        end_date: str = None,
+        customer_id: int = None,
+    ) -> List[Dict]:
+        """Return invoices optionally filtered by ID, date range, or customer."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conditions = []
+            params = []
+            if search_id:
+                conditions.append("i.id LIKE ?")
+                params.append(f"%{search_id}%")
+            if start_date:
+                conditions.append("date(i.invoice_date) >= date(?)")
+                params.append(start_date)
+            if end_date:
+                conditions.append("date(i.invoice_date) <= date(?)")
+                params.append(end_date)
+            if customer_id is not None:
+                conditions.append("i.customer_id = ?")
+                params.append(customer_id)
+            where = (" AND ".join(conditions)) if conditions else "1=1"
+            rows = conn.execute(
+                f"SELECT i.id, i.invoice_date, i.subtotal, i.vat_amount, i.grand_total, "
+                f"i.customer_id, c.name as customer_name "
+                f"FROM invoices i LEFT JOIN customers c ON i.customer_id = c.id "
+                f"WHERE {where} ORDER BY i.invoice_date DESC LIMIT 200",
+                params,
+            ).fetchall()
+            return [{
+                "id": r["id"], "date": r["invoice_date"], "subtotal": r["subtotal"],
+                "vat": r["vat_amount"], "total": r["grand_total"],
+                "customer_id": r["customer_id"], "customer_name": r["customer_name"] or "",
+            } for r in rows]
+        except sqlite3.Error as e:
+            logging.error("Error fetching invoices: %s", e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def get_invoice_items(self, invoice_id: str) -> List[Dict]:
+        """Return line items for a given invoice."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            rows = conn.execute(
+                "SELECT barcode, name, quantity, price FROM invoice_items "
+                "WHERE invoice_id = ? ORDER BY id ASC",
+                (invoice_id,),
+            ).fetchall()
+            return [{"barcode": r["barcode"], "name": r["name"], "quantity": r["quantity"], "price": r["price"]} for r in rows]
+        except sqlite3.Error as e:
+            logging.error("Error fetching invoice items for '%s': %s", invoice_id, e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    # =================================================================
+    # LIVE DASHBOARD ANALYTICS
+    # =================================================================
+    def get_dashboard_analytics(self) -> Dict:
+        """Return aggregated analytics: today's revenue, VAT, top-5 products."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            today = conn.execute(
+                "SELECT COALESCE(SUM(grand_total), 0) FROM invoices "
+                "WHERE date(invoice_date) = date('now')"
+            ).fetchone()[0]
+            vat_today = conn.execute(
+                "SELECT COALESCE(SUM(vat_amount), 0) FROM invoices "
+                "WHERE date(invoice_date) = date('now')"
+            ).fetchone()[0]
+            total_revenue = conn.execute(
+                "SELECT COALESCE(SUM(grand_total), 0) FROM invoices"
+            ).fetchone()[0]
+            invoice_count = conn.execute(
+                "SELECT COUNT(*) FROM invoices"
+            ).fetchone()[0]
+            top_products = conn.execute(
+                "SELECT name, SUM(quantity) as total_qty, SUM(quantity * price) as total_sales "
+                "FROM invoice_items GROUP BY name ORDER BY total_qty DESC LIMIT 5"
+            ).fetchall()
+            return {
+                "revenue_today": today,
+                "vat_today": vat_today,
+                "total_revenue": total_revenue,
+                "invoice_count": invoice_count,
+                "top_products": [
+                    {"name": r["name"], "qty": r["total_qty"], "sales": r["total_sales"]}
+                    for r in top_products
+                ],
+            }
+        except sqlite3.Error as e:
+            logging.error("Error in get_dashboard_analytics: %s", e)
+            return {"revenue_today": 0, "vat_today": 0, "total_revenue": 0, "invoice_count": 0, "top_products": []}
+        finally:
+            if conn:
+                conn.close()
