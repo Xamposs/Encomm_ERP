@@ -35,7 +35,7 @@ def main():
 
     # Configure application thresholds with fallback default parameters
     config = {
-        "db_path": os.getenv("DB_PATH", "pharmacy.db"),
+        "db_path": os.getenv("DB_PATH", "encomm_erp.db"),
         "vat_rate": float(os.getenv("VAT_RATE", "0.15")),
         "low_stock_threshold": int(os.getenv("LOW_STOCK_THRESHOLD", "10")),
         "expiry_alert_days": int(os.getenv("EXPIRY_ALERT_DAYS", "30")),

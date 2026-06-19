@@ -48,6 +48,14 @@ def _header_bg() -> tuple:
     return ("gray75", "gray20")
 
 
+def _csv_cell(val) -> str:
+    """Escape a CSV cell: wrap in quotes if it contains comma, quote, or newline."""
+    s = str(val)
+    if "," in s or '"' in s or "\n" in s:
+        s = '"' + s.replace('"', '""') + '"'
+    return s
+
+
 def _header_fg() -> tuple:
     return ("gray30", "gray80")
 
@@ -794,7 +802,7 @@ class MainWindow(customtkinter.CTk):
                     dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Dashboard_Export_{ts}.csv")
                     lines = ["Όνομα,Στοκ,Ημ.Λήξης,Αιτία"]
                     for r in rows:
-                        lines.append(f'{r["name"]},{r["stock"]},{r["expiry"]},{r["reason"]}')
+                        lines.append(f'{_csv_cell(r["name"])},{r["stock"]},{_csv_cell(r["expiry"])},{_csv_cell(r["reason"])}')
                     with open(dest, "w", encoding="utf-8-sig") as f:
                         f.write("\n".join(lines))
                 else:
@@ -1021,7 +1029,7 @@ class MainWindow(customtkinter.CTk):
                     dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Inventory_Export_{ts}.csv")
                     lines = ["Barcode,Όνομα,Στοκ,Ημ.Λήξης,Τιμή"]
                     for p in products:
-                        lines.append(f'{p.barcode},{p.name},{p.stock},{p.expiry_date},{p.price:.2f}')
+                        lines.append(f'{_csv_cell(p.barcode)},{_csv_cell(p.name)},{p.stock},{_csv_cell(p.expiry_date)},{p.price:.2f}')
                     with open(dest, "w", encoding="utf-8-sig") as f:
                         f.write("\n".join(lines))
                 else:
@@ -1438,17 +1446,18 @@ class MainWindow(customtkinter.CTk):
                     pass
                 subtotal = sum(p.price * q for p, q in items)
                 total_qty = sum(q for _, q in items)
-                vat = subtotal * 0.15
+                vat_rate = float(self.config.get("vat_rate", 0.15))
+                vat = subtotal * vat_rate
                 grand = subtotal + vat
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 if is_csv:
                     dest = os.path.join(os.path.expanduser("~"), "Desktop", f"POS_Cart_Export_{ts}.csv")
                     lines = ["Barcode,Όνομα,Ποσότητα,Τιμή Μον.,Σύνολο"]
                     for p, q in items:
-                        lines.append(f'{p.barcode},{p.name},{q},{p.price:.2f},{p.price*q:.2f}')
+                        lines.append(f'{_csv_cell(p.barcode)},{_csv_cell(p.name)},{q},{p.price:.2f},{p.price*q:.2f}')
                     lines.append(f"")
                     lines.append(f"Υποσύνολο,,{total_qty},,{subtotal:.2f}")
-                    lines.append(f"ΦΠΑ 15%,,,,{vat:.2f}")
+                    lines.append(f"ΦΠΑ {vat_rate*100:.1f}%,,,,{vat:.2f}")
                     lines.append(f"ΓΕΝΙΚΟ ΣΥΝΟΛΟ,,,,{grand:.2f}")
                     with open(dest, "w", encoding="utf-8-sig") as f:
                         f.write("\n".join(lines))
@@ -1487,7 +1496,7 @@ class MainWindow(customtkinter.CTk):
                     dest = os.path.join(os.path.expanduser("~"), "Desktop", f"POS_Sales_{ts}.csv")
                     lines = ["Αρ.Παραστατικού,Ημερομηνία,Υποσύνολο,ΦΠΑ,Γενικό Σύνολο,Πελάτης"]
                     for inv in invoices:
-                        lines.append(f'{inv["id"]},{inv["date"]},{inv["subtotal"]:.2f},{inv["vat"]:.2f},{inv["total"]:.2f},{inv["customer_name"]}')
+                        lines.append(f'{_csv_cell(inv["id"])},{_csv_cell(inv["date"])},{inv["subtotal"]:.2f},{inv["vat"]:.2f},{inv["total"]:.2f},{_csv_cell(inv["customer_name"])}')
                     with open(dest, "w", encoding="utf-8-sig") as f:
                         f.write("\n".join(lines))
                 else:
@@ -1792,22 +1801,45 @@ class MainWindow(customtkinter.CTk):
         succeeded: List[Tuple[Product, int]] = []
         failed_items: List[Tuple[str, str]] = []  # (name, reason)
 
-        for p, qty in self.invoice_cart:
-            db_p = self.db_service.get_product(p.barcode)
-            if not db_p:
-                failed_items.append((p.name, "Το προϊόν δεν βρέθηκε στη βάση δεδομένων."))
-                continue
-            if db_p.stock < qty:
-                failed_items.append((
-                    p.name,
-                    f"Απαιτούνται {qty} τεμ., διαθέσιμα μόνο {db_p.stock}.",
-                ))
-                continue
-            new_stock = db_p.stock - qty
-            if not self.db_service.update_stock(p.barcode, new_stock):
-                failed_items.append((p.name, "Σφάλμα εγγραφής αποθέματος (DB)."))
-                continue
-            succeeded.append((p, qty))
+        # ── Atomic transaction: validate ALL items first, then commit or rollback ──
+        conn = None
+        try:
+            conn = self.db_service._get_connection()
+            conn.execute("BEGIN TRANSACTION")
+
+            for p, qty in self.invoice_cart:
+                db_p = self.db_service.get_product(p.barcode)
+                if not db_p:
+                    failed_items.append((p.name, "Το προϊόν δεν βρέθηκε στη βάση δεδομένων."))
+                    continue
+                if db_p.stock < qty:
+                    failed_items.append((
+                        p.name,
+                        f"Απαιτούνται {qty} τεμ., διαθέσιμα μόνο {db_p.stock}.",
+                    ))
+                    continue
+                new_stock = db_p.stock - qty
+                conn.execute(
+                    "UPDATE ProductMaster SET Stock = ? WHERE Barcode = ?",
+                    (new_stock, p.barcode))
+                succeeded.append((p, qty))
+
+            if not failed_items:
+                conn.commit()
+            else:
+                conn.rollback()
+                succeeded.clear()
+        except Exception:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            succeeded.clear()
+            failed_items.append(("Σύστημα", "Κρίσιμο σφάλμα βάσης δεδομένων. Η συναλλαγή ακυρώθηκε."))
+        finally:
+            if conn:
+                conn.close()
 
         # --- Handle partial / total failure ---
         if failed_items:
@@ -2217,7 +2249,7 @@ class MainWindow(customtkinter.CTk):
                     dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Invoices_Ledger_{ts}.csv")
                     lines = ["Αρ.Παραστατικού,Ημερομηνία,Υποσύνολο,ΦΠΑ,Γενικό Σύνολο,Πελάτης"]
                     for inv in invoices:
-                        lines.append(f'{inv["id"]},{inv["date"]},{inv["subtotal"]:.2f},{inv["vat"]:.2f},{inv["total"]:.2f},{inv["customer_name"]}')
+                        lines.append(f'{_csv_cell(inv["id"])},{_csv_cell(inv["date"])},{inv["subtotal"]:.2f},{inv["vat"]:.2f},{inv["total"]:.2f},{_csv_cell(inv["customer_name"])}')
                     with open(dest, "w", encoding="utf-8-sig") as f:
                         f.write("\n".join(lines))
                 else:
@@ -2398,7 +2430,7 @@ class MainWindow(customtkinter.CTk):
     def load_settings_values(self):
         self.set_vat_entry.configure(state="normal")
         self.set_vat_entry.delete(0, tk.END)
-        self.set_vat_entry.insert(0, str(self.config.get("vat_rate", 0.24)))
+        self.set_vat_entry.insert(0, str(self.config.get("vat_rate", 0.15)))
 
         self.set_stock_entry.configure(state="normal")
         self.set_stock_entry.delete(0, tk.END)
