@@ -1549,14 +1549,64 @@ class MainWindow(customtkinter.CTk):
             pass
 
     def _on_pos_customer_selected(self, choice: str):
-        """Extract customer ID from dropdown selection."""
+        """Extract customer ID and trigger history popup or close existing one."""
         if choice.startswith("Λιανική"):
             self._selected_customer_id = None
+            if hasattr(self, 'cust_popup') and self.cust_popup.winfo_exists():
+                self.cust_popup.destroy()
         else:
             try:
                 self._selected_customer_id = int(choice.split(":")[0])
+                customer_name = choice.split(": ", 1)[1] if ": " in choice else choice
+                self.after(80, lambda: self.show_customer_history_popup(self._selected_customer_id, customer_name))
             except (ValueError, IndexError):
                 self._selected_customer_id = None
+
+    def show_customer_history_popup(self, customer_id: int, customer_name: str):
+        """Spawn a CTkToplevel popup with the customer's last 5 purchases."""
+        if hasattr(self, 'cust_popup') and self.cust_popup.winfo_exists():
+            self.cust_popup.destroy()
+
+        self.cust_popup = customtkinter.CTkToplevel(self)
+        self.cust_popup.title("👤 Ιστορικό Αγορών")
+        self.cust_popup.geometry("450x320")
+        self.cust_popup.resizable(False, False)
+        self.cust_popup.transient(self)
+        self.cust_popup.after(100, lambda: self.cust_popup.lift())
+
+        customtkinter.CTkLabel(self.cust_popup,
+            text=f"Πρόσφατες αγορές: {customer_name}",
+            font=customtkinter.CTkFont(size=13, weight="bold")).pack(pady=15)
+
+        scroll = customtkinter.CTkScrollableFrame(self.cust_popup, width=410, height=220)
+        scroll.pack(padx=20, pady=(0, 15), fill="both", expand=True)
+
+        loading = customtkinter.CTkLabel(scroll, text="🔄 Ανάκτηση ιστορικού από τη βάση δεδομένων...",
+            font=customtkinter.CTkFont(size=12))
+        loading.pack(pady=20)
+
+        def _fetch():
+            try:
+                rows = self.db_service.get_customer_purchase_history(customer_id)
+                self.after(0, lambda: _render(rows))
+            except Exception as e:
+                self.after(0, lambda: loading.configure(text=f"Σφάλμα: {e}"))
+
+        def _render(rows):
+            for w in scroll.winfo_children():
+                w.destroy()
+            if not rows:
+                customtkinter.CTkLabel(scroll,
+                    text="Δεν βρέθηκαν παλαιότερες αγορές για τον συγκεκριμένο πελάτη.",
+                    font=customtkinter.CTkFont(size=11), wraplength=380).pack(pady=20)
+                return
+            for r in rows:
+                line = f"📅 [{r['date']}] - {r['name']} (Τεμ: {r['qty']} - €{r['price']:.2f})"
+                customtkinter.CTkLabel(scroll, text=line, font=customtkinter.CTkFont(size=11),
+                    anchor="w", justify="left").pack(anchor="w", pady=2)
+                customtkinter.CTkFrame(scroll, height=1, fg_color=("gray85", "gray25")).pack(fill="x", pady=1)
+
+        threading.Thread(target=_fetch, daemon=True).start()
 
     def _pos_search_changed(self):
         """Throttle input bursts using a 250ms debounce window before querying the DB."""

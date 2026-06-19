@@ -888,6 +888,30 @@ class DatabaseService:
     # =================================================================
     # INVOICE HISTORY
     # =================================================================
+    def get_customer_purchase_history(self, customer_id: int, limit: int = 5) -> List[Dict]:
+        """Return the last N purchased items for a given customer via JOIN."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            rows = conn.execute("""
+                SELECT ii.name, ii.quantity, ii.price, i.invoice_date
+                FROM invoice_items ii
+                JOIN invoices i ON ii.invoice_id = i.id
+                WHERE i.customer_id = ?
+                ORDER BY i.invoice_date DESC
+                LIMIT ?
+            """, (customer_id, limit)).fetchall()
+            return [{
+                "name": r["name"], "qty": r["quantity"],
+                "price": r["price"], "date": r["invoice_date"]
+            } for r in rows]
+        except sqlite3.Error as e:
+            logging.error("Error fetching purchase history for customer %s: %s", customer_id, e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
     def get_all_invoices(
         self,
         search_id: str = "",

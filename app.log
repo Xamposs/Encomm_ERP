@@ -1,0 +1,68 @@
+2026-06-19 00:48:05 - INFO - === ENCOMM ERP STARTED ===
+2026-06-19 00:48:05 - INFO - Database location: pharmacy.db
+2026-06-19 00:48:05 - INFO - WAL journal mode is active — confirmed.
+2026-06-19 00:48:05 - INFO - Loaded 8 config keys from database.
+2026-06-19 00:48:05 - INFO - Final config — VAT: 40.0%, LowStock: 10, ExpiryAlert: 30d
+2026-06-19 00:48:05 - INFO - Starting main GUI application window...
+2026-06-19 00:48:06 - INFO - Dashboard DB fetch (threaded) in 65ms | 20 alerts
+2026-06-19 00:48:06 - INFO - HWID generated: A3BB1306464971D54F4AC7B7468B023E
+2026-06-19 00:48:09 - INFO - Inventory DB fetch (threaded) in 4ms | page 1/5001
+2026-06-19 00:48:56 - INFO - Inventory DB fetch (threaded) in 2ms | page 1/5001
+2026-06-19 00:49:22 - INFO - Invoice INV-20260619-004922 saved with 1 items.
+2026-06-19 00:49:33 - INFO - Dashboard DB fetch (threaded) in 68ms | 20 alerts
+2026-06-19 00:53:36 - INFO - Safe exit triggered — hard OS-level kill...
+2026-06-19 00:58:36 - INFO - === ENCOMM ERP STARTED ===
+2026-06-19 00:58:36 - INFO - Database location: pharmacy.db
+2026-06-19 00:58:36 - INFO - WAL journal mode is active — confirmed.
+2026-06-19 00:58:36 - INFO - Loaded 8 config keys from database.
+2026-06-19 00:58:36 - INFO - Final config — VAT: 40.0%, LowStock: 10, ExpiryAlert: 30d
+2026-06-19 00:58:36 - INFO - Starting main GUI application window...
+2026-06-19 00:58:37 - INFO - Dashboard DB fetch (threaded) in 66ms | 20 alerts
+2026-06-19 00:58:37 - INFO - HWID generated: A3BB1306464971D54F4AC7B7468B023E
+2026-06-19 00:59:19 - INFO - Safe exit triggered — hard OS-level kill...
+2026-06-19 10:40:20 - INFO - === ENCOMM ERP STARTED ===
+2026-06-19 10:40:20 - INFO - Database location: pharmacy.db
+2026-06-19 10:40:20 - INFO - WAL journal mode is active — confirmed.
+2026-06-19 10:40:20 - INFO - Loaded 8 config keys from database.
+2026-06-19 10:40:20 - INFO - Final config — VAT: 40.0%, LowStock: 10, ExpiryAlert: 30d
+2026-06-19 10:40:20 - INFO - Starting main GUI application window...
+2026-06-19 10:40:21 - INFO - Dashboard DB fetch (threaded) in 63ms | 20 alerts
+2026-06-19 10:40:21 - INFO - HWID generated: A3BB1306464971D54F4AC7B7468B023E
+2026-06-19 10:40:23 - INFO - Inventory DB fetch (threaded) in 3ms | page 1/5001
+2026-06-19 10:40:46 - INFO - Inventory DB fetch (threaded) in 3ms | page 1/5001
+2026-06-19 10:40:50 - INFO - Safe exit triggered — hard OS-level kill...
+2026-06-19 11:26:11 - INFO - === ENCOMM ERP STARTED ===
+2026-06-19 11:26:11 - INFO - Database location: pharmacy.db
+2026-06-19 11:26:11 - INFO - WAL journal mode is active — confirmed.
+2026-06-19 11:26:11 - INFO - Loaded 8 config keys from database.
+2026-06-19 11:26:11 - INFO - Final config — VAT: 40.0%, LowStock: 10, ExpiryAlert: 30d
+2026-06-19 11:26:11 - INFO - Starting main GUI application window...
+2026-06-19 11:26:12 - INFO - Dashboard DB fetch (threaded) in 66ms | 20 alerts
+2026-06-19 11:26:12 - INFO - HWID generated: A3BB1306464971D54F4AC7B7468B023E
+2026-06-19 11:26:15 - INFO - Inventory DB fetch (threaded) in 4ms | page 1/5001
+2026-06-19 11:26:23 - INFO - Inventory DB fetch (threaded) in 2ms | page 1/5001
+2026-06-19 11:26:24 - INFO - Dashboard DB fetch (threaded) in 64ms | 20 alerts
+2026-06-19 11:26:29 - INFO - Safe exit triggered — hard OS-level kill...
+2026-06-19 11:31:27 - INFO - === ENCOMM ERP STARTED ===
+2026-06-19 11:31:27 - INFO - Database location: pharmacy.db
+2026-06-19 11:31:27 - INFO - WAL journal mode is active — confirmed.
+2026-06-19 11:31:27 - INFO - Loaded 8 config keys from database.
+2026-06-19 11:31:27 - INFO - Final config — VAT: 40.0%, LowStock: 10, ExpiryAlert: 30d
+2026-06-19 11:31:27 - INFO - Starting main GUI application window...
+2026-06-19 11:31:28 - INFO - Dashboard DB fetch (threaded) in 67ms | 20 alerts
+2026-06-19 11:31:28 - INFO - HWID generated: A3BB1306464971D54F4AC7B7468B023E
+2026-06-19 11:33:29 - INFO - Dashboard DB fetch (threaded) in 64ms | 20 alerts
+2026-06-19 11:34:49 - INFO - Safe exit triggered — hard OS-level kill...
+2026-06-19 11:50:49 - INFO - === ENCOMM ERP STARTED ===
+2026-06-19 11:50:49 - INFO - Database location: pharmacy.db
+2026-06-19 11:50:49 - INFO - WAL journal mode is active — confirmed.
+2026-06-19 11:50:49 - INFO - Loaded 8 config keys from database.
+2026-06-19 11:50:49 - INFO - Final config — VAT: 40.0%, LowStock: 10, ExpiryAlert: 30d
+2026-06-19 11:50:49 - INFO - Starting main GUI application window...
+2026-06-19 11:50:50 - INFO - Dashboard DB fetch (threaded) in 65ms | 20 alerts
+2026-06-19 11:50:50 - INFO - HWID generated: A3BB1306464971D54F4AC7B7468B023E
+2026-06-19 11:50:53 - INFO - Inventory DB fetch (threaded) in 4ms | page 1/5001
+2026-06-19 11:51:03 - INFO - Inventory DB fetch (threaded) in 4ms | page 1/5001
+2026-06-19 11:51:08 - INFO - Inventory DB fetch (threaded) in 4ms | page 1/5001
+2026-06-19 11:51:08 - INFO - Dashboard DB fetch (threaded) in 65ms | 20 alerts
+2026-06-19 12:15:54 - INFO - Safe exit triggered — hard OS-level kill...
