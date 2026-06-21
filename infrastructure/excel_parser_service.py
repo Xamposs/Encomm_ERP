@@ -34,7 +34,7 @@ class ExcelParserService:
         -------
         list[tuple]
             Each tuple: ``(barcode: str, name: str, stock: int,
-                           expiry_date: str, price: float)``
+                           expiry_date: str, price: float[, supplier_id: int])``
         """
         if not os.path.isfile(file_path):
             logger.error(f"File not found: {file_path}")
@@ -113,7 +113,9 @@ class ExcelParserService:
         safely cast, so the rest of the file continues uninterrupted.
         """
         try:
-            # Flatten any None padding and ensure at least 5 columns
+            # Flatten any None padding and ensure at least 5 columns.
+            # Note: supplier_id (6th column) is optional — the DB layer
+            # handles it via COALESCE in bulk_upsert.
             values = list(raw) + [None] * 5
             values = values[:5]
 

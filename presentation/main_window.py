@@ -1366,7 +1366,8 @@ class MainWindow(customtkinter.CTk):
         self.sum_subtotal = customtkinter.CTkLabel(self.pos_right_panel, text="Υποσύνολο: €0.00", font=customtkinter.CTkFont(size=13))
         self.sum_subtotal.pack(padx=20, pady=5, anchor="w")
 
-        self.sum_vat = customtkinter.CTkLabel(self.pos_right_panel, text="ΦΠΑ (15.0%): €0.00", font=customtkinter.CTkFont(size=13))
+        vat_pct = float(self.config.get("vat_rate", 0.15)) * 100
+        self.sum_vat = customtkinter.CTkLabel(self.pos_right_panel, text=f"ΦΠΑ ({vat_pct:.1f}%): €0.00", font=customtkinter.CTkFont(size=13))
         self.sum_vat.pack(padx=20, pady=5, anchor="w")
 
         self.sum_total = customtkinter.CTkLabel(self.pos_right_panel, text="Γενικό Σύνολο: €0.00", font=customtkinter.CTkFont(size=20, weight="bold"), text_color="#34C759")
@@ -1470,7 +1471,8 @@ class MainWindow(customtkinter.CTk):
                         lines.append(f"{p.barcode:<14} {p.name[:22]:<22} {q:<6} €{p.price:<7.2f} €{p.price*q:<9.2f}")
                     lines.append("-" * 55)
                     lines.append(f"{'Υποσύνολο:':<42} €{subtotal:.2f}")
-                    lines.append(f"{'ΦΠΑ (15%):':<42} €{vat:.2f}")
+                    vat_label = f"ΦΠΑ ({vat_rate*100:.1f}%):"
+                    lines.append(vat_label.ljust(42) + f" €{vat:.2f}")
                     lines.append(f"{'ΓΕΝΙΚΟ ΣΥΝΟΛΟ:':<42} €{grand:.2f}")
                     lines.append("=" * 55)
                     with open(dest, "w", encoding="utf-8") as f:

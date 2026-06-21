@@ -80,11 +80,11 @@ def main():
                      f"LowStock: {config['low_stock_threshold']}, "
                      f"ExpiryAlert: {config['expiry_alert_days']}d")
 
-        # 2. Instantiate MainWindow — renders empty window immediately via internal update_idletasks()
+        # 3. Instantiate MainWindow — renders empty window immediately via internal update_idletasks()
         app = MainWindow(db_service=db_service, config=config)
         app.update_idletasks()  # belt-and-suspenders: ensure window pixels are on screen
         
-        # 3. Start the CustomTkinter GUI main event loop (UI builds inside callbacks)
+        # 4. Start the CustomTkinter GUI main event loop (UI builds inside callbacks)
         logging.info("Starting main GUI application window...")
         app.mainloop()
         

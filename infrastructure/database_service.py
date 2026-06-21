@@ -140,18 +140,18 @@ class DatabaseService:
     def _insert_dummy_data(self, cursor: sqlite3.Cursor):
         """Seed the database with high-quality sample pharmacy items."""
         dummy_products = [
-            ("8801234567890", "Paracetamol 500mg (Panadol)", 150, "2027-08-15", 3.50),
-            ("8801234567891", "Amoxicillin 250mg (Antibiotic)", 8, "2026-06-10", 12.99), # Low stock & Near expiry (rel. to June 2026)
-            ("8801234567892", "Ibuprofen 400mg (Advil)", 80, "2027-01-20", 5.25),
-            ("8801234567893", "Atorvastatin 20mg (Lipitor)", 4, "2026-05-30", 25.00), # Low stock & Expired
-            ("8801234567894", "Metformin 850mg (Glucophage)", 200, "2028-11-05", 9.80),
-            ("8801234567895", "Omeprazole 20mg (Prilosec)", 12, "2026-06-22", 8.45), # Near expiry
-            ("8801234567896", "Lisinopril 10mg (Zestril)", 95, "2027-04-12", 11.20),
-            ("8801234567897", "Cetirizine 10mg (Zyrtec)", 180, "2028-02-18", 4.99),
+            ("8801234567890", "Paracetamol 500mg (Panadol)", 150, "2027-08-15", 3.50, None),
+            ("8801234567891", "Amoxicillin 250mg (Antibiotic)", 8, "2026-06-10", 12.99, None), # Low stock & Near expiry (rel. to June 2026)
+            ("8801234567892", "Ibuprofen 400mg (Advil)", 80, "2027-01-20", 5.25, None),
+            ("8801234567893", "Atorvastatin 20mg (Lipitor)", 4, "2026-05-30", 25.00, None), # Low stock & Expired
+            ("8801234567894", "Metformin 850mg (Glucophage)", 200, "2028-11-05", 9.80, None),
+            ("8801234567895", "Omeprazole 20mg (Prilosec)", 12, "2026-06-22", 8.45, None), # Near expiry
+            ("8801234567896", "Lisinopril 10mg (Zestril)", 95, "2027-04-12", 11.20, None),
+            ("8801234567897", "Cetirizine 10mg (Zyrtec)", 180, "2028-02-18", 4.99, None),
         ]
         cursor.executemany("""
-            INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, dummy_products)
 
     def get_all_products(self) -> List[Product]:
@@ -160,7 +160,7 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT Barcode, Name, Stock, ExpiryDate, Price FROM ProductMaster ORDER BY Name ASC")
+            cursor.execute("SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id FROM ProductMaster ORDER BY Name ASC")
             rows = cursor.fetchall()
             products = [
                 Product(
@@ -168,7 +168,8 @@ class DatabaseService:
                     name=row["Name"],
                     stock=row["Stock"],
                     expiry_date=row["ExpiryDate"],
-                    price=row["Price"]
+                    price=row["Price"],
+                    supplier_id=row["supplier_id"]
                 )
                 for row in rows
             ]
@@ -187,7 +188,7 @@ class DatabaseService:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT Barcode, Name, Stock, ExpiryDate, Price "
+                "SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id "
                 "FROM ProductMaster WHERE Stock > 0 ORDER BY Name ASC LIMIT ?",
                 (limit,),
             )
@@ -199,6 +200,7 @@ class DatabaseService:
                     stock=row["Stock"],
                     expiry_date=row["ExpiryDate"],
                     price=row["Price"],
+                    supplier_id=row["supplier_id"],
                 )
                 for row in rows
             ]
@@ -216,7 +218,7 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT Barcode, Name, Stock, ExpiryDate, Price FROM ProductMaster WHERE Barcode = ?", (barcode,))
+            cursor.execute("SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id FROM ProductMaster WHERE Barcode = ?", (barcode,))
             row = cursor.fetchone()
             product = None
             if row:
@@ -225,7 +227,8 @@ class DatabaseService:
                     name=row["Name"],
                     stock=row["Stock"],
                     expiry_date=row["ExpiryDate"],
-                    price=row["Price"]
+                    price=row["Price"],
+                    supplier_id=row["supplier_id"]
                 )
             return product
         except sqlite3.Error as e:
@@ -327,13 +330,14 @@ class DatabaseService:
             try:
                 cursor.executemany(
                     """
-                    INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(Barcode) DO UPDATE SET
                         Name       = excluded.Name,
                         Stock      = Stock + excluded.Stock,
                         ExpiryDate = excluded.ExpiryDate,
-                        Price      = excluded.Price
+                        Price      = excluded.Price,
+                        supplier_id = COALESCE(excluded.supplier_id, ProductMaster.supplier_id)
                     """,
                     products_list,
                 )
@@ -391,7 +395,7 @@ class DatabaseService:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT Barcode, Name, Stock, ExpiryDate, Price,
+                SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id,
                        CASE
                            WHEN date(ExpiryDate) < date('now')                          THEN 0
                            WHEN date(ExpiryDate) <= date('now', '+' || ? || ' days')    THEN 1
@@ -421,6 +425,7 @@ class DatabaseService:
                     stock=row["Stock"],
                     expiry_date=row["ExpiryDate"],
                     price=row["Price"],
+                    supplier_id=row["supplier_id"],
                 )
                 reasons = []
                 if row["is_expiry_flag"]:
@@ -482,7 +487,7 @@ class DatabaseService:
 
             # Page slice
             cursor.execute(
-                f"SELECT Barcode, Name, Stock, ExpiryDate, Price "
+                f"SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id "
                 f"FROM ProductMaster WHERE {where_clause} "
                 f"ORDER BY Name ASC LIMIT ? OFFSET ?",
                 params + [limit, offset],
@@ -500,6 +505,7 @@ class DatabaseService:
                     stock=row["Stock"],
                     expiry_date=row["ExpiryDate"],
                     price=row["Price"],
+                    supplier_id=row["supplier_id"],
                 )
                 for row in rows
             ]
