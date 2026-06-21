@@ -1023,3 +1023,132 @@ class DatabaseService:
         finally:
             if conn:
                 conn.close()
+
+    # =========================================================================
+    # Undo-support helper methods
+    # =========================================================================
+
+    def restore_product(self, data: dict) -> bool:
+        """Restore a previously deleted product from captured state dict.
+
+        Keys expected: Barcode, Name, Stock, ExpiryDate, Price, supplier_id
+        (PascalCase to match ProductMaster schema column names).
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute(
+                "INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    data.get("Barcode"),
+                    data.get("Name"),
+                    data.get("Stock"),
+                    data.get("ExpiryDate"),
+                    data.get("Price"),
+                    data.get("supplier_id"),
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("Error in restore_product: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def get_customer_by_id(self, customer_id: int) -> dict | None:
+        """Get full customer record by ID for undo state capture."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute(
+                "SELECT * FROM customers WHERE id = ?", (customer_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            logging.error("Error in get_customer_by_id: %s", e)
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def get_supplier_by_id(self, supplier_id: int) -> dict | None:
+        """Get full supplier record by ID for undo state capture."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute(
+                "SELECT * FROM suppliers WHERE id = ?", (supplier_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            logging.error("Error in get_supplier_by_id: %s", e)
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def delete_invoice(self, invoice_id: str) -> bool:
+        """Delete an invoice. CASCADE handles related invoice_items."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("Error in delete_invoice: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def restore_customer(self, data: dict) -> bool:
+        """Restore a previously deleted customer from captured state."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute(
+                "INSERT INTO customers (id, name, amka, phone) VALUES (?, ?, ?, ?)",
+                (
+                    data.get("id"),
+                    data.get("name"),
+                    data.get("amka", ""),
+                    data.get("phone", ""),
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("Error in restore_customer: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def restore_supplier(self, data: dict) -> bool:
+        """Restore a previously deleted supplier from captured state."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute(
+                "INSERT INTO suppliers (id, name, phone, email, address) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    data.get("id"),
+                    data.get("name"),
+                    data.get("phone", ""),
+                    data.get("email", ""),
+                    data.get("address", ""),
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("Error in restore_supplier: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()

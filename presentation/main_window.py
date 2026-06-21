@@ -23,6 +23,7 @@ from infrastructure.excel_parser_service import ExcelParserService
 from infrastructure.license_service import generate_hwid, verify_local_license, generate_license_key
 from infrastructure.ai_service import AIService
 from core.intent_factory import IntentFactory
+from core.undo_stack import ActionHistory
 
 # Configure CustomTkinter behavior
 customtkinter.set_appearance_mode("Dark")
@@ -143,6 +144,9 @@ class MainWindow(customtkinter.CTk):
 
         # Cached HWID (fetched in background to avoid 18s startup freeze)
         self.cached_hwid = None
+
+        # Undo/Redo action-history stack (5-level deep)
+        self.action_history = ActionHistory()
 
         # Safe exit protocol (register before UI build so it's always active)
         self._active_timers = []
@@ -366,14 +370,35 @@ class MainWindow(customtkinter.CTk):
         )
         self.section_title_label.grid(row=0, column=0, sticky="w")
 
-        # Live clock
+        # Live clock + undo/redo button bar (right side of header)
+        self.header_right_bar = customtkinter.CTkFrame(self.header_frame, fg_color="transparent")
+        self.header_right_bar.grid(row=0, column=1, sticky="e")
+
         self.clock_label = customtkinter.CTkLabel(
-            self.header_frame,
+            self.header_right_bar,
             text="",
             font=customtkinter.CTkFont(family="Courier", size=14),
             text_color="#34C759"
         )
-        self.clock_label.grid(row=0, column=1, sticky="e")
+        self.clock_label.pack(side="left", padx=(0, 12))
+
+        self.undo_btn = customtkinter.CTkButton(
+            self.header_right_bar, text="↩", width=36, height=36,
+            fg_color="transparent", text_color=_nav_text(),
+            hover_color=_nav_hover(),
+            font=customtkinter.CTkFont(size=16),
+            command=self._undo_last_action, state="disabled"
+        )
+        self.undo_btn.pack(side="left", padx=(0, 4))
+
+        self.redo_btn = customtkinter.CTkButton(
+            self.header_right_bar, text="↪", width=36, height=36,
+            fg_color="transparent", text_color=_nav_text(),
+            hover_color=_nav_hover(),
+            font=customtkinter.CTkFont(size=16),
+            command=self._redo_last_action, state="disabled"
+        )
+        self.redo_btn.pack(side="left")
 
         # AI Command Bar
         self.ai_cmd_bar = customtkinter.CTkEntry(
@@ -409,6 +434,38 @@ class MainWindow(customtkinter.CTk):
         self.settings_frame = None
         self.ai_assistant_frame = None
         # Dashboard frame created lazily on first select_frame("dashboard")
+
+    # =========================================================================
+    # UNDO / REDO
+    # =========================================================================
+    def _update_undo_redo_buttons(self):
+        """Enable or disable the undo/redo header buttons based on stack state."""
+        if hasattr(self, 'undo_btn') and self.undo_btn is not None:
+            if self.action_history.can_undo:
+                self.undo_btn.configure(state="normal")
+            else:
+                self.undo_btn.configure(state="disabled")
+        if hasattr(self, 'redo_btn') and self.redo_btn is not None:
+            if self.action_history.can_redo:
+                self.redo_btn.configure(state="normal")
+            else:
+                self.redo_btn.configure(state="disabled")
+
+    def _undo_last_action(self):
+        """Execute the most recent undo entry."""
+        desc = self.action_history.undo()
+        if desc is None:
+            return
+        self._update_undo_redo_buttons()
+        messagebox.showinfo("Αναίρεση", f"Η ενέργεια αναιρέθηκε:\n{desc}")
+
+    def _redo_last_action(self):
+        """Re-execute the most recently undone action."""
+        desc = self.action_history.redo()
+        if desc is None:
+            return
+        self._update_undo_redo_buttons()
+        messagebox.showinfo("Επανάληψη", f"Η ενέργεια επαναλήφθηκε:\n{desc}")
 
     # =========================================================================
     # AI BACKEND — Thread-safe lazy initialization
@@ -1223,6 +1280,20 @@ class MainWindow(customtkinter.CTk):
             )
             success = self.db_service.add_product(new_prod)
             if success:
+                # Push undo entry for product addition
+                _bc = new_prod.barcode
+                _nm = new_prod.name
+                def undo_add():
+                    self.db_service.delete_product(_bc)
+                    self.refresh_inventory_list()
+                    self.refresh_dashboard()
+                def redo_add():
+                    self.db_service.add_product(new_prod)
+                    self.refresh_inventory_list()
+                    self.refresh_dashboard()
+                self.action_history.push(
+                    f"Προσθήκη προϊόντος: {_nm}", undo_add, redo_add)
+                self._update_undo_redo_buttons()
                 messagebox.showinfo("Επιτυχία", f"Το προϊόν '{new_prod.name}' καταχωρήθηκε επιτυχώς.")
                 self.refresh_inventory_list()
             else:
@@ -1241,17 +1312,70 @@ class MainWindow(customtkinter.CTk):
                 price=p_data["price"],
                 supplier_id=p_data.get("supplier_id")
             )
+            # Capture old state BEFORE updating for undo
+            _old = self.db_service.get_product(product.barcode)
+            _old_data = {
+                "Barcode": _old.barcode if _old else product.barcode,
+                "Name": _old.name if _old else product.name,
+                "Stock": _old.stock if _old else product.stock,
+                "ExpiryDate": _old.expiry_date if _old else product.expiry_date,
+                "Price": _old.price if _old else product.price,
+                "supplier_id": getattr(_old, 'supplier_id', None) if _old else None,
+            }
+            _bc = product.barcode
+            _nm = updated_prod.name
             success = self.db_service.update_product(updated_prod)
             if success:
+                def undo_edit():
+                    from core.domain_models import Product as P
+                    restore = P(
+                        barcode=_old_data["Barcode"], name=_old_data["Name"],
+                        stock=_old_data["Stock"], expiry_date=_old_data["ExpiryDate"],
+                        price=_old_data["Price"], supplier_id=_old_data.get("supplier_id"))
+                    self.db_service.update_product(restore)
+                    self.refresh_inventory_list()
+                def redo_edit():
+                    self.db_service.update_product(updated_prod)
+                    self.refresh_inventory_list()
+                self.action_history.push(
+                    f"Επεξεργασία προϊόντος: {_nm}", undo_edit, redo_edit)
+                self._update_undo_redo_buttons()
                 messagebox.showinfo("Επιτυχία", "Τα στοιχεία του προϊόντος ενημερώθηκαν.")
                 self.refresh_inventory_list()
             else:
                 messagebox.showerror("Σφάλμα", "Αποτυχία ενημέρωσης στοιχείων προϊόντος.")
 
     def delete_product(self, barcode: str, name: str):
-        if messagebox.askyesno("Eπιβεβαίωση Διαγραφής", f"Είστε σίγουροι ότι θέλετε να διαγράψετε το '{name}'?\nΗ ενέργεια αυτή είναι μη αναστρέψιμη."):
+        old_product = self.db_service.get_product(barcode)
+        if not old_product:
+            messagebox.showerror("Σφάλμα", "Το προϊόν δεν βρέθηκε.")
+            return
+
+        if messagebox.askyesno("Επιβεβαίωση Διαγραφής",
+            f"Είστε σίγουροι ότι θέλετε να διαγράψετε το '{name}';\n"
+            f"(Μπορείτε να το επαναφέρετε με ↩ Αναίρεση)"):
+            # Capture state for undo BEFORE deleting
+            old_data = {
+                "Barcode": old_product.barcode,
+                "Name": old_product.name,
+                "Stock": old_product.stock,
+                "ExpiryDate": old_product.expiry_date,
+                "Price": old_product.price,
+                "supplier_id": getattr(old_product, 'supplier_id', None),
+            }
             success = self.db_service.delete_product(barcode)
             if success:
+                def undo_del():
+                    self.db_service.restore_product(old_data)
+                    self.refresh_inventory_list()
+                    self.refresh_dashboard()
+                def redo_del():
+                    self.db_service.delete_product(barcode)
+                    self.refresh_inventory_list()
+                    self.refresh_dashboard()
+                self.action_history.push(
+                    f"Διαγραφή προϊόντος: {name}", undo_del, redo_del)
+                self._update_undo_redo_buttons()
                 messagebox.showinfo("Διαγραφή", "Το προϊόν διαγράφηκε επιτυχώς.")
                 self.refresh_inventory_list()
             else:
@@ -1918,6 +2042,59 @@ class MainWindow(customtkinter.CTk):
         self.refresh_inventory_list()
         self.refresh_invoice_view()
 
+        # ── Push undo entry for this sale ──
+        _succeeded = list(succeeded)  # copy for closure
+        _inv_id = invoice_id
+        _inv_date = invoice_date
+        _sub = subtotal
+        _vat = vat_amount
+        _gt = grand_total
+        def undo_sale():
+            conn2 = self.db_service._get_connection()
+            try:
+                for p, qty in _succeeded:
+                    conn2.execute(
+                        "UPDATE ProductMaster SET Stock = Stock + ? WHERE Barcode = ?",
+                        (qty, p.barcode))
+                conn2.commit()
+            except Exception:
+                try:
+                    conn2.rollback()
+                except Exception:
+                    pass
+            finally:
+                conn2.close()
+            self.db_service.delete_invoice(_inv_id)
+            self.refresh_invoice_view()
+            self.refresh_dashboard()
+            self.refresh_inventory_list()
+        def redo_sale():
+            conn2 = self.db_service._get_connection()
+            try:
+                for p, qty in _succeeded:
+                    conn2.execute(
+                        "UPDATE ProductMaster SET Stock = Stock - ? WHERE Barcode = ?",
+                        (qty, p.barcode))
+                conn2.commit()
+            except Exception:
+                try:
+                    conn2.rollback()
+                except Exception:
+                    pass
+            finally:
+                conn2.close()
+            items_list = [(p.barcode, p.name, qty, p.price) for p, qty in _succeeded]
+            self.db_service.save_invoice_transaction(
+                _inv_id, _sub, _vat, _gt, _succeeded,
+                customer_id=getattr(self, '_selected_customer_id', None))
+            self.refresh_invoice_view()
+            self.refresh_dashboard()
+            self.refresh_inventory_list()
+        self.action_history.push(
+            f"Πώληση {_inv_id} — {len(_succeeded)} είδη, €{_gt:.2f}",
+            undo_sale, redo_sale)
+        self._update_undo_redo_buttons()
+
     def _export_invoice_pdf(self, invoice_id: str) -> None:
         """Export a text-format invoice receipt to the Desktop in a background thread."""
         items = self.db_service.get_invoice_items(invoice_id)
@@ -2034,21 +2211,34 @@ class MainWindow(customtkinter.CTk):
             messagebox.showerror("Σφάλμα", "Αποτυχία αποθήκευσης (πιθανή διπλότυπη ΑΜΚΑ).")
 
     def delete_customer(self):
-        """Delete the selected customer after confirmation."""
+        """Delete the selected customer after confirmation — undoable."""
         sel = self.cust_tree.selection()
         if not sel:
             messagebox.showwarning("Προειδοποίηση", "Παρακαλώ επιλέξτε έναν πελάτη από τη λίστα.")
             return
         customer_id = self.cust_tree.item(sel[0])["values"][0]
         name = self.cust_tree.item(sel[0])["values"][1]
-        if not messagebox.askyesno("Επιβεβαίωση Διαγραφής", f"Είστε βέβαιοι ότι θέλετε να διαγράψετε τον πελάτη '{name}';", icon="warning"):
+        if not messagebox.askyesno("Επιβεβαίωση Διαγραφής",
+            f"Είστε βέβαιοι ότι θέλετε να διαγράψετε τον πελάτη '{name}';\n"
+            f"(Μπορείτε να τον επαναφέρετε με ↩ Αναίρεση)", icon="warning"):
             return
-        if self.db_service.delete_customer(int(customer_id)):
+        _old = self.db_service.get_customer_by_id(int(customer_id))
+        _cid = int(customer_id)
+        if self.db_service.delete_customer(_cid):
+            if _old:
+                def undo_cust():
+                    self.db_service.restore_customer(dict(_old))
+                    self.refresh_customer_list()
+                def redo_cust():
+                    self.db_service.delete_customer(_cid)
+                    self.refresh_customer_list()
+                self.action_history.push(
+                    f"Διαγραφή πελάτη: {name}", undo_cust, redo_cust)
+                self._update_undo_redo_buttons()
             messagebox.showinfo("Επιτυχία", f"Ο πελάτης '{name}' διαγράφηκε επιτυχώς.")
             self.refresh_customer_list()
         else:
             messagebox.showerror("Σφάλμα", "Αποτυχία διαγραφής πελάτη.")
-
     # =========================================================================
     # VIEW: SUPPLIERS
     # =========================================================================
@@ -2145,9 +2335,23 @@ class MainWindow(customtkinter.CTk):
             return
         supplier_id = self.supp_tree.item(sel[0])["values"][0]
         name = self.supp_tree.item(sel[0])["values"][1]
-        if not messagebox.askyesno("Επιβεβαίωση Διαγραφής", f"Είστε βέβαιοι ότι θέλετε να διαγράψετε τον προμηθευτή '{name}';", icon="warning"):
+        if not messagebox.askyesno("Επιβεβαίωση Διαγραφής",
+            f"Είστε βέβαιοι ότι θέλετε να διαγράψετε τον προμηθευτή '{name}';\n"
+            f"(Μπορείτε να τον επαναφέρετε με ↩ Αναίρεση)", icon="warning"):
             return
-        if self.db_service.delete_supplier(int(supplier_id)):
+        _old = self.db_service.get_supplier_by_id(int(supplier_id))
+        _sid = int(supplier_id)
+        if self.db_service.delete_supplier(_sid):
+            if _old:
+                def undo_supp():
+                    self.db_service.restore_supplier(dict(_old))
+                    self.refresh_supplier_list()
+                def redo_supp():
+                    self.db_service.delete_supplier(_sid)
+                    self.refresh_supplier_list()
+                self.action_history.push(
+                    f"Διαγραφή προμηθευτή: {name}", undo_supp, redo_supp)
+                self._update_undo_redo_buttons()
             messagebox.showinfo("Επιτυχία", f"Ο προμηθευτής '{name}' διαγράφηκε επιτυχώς.")
             self.refresh_supplier_list()
         else:
