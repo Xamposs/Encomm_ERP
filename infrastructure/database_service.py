@@ -94,6 +94,20 @@ class DatabaseService:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS stock_movements (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp    TEXT    NOT NULL,
+                    barcode      TEXT    NOT NULL,
+                    product_name TEXT    NOT NULL,
+                    old_stock    INTEGER NOT NULL,
+                    new_stock    INTEGER NOT NULL,
+                    difference   INTEGER NOT NULL,
+                    reason       TEXT    NOT NULL,
+                    reference_id TEXT
+                )
+            """)
+
             # Safely add supplier_id column to ProductMaster if it doesn't exist
             try:
                 cursor.execute("ALTER TABLE ProductMaster ADD COLUMN supplier_id INTEGER")
@@ -111,6 +125,25 @@ class DatabaseService:
             except sqlite3.OperationalError:
                 pass  # column already exists
 
+            # ── Stock Movement Audit Trail (migration-safe) ──
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS stock_movements (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp     TEXT    NOT NULL,
+                    barcode       TEXT    NOT NULL,
+                    product_name  TEXT    NOT NULL,
+                    old_stock     INTEGER NOT NULL,
+                    new_stock     INTEGER NOT NULL,
+                    change_amount INTEGER NOT NULL,
+                    reason        TEXT    NOT NULL,
+                    source        TEXT,
+                    operator      TEXT    DEFAULT 'Σύστημα'
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sm_barcode ON stock_movements(barcode)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sm_timestamp ON stock_movements(timestamp)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sm_reason ON stock_movements(reason)")
+
             conn.commit()
 
             # Performance indexes for 100K+ row queries
@@ -119,6 +152,8 @@ class DatabaseService:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_product_expiry ON ProductMaster(ExpiryDate)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_inv_items_invoice ON invoice_items(invoice_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_movements_barcode ON stock_movements(barcode)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_movements_timestamp ON stock_movements(timestamp)")
             conn.commit()
 
             # Check if table is empty, and insert premium mock data for demonstration
@@ -250,6 +285,13 @@ class DatabaseService:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (product.barcode, product.name, product.stock, product.expiry_date, product.price, sid))
             conn.commit()
+            # ── Audit trail ──
+            try:
+                self.log_stock_movement(
+                    product.barcode, product.name, 0, product.stock,
+                    reason="Εισαγωγή", source="Φόρμα Προϊόντος")
+            except Exception:
+                pass
             return True
         except sqlite3.Error as e:
             logging.error(f"Error adding product '{product.name}': {e}")
@@ -262,6 +304,9 @@ class DatabaseService:
         """Update an existing product record."""
         conn = None
         try:
+            # Capture old stock for audit before updating
+            old = self.get_product(product.barcode)
+            old_stock = old.stock if old else 0
             conn = self._get_connection()
             cursor = conn.cursor()
             sid = getattr(product, 'supplier_id', None)
@@ -271,6 +316,14 @@ class DatabaseService:
                 WHERE Barcode = ?
             """, (product.name, product.stock, product.expiry_date, product.price, sid, product.barcode))
             conn.commit()
+            # ── Audit trail ──
+            try:
+                if old_stock != product.stock:
+                    self.log_stock_movement(
+                        product.barcode, product.name, old_stock, product.stock,
+                        reason="Χειροκίνητη Ενημέρωση", source="Φόρμα Προϊόντος")
+            except Exception:
+                pass
             return True
         except sqlite3.Error as e:
             logging.error(f"Error updating product '{product.barcode}': {e}")
@@ -283,6 +336,9 @@ class DatabaseService:
         """Update the stock count of an existing product."""
         conn = None
         try:
+            # Capture old stock for audit before updating
+            old = self.get_product(barcode)
+            old_stock = old.stock if old else 0
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute("""
@@ -291,6 +347,14 @@ class DatabaseService:
                 WHERE Barcode = ?
             """, (new_stock, barcode))
             conn.commit()
+            # ── Audit trail ──
+            try:
+                if old_stock != new_stock:
+                    self.log_stock_movement(
+                        barcode, old.name if old else "", old_stock, new_stock,
+                        reason="Χειροκίνητη Ενημέρωση", source="Ενημέρωση Στοκ")
+            except Exception:
+                pass
             return True
         except sqlite3.Error as e:
             logging.error(f"Error updating stock for barcode '{barcode}': {e}")
@@ -343,6 +407,15 @@ class DatabaseService:
                 )
                 conn.commit()
                 logging.info(f"Bulk upsert completed for {len(products_list)} items.")
+                # ── Audit trail: log each product import ──
+                for prod in products_list:
+                    try:
+                        barcode, name, stock = prod[0], prod[1], prod[2]
+                        self.log_stock_movement(
+                            barcode, name, 0, stock,
+                            reason="Εισαγωγή", source="Τιμολόγιο")
+                    except Exception:
+                        pass
             except Exception:
                 conn.rollback()
                 logging.exception(f"Bulk upsert failed for batch of {len(products_list)} items — rolled back.")
@@ -1050,6 +1123,14 @@ class DatabaseService:
                 ),
             )
             conn.commit()
+            # ── Audit trail ──
+            try:
+                self.log_stock_movement(
+                    data.get("Barcode", ""), data.get("Name", ""),
+                    0, data.get("Stock", 0),
+                    reason="Επαναφορά", source="Undo")
+            except Exception:
+                pass
             return True
         except sqlite3.Error as e:
             logging.error("Error in restore_product: %s", e)
@@ -1152,3 +1233,236 @@ class DatabaseService:
         finally:
             if conn:
                 conn.close()
+
+    # ── Stock Movement Audit Trail ───────────────────────────────────
+
+    def log_stock_movement(self, barcode: str, product_name: str,
+                           old_stock: int, new_stock: int, reason: str,
+                           reference_id: str = None) -> bool:
+        """Insert a stock movement audit record. Returns True on success."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            diff = new_stock - old_stock
+            conn.execute(
+                "INSERT INTO stock_movements "
+                "(timestamp, barcode, product_name, old_stock, new_stock, "
+                " difference, reason, reference_id) "
+                "VALUES (datetime('now','localtime'), ?, ?, ?, ?, ?, ?, ?)",
+                (barcode, product_name, old_stock, new_stock, diff,
+                 reason, reference_id))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("log_stock_movement failed: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def get_stock_movements(self, barcode: str = None, limit: int = 200,
+                            offset: int = 0) -> List[Dict]:
+        """Query stock movements, optionally filtered by barcode."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            if barcode:
+                rows = conn.execute(
+                    "SELECT * FROM stock_movements WHERE barcode = ? "
+                    "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                    (barcode, limit, offset)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM stock_movements "
+                    "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                    (limit, offset)).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            logging.error("get_stock_movements failed: %s", e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def get_recent_movements(self, limit: int = 50) -> List[Dict]:
+        """Get the most recent stock movements."""
+        return self.get_stock_movements(limit=limit)
+
+    # ── Backup & Restore ──────────────────────────────────────────────
+
+    def backup_database(self, backup_dir: str = None) -> str:
+        """Create a timestamped backup of the SQLite database.
+
+        Copies the main DB file plus WAL and SHM companion files.
+        Runs a WAL checkpoint first to minimise companion file sizes.
+        Returns the absolute path to the backup file.
+        """
+        import shutil
+        from datetime import datetime
+
+        if backup_dir is None:
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            backup_dir = os.path.join(desktop, "ENCOMM_Backups")
+
+        os.makedirs(backup_dir, exist_ok=True)
+
+        # Flush WAL to main DB before copying
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception as e:
+            logging.warning("WAL checkpoint before backup failed (non-fatal): %s", e)
+        finally:
+            if conn:
+                conn.close()
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(backup_dir, f"encomm_erp_backup_{ts}.db")
+
+        shutil.copy2(self.db_path, backup_path)
+        logging.info("Database backed up to: %s", backup_path)
+
+        # Copy WAL and SHM companions if they exist
+        for suffix in ("-wal", "-shm"):
+            companion = self.db_path + suffix
+            if os.path.exists(companion):
+                shutil.copy2(companion, backup_path + suffix)
+
+        return backup_path
+
+    def restore_database(self, backup_path: str) -> bool:
+        """Restore database from a backup file.
+
+        Overwrites the current database and companion files.
+        The application should be restarted after restore.
+        Returns True on success.
+        """
+        import shutil
+
+        if not os.path.exists(backup_path):
+            logging.error("Backup file not found: %s", backup_path)
+            return False
+
+        if not backup_path.endswith(".db"):
+            logging.error("Invalid backup file (must be .db): %s", backup_path)
+            return False
+
+        try:
+            shutil.copy2(backup_path, self.db_path)
+            logging.info("Database restored from: %s", backup_path)
+
+            for suffix in ("-wal", "-shm"):
+                companion_backup = backup_path + suffix
+                companion_current = self.db_path + suffix
+                if os.path.exists(companion_backup):
+                    shutil.copy2(companion_backup, companion_current)
+                elif os.path.exists(companion_current):
+                    os.remove(companion_current)
+
+            return True
+        except Exception as e:
+            logging.error("Database restore failed: %s", e)
+            return False
+
+    # ── Stock Movement Audit Trail ───────────────────────────────────
+
+    def log_stock_movement(self, barcode: str, product_name: str,
+                           old_stock: int, new_stock: int, reason: str,
+                           source: str = "", operator: str = "Σύστημα") -> bool:
+        """Log a stock change to the audit trail.
+
+        Returns True on success, False on failure. Logging failures
+        must never crash the calling operation — callers should wrap
+        in try/except.
+        """
+        from datetime import datetime
+
+        conn = None
+        try:
+            change_amount = new_stock - old_stock
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn = self._get_connection()
+
+            # Try new schema first (change_amount, source, operator)
+            try:
+                conn.execute(
+                    """INSERT INTO stock_movements
+                       (timestamp, barcode, product_name, old_stock, new_stock,
+                        change_amount, reason, source, operator)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (timestamp, barcode, product_name,
+                     old_stock, new_stock, change_amount,
+                     reason, source, operator),
+                )
+            except sqlite3.Error:
+                # Fallback: old schema (difference, reference_id)
+                conn.execute(
+                    """INSERT INTO stock_movements
+                       (timestamp, barcode, product_name, old_stock, new_stock,
+                        difference, reason, reference_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (timestamp, barcode, product_name,
+                     old_stock, new_stock, change_amount,
+                     reason, source),
+                )
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("log_stock_movement failed for %s: %s", barcode, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def get_stock_movements(self, limit: int = 200, barcode: str = None,
+                            reason: str = None, start_date: str = None,
+                            end_date: str = None) -> List[Dict]:
+        """Query the audit trail with optional filters.
+
+        Returns list of dicts ordered by timestamp DESC.
+        Handles both old (difference) and new (change_amount) schemas.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            query = "SELECT * FROM stock_movements WHERE 1=1"
+            params: list = []
+
+            if barcode:
+                query += " AND barcode LIKE ?"
+                params.append(f"%{barcode}%")
+            if reason:
+                query += " AND reason = ?"
+                params.append(reason)
+            if start_date:
+                query += " AND timestamp >= ?"
+                params.append(start_date)
+            if end_date:
+                query += " AND timestamp <= ?"
+                params.append(end_date)
+
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+
+            rows = conn.execute(query, params).fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                # Normalize column: old schema uses 'difference', new uses 'change_amount'
+                if d.get("change_amount") is None and "difference" in d:
+                    d["change_amount"] = d["difference"]
+                if d.get("source") is None and "reference_id" in d:
+                    d["source"] = d.get("reference_id", "")
+                result.append(d)
+            return result
+        except sqlite3.Error as e:
+            logging.error("get_stock_movements query failed: %s", e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def get_product_movement_history(self, barcode: str, limit: int = 50) -> List[Dict]:
+        """Convenience: all movements for a single product."""
+        return self.get_stock_movements(barcode=barcode, limit=limit)

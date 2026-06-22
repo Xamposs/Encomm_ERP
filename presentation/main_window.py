@@ -202,8 +202,16 @@ class MainWindow(customtkinter.CTk):
             self.set_hwid_entry.configure(state="disabled")
 
     def on_safe_close(self):
-        """Hard exit: cancel pending timers then kill process instantly at OS level.
+        """Auto-backup if enabled, cancel timers, then hard OS-level kill.
         Bypasses self.quit()/self.destroy() to avoid X11 deadlock with background threads."""
+        # ── Auto-backup on close (if enabled in settings) ──
+        if hasattr(self, 'set_autobackup_var') and self.set_autobackup_var.get():
+            try:
+                path = self.db_service.backup_database()
+                logging.info("Auto-backup on close: %s", path)
+            except Exception as e:
+                logging.error("Auto-backup on close failed: %s", e)
+
         logging.info("Safe exit triggered — hard OS-level kill...")
         try:
             if hasattr(self, '_search_timer') and self._search_timer is not None:
@@ -227,7 +235,7 @@ class MainWindow(customtkinter.CTk):
         """Build the left navigation sidebar with a flat minimalist style."""
         self.sidebar_frame = customtkinter.CTkFrame(self, corner_radius=0, width=220)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(8, weight=1)
+        self.sidebar_frame.grid_rowconfigure(9, weight=1)
 
         # App Brand Header
         self.brand_label = customtkinter.CTkLabel(
@@ -312,6 +320,18 @@ class MainWindow(customtkinter.CTk):
         )
         self.nav_buttons["invoice_history"].grid(row=6, column=0, padx=20, pady=8, sticky="ew")
 
+        self.nav_buttons["stock_movements"] = customtkinter.CTkButton(
+            self.sidebar_frame,
+            text="📋  Κινήσεις",
+            anchor="w",
+            fg_color="transparent",
+            text_color=_nav_text(),
+            hover_color=_nav_hover(),
+            font=customtkinter.CTkFont(family="Outfit", size=13, weight="normal"),
+            command=lambda: self.select_frame("stock_movements")
+        )
+        self.nav_buttons["stock_movements"].grid(row=7, column=0, padx=20, pady=8, sticky="ew")
+
         self.nav_buttons["settings"] = customtkinter.CTkButton(
             self.sidebar_frame,
             text="⚙️  Ρυθμίσεις",
@@ -322,7 +342,7 @@ class MainWindow(customtkinter.CTk):
             font=customtkinter.CTkFont(family="Outfit", size=13, weight="normal"),
             command=lambda: self.select_frame("settings")
         )
-        self.nav_buttons["settings"].grid(row=7, column=0, padx=20, pady=8, sticky="ew")
+        self.nav_buttons["settings"].grid(row=8, column=0, padx=20, pady=8, sticky="ew")
 
         self.nav_buttons["ai_assistant"] = customtkinter.CTkButton(
             self.sidebar_frame,
@@ -334,16 +354,16 @@ class MainWindow(customtkinter.CTk):
             font=customtkinter.CTkFont(family="Outfit", size=13, weight="normal"),
             command=lambda: self.select_frame("ai_assistant")
         )
-        self.nav_buttons["ai_assistant"].grid(row=8, column=0, padx=20, pady=8, sticky="ew")
+        self.nav_buttons["ai_assistant"].grid(row=9, column=0, padx=20, pady=8, sticky="ew")
 
-        # Footer branding
+        # Footer branding — shares weighted row 9 with AI button (spacer pushes both down)
         self.version_label = customtkinter.CTkLabel(
             self.sidebar_frame,
             text="v1.0.0 Stable | ENCOMM Tensor Intelligence",
             font=customtkinter.CTkFont(size=11),
             text_color=_subtle_text()
         )
-        self.version_label.grid(row=8, column=0, padx=20, pady=20)
+        self.version_label.grid(row=9, column=0, padx=20, pady=(120, 15))
 
     # =========================================================================
     # MAIN PANEL
@@ -491,7 +511,7 @@ class MainWindow(customtkinter.CTk):
 
         self.ai_title_label = customtkinter.CTkLabel(
             self.ai_assistant_frame,
-            text="Συγκυβερνήτης Φαρμακείου (ClawBot AI)",
+            text="Βοηθός AI Φαρμακείου (Encomm AI)",
             font=customtkinter.CTkFont(family="Outfit", size=18, weight="bold")
         )
         self.ai_title_label.grid(row=0, column=0, sticky="w", pady=(0, 15))
@@ -503,7 +523,7 @@ class MainWindow(customtkinter.CTk):
         self.ai_chat_log.grid(row=1, column=0, sticky="nsew", pady=(0, 15))
         self.ai_chat_log.grid_columnconfigure(0, weight=1)
 
-        self._append_chat_message("ClawBot AI", "Γεια! Είμαι ο ClawBot, ο AI βοηθός σου. Πώς μπορώ να σε βοηθήσω; 🤖")
+        self._append_chat_message("Encomm AI", "Γεια! Είμαι ο Encomm, ο AI βοηθός σου. Πώς μπορώ να σε βοηθήσω; 🤖")
 
         self.ai_input_frame = customtkinter.CTkFrame(self.ai_assistant_frame, fg_color="transparent")
         self.ai_input_frame.grid(row=2, column=0, sticky="ew")
@@ -532,7 +552,7 @@ class MainWindow(customtkinter.CTk):
 
     def _append_chat_message(self, sender: str, message: str):
         """Append a styled message bubble to the chat log."""
-        is_bot = sender == "ClawBot AI"
+        is_bot = sender == "Encomm AI"
         bubble_color = ("#E2E8F0", "#1E293B")
         sender_color = "#10B981" if is_bot else ("#2563EB", "#3B82F6")
 
@@ -571,9 +591,9 @@ class MainWindow(customtkinter.CTk):
             try:
                 time.sleep(0.4)
                 reply = "Λήψη εντολής επιτυχής. Το backend AI interface είναι έτοιμο για διασύνδεση!"
-                self.after(0, lambda: self._append_chat_message("ClawBot AI", reply))
+                self.after(0, lambda: self._append_chat_message("Encomm AI", reply))
             except Exception as e:
-                self.after(0, lambda: self._append_chat_message("ClawBot AI", f"⚠️ Σφάλμα: {str(e)}"))
+                self.after(0, lambda: self._append_chat_message("Encomm AI", f"⚠️ Σφάλμα: {str(e)}"))
 
         threading.Thread(target=bg_chat_process, daemon=True).start()
 
@@ -600,6 +620,7 @@ class MainWindow(customtkinter.CTk):
             "customers":       self._init_customers_frame,
             "invoice_history": self._init_invoice_history_frame,
             "suppliers":       self._init_suppliers_frame,
+            "stock_movements": self._init_stock_movements_frame,
         }
         init_map[name]()
         frame = getattr(self, frame_attr)
@@ -649,6 +670,7 @@ class MainWindow(customtkinter.CTk):
             "customers":       "Πελάτες",
             "invoice_history": "Ιστορικό Παραστατικών",
             "suppliers":       "Μητρώο Προμηθευτών",
+            "stock_movements": "Κινήσεις Αποθέματος",
         }
         refresh_fns = {
             "dashboard":       self.refresh_dashboard,
@@ -659,6 +681,7 @@ class MainWindow(customtkinter.CTk):
             "customers":       self.refresh_customer_list,
             "invoice_history": self.refresh_invoice_history_list,
             "suppliers":       self.refresh_supplier_list,
+            "stock_movements": self.refresh_stock_movements,
         }
 
         self.section_title_label.configure(text=frame_titles[name])
@@ -937,6 +960,7 @@ class MainWindow(customtkinter.CTk):
         self.inventory_frame = customtkinter.CTkFrame(self.main_container, fg_color="transparent")
         self.inventory_frame.grid_columnconfigure(0, weight=1)
         self.inventory_frame.grid_rowconfigure(1, weight=1)
+        self.inventory_frame.grid_rowconfigure(2, weight=1)
 
         # Toolbar Frame
         self.inv_toolbar = customtkinter.CTkFrame(self.inventory_frame, fg_color="transparent")
@@ -970,6 +994,19 @@ class MainWindow(customtkinter.CTk):
         )
         self.import_inv_btn.grid(row=0, column=2, padx=(5, 0))
 
+        self.inv_movements_btn = customtkinter.CTkButton(
+            self.inv_toolbar,
+            text="📋 Ιστορικό Κινήσεων",
+            fg_color=("#8E44AD", "#7D3C98"),
+            hover_color=("#7D3C98", "#6C3483"),
+            font=customtkinter.CTkFont(weight="bold"),
+            command=self.toggle_movement_history
+        )
+        self.inv_movements_btn.grid(row=0, column=3, padx=(5, 0))
+
+        # Movement history toggle state
+        self.inv_show_movements = False
+
         # Pagination state
         self.inv_page = 0
         self.inv_page_size = 20
@@ -1001,6 +1038,70 @@ class MainWindow(customtkinter.CTk):
             command=self._inv_next_page
         )
         self.inv_next_btn.grid(row=0, column=2, padx=(5, 0))
+
+        # ── Movement History View (hidden by default) ──
+        self.inv_mov_filter = customtkinter.CTkEntry(
+            self.inventory_frame,
+            placeholder_text="🔍 Φιλτράρισμα κατά Barcode...",
+            width=250
+        )
+        self.inv_mov_filter.grid(row=1, column=0, sticky="w", padx=15, pady=(5, 10))
+        self.inv_mov_filter.bind("<KeyRelease>", lambda e: self._refresh_movement_history())
+        self.inv_mov_filter.grid_remove()
+
+        self.inv_mov_container = customtkinter.CTkFrame(self.inventory_frame)
+        self.inv_mov_container.grid(row=2, column=0, sticky="nsew", padx=15, pady=15)
+        self.inv_mov_container.grid_columnconfigure(0, weight=1)
+        self.inv_mov_container.grid_rowconfigure(0, weight=1)
+        self.inv_mov_container.grid_remove()
+
+        self.inv_mov_scrollbar = ttk.Scrollbar(
+            self.inv_mov_container, orient="vertical")
+        self.inv_mov_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.inv_mov_tree = ttk.Treeview(
+            self.inv_mov_container,
+            columns=("timestamp", "barcode", "name", "old_stock",
+                     "new_stock", "diff", "reason", "ref"),
+            show="headings", height=20,
+            yscrollcommand=self.inv_mov_scrollbar.set,
+            selectmode="browse"
+        )
+        self.inv_mov_tree.grid(row=0, column=0, sticky="nsew")
+        self.inv_mov_scrollbar.config(command=self.inv_mov_tree.yview)
+
+        self.inv_mov_tree.heading("timestamp", text="Ημερομηνία")
+        self.inv_mov_tree.heading("barcode", text="Barcode")
+        self.inv_mov_tree.heading("name", text="Προϊόν")
+        self.inv_mov_tree.heading("old_stock", text="Παλιό Στοκ")
+        self.inv_mov_tree.heading("new_stock", text="Νέο Στοκ")
+        self.inv_mov_tree.heading("diff", text="Διαφορά")
+        self.inv_mov_tree.heading("reason", text="Αιτία")
+        self.inv_mov_tree.heading("ref", text="Αναφορά")
+
+        self.inv_mov_tree.column("timestamp", width=150, anchor="w")
+        self.inv_mov_tree.column("barcode", width=120, anchor="w")
+        self.inv_mov_tree.column("name", width=200, anchor="w")
+        self.inv_mov_tree.column("old_stock", width=80, anchor="e")
+        self.inv_mov_tree.column("new_stock", width=80, anchor="e")
+        self.inv_mov_tree.column("diff", width=80, anchor="e")
+        self.inv_mov_tree.column("reason", width=140, anchor="w")
+        self.inv_mov_tree.column("ref", width=100, anchor="w")
+
+        # Movement pager
+        self.inv_mov_pager = customtkinter.CTkFrame(
+            self.inventory_frame, fg_color="transparent")
+        self.inv_mov_pager.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self.inv_mov_pager.grid_columnconfigure(1, weight=1)
+        self.inv_mov_pager.grid_remove()
+
+        self.inv_mov_page_info = customtkinter.CTkLabel(
+            self.inv_mov_pager, text="",
+            font=customtkinter.CTkFont(size=12),
+            text_color=_subtle_text())
+        self.inv_mov_page_info.grid(row=0, column=1, sticky="e", padx=10)
+
+        self.inv_mov_page = 0
 
         # Main Table Container
         self.table_container = customtkinter.CTkFrame(self.inventory_frame)
@@ -1157,6 +1258,80 @@ class MainWindow(customtkinter.CTk):
         if self.inv_page > 0:
             self.inv_page -= 1
             self.refresh_inventory_list()
+
+    # ── Movement History Toggle ──────────────────────────────────────
+
+    def toggle_movement_history(self):
+        """Switch between product list and movement history views."""
+        self.inv_show_movements = not self.inv_show_movements
+        if self.inv_show_movements:
+            self.inv_movements_btn.configure(
+                text="🔄 Πίσω στη Λίστα Προϊόντων")
+            self._show_movement_history()
+        else:
+            self.inv_movements_btn.configure(
+                text="📋 Ιστορικό Κινήσεων")
+            self._hide_movement_history()
+
+    def _show_movement_history(self):
+        """Hide product views, show movement history below toolbar."""
+        self.search_entry.grid_remove()
+        self.add_prod_btn.grid_remove()
+        self.import_inv_btn.grid_remove()
+        self.table_container.grid_remove()
+        self.inv_pager.grid_remove()
+        self.inv_mov_filter.grid()
+        self.inv_mov_container.grid()
+        self.inv_mov_pager.grid()
+        self.inv_mov_page = 0
+        self._refresh_movement_history()
+
+    def _hide_movement_history(self):
+        """Hide movement history, show product views."""
+        self.inv_mov_filter.grid_remove()
+        self.inv_mov_container.grid_remove()
+        self.inv_mov_pager.grid_remove()
+        self.search_entry.grid()
+        self.add_prod_btn.grid()
+        self.import_inv_btn.grid()
+        self.table_container.grid()
+        self.inv_pager.grid()
+        self.refresh_inventory_list()
+
+    def _refresh_movement_history(self):
+        """Query and render movement history into the treeview."""
+        if not self.inv_show_movements:
+            return
+        barcode_filter = self.inv_mov_filter.get().strip() or None
+
+        def _fetch():
+            try:
+                rows = self.db_service.get_stock_movements(
+                    barcode=barcode_filter, limit=50,
+                    offset=self.inv_mov_page * 50)
+                self.after(0, lambda: self._render_movements(rows, barcode_filter))
+            except Exception as e:
+                logging.error("Movement history fetch failed: %s", e)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _render_movements(self, rows, barcode_filter=None):
+        """Populate movement treeview from fetched rows."""
+        if not hasattr(self, 'inv_mov_tree') or self.inv_mov_tree is None:
+            return
+        self.inv_mov_tree.delete(*self.inv_mov_tree.get_children())
+        for r in rows:
+            ch = r.get("change_amount") or r.get("difference", 0)
+            diff_str = f"+{ch}" if ch >= 0 else str(ch)
+            ref = r.get("source") or r.get("reference_id") or "-"
+            self.inv_mov_tree.insert("", "end", values=(
+                r["timestamp"], r["barcode"], r["product_name"],
+                r["old_stock"], r["new_stock"], diff_str,
+                r["reason"], ref
+            ))
+        total = len(rows)
+        self.inv_mov_page_info.configure(
+            text=f"Σελίδα {self.inv_mov_page + 1} — {total} εγγραφές")
 
     def refresh_inventory_list(self):
         """Fetch ONE page of filtered products via threaded SQL — only when frame is visible."""
@@ -1326,6 +1501,16 @@ class MainWindow(customtkinter.CTk):
             _nm = updated_prod.name
             success = self.db_service.update_product(updated_prod)
             if success:
+                # ── Audit trail: log manual stock edit ──
+                old_stock = p_data.get("old_stock")
+                if old_stock is not None and updated_prod.stock != old_stock:
+                    try:
+                        self.db_service.log_stock_movement(
+                            updated_prod.barcode, updated_prod.name,
+                            old_stock, updated_prod.stock,
+                            "Χειροκίνητη Επεξεργασία")
+                    except Exception:
+                        pass  # non-critical — edit succeeds regardless
                 def undo_edit():
                     from core.domain_models import Product as P
                     restore = P(
@@ -1948,6 +2133,14 @@ class MainWindow(customtkinter.CTk):
                 conn.execute(
                     "UPDATE ProductMaster SET Stock = ? WHERE Barcode = ?",
                     (new_stock, p.barcode))
+                # ── Audit trail — inside same transaction, rolls back atomically ──
+                conn.execute(
+                    "INSERT INTO stock_movements "
+                    "(timestamp, barcode, product_name, old_stock, new_stock, "
+                    " change_amount, reason, source) "
+                    "VALUES (datetime('now','localtime'), ?, ?, ?, ?, ?, ?, ?)",
+                    (p.barcode, p.name, db_p.stock, new_stock,
+                     new_stock - db_p.stock, "Πώληση", "POS"))
                 succeeded.append((p, qty))
 
             if not failed_items:
@@ -2605,6 +2798,47 @@ class MainWindow(customtkinter.CTk):
         )
         self.set_theme_menu.pack(padx=30, pady=(0, 25), anchor="w")
 
+        # --- Backup & Restore ---
+        self._add_section_label("💾 Ασφάλεια Δεδομένων")
+
+        self.set_autobackup_var = tk.BooleanVar(value=False)
+        self.set_autobackup_cb = customtkinter.CTkCheckBox(
+            self.settings_card,
+            text="Αυτόματο αντίγραφο ασφαλείας κατά το κλείσιμο",
+            variable=self.set_autobackup_var,
+            font=customtkinter.CTkFont(size=13),
+        )
+        self.set_autobackup_cb.pack(padx=30, pady=(5, 15), anchor="w")
+
+        self.backup_btn_frame = customtkinter.CTkFrame(self.settings_card, fg_color="transparent")
+        self.backup_btn_frame.pack(padx=30, pady=(5, 10), anchor="w")
+
+        self.backup_now_btn = customtkinter.CTkButton(
+            self.backup_btn_frame, text="💾 Δημιουργία Αντιγράφου Ασφαλείας",
+            font=customtkinter.CTkFont(weight="bold"),
+            fg_color="#2980B9", hover_color="#1F618D",
+            text_color=("#FFFFFF", "#FFFFFF"),
+            command=self.backup_database_now
+        )
+        self.backup_now_btn.pack(side="left", padx=(0, 10))
+
+        self.restore_btn = customtkinter.CTkButton(
+            self.backup_btn_frame, text="📂 Επαναφορά από Αντίγραφο",
+            font=customtkinter.CTkFont(weight="bold"),
+            fg_color=("#E74C3C", "#C0392B"), hover_color=("#C0392B", "#A93226"),
+            text_color=("#FFFFFF", "#FFFFFF"),
+            command=self.restore_database_from_backup
+        )
+        self.restore_btn.pack(side="left")
+
+        self.last_backup_lbl = customtkinter.CTkLabel(
+            self.settings_card,
+            text="Τελευταίο αντίγραφο: Κανένα",
+            font=customtkinter.CTkFont(size=11),
+            text_color=("gray50", "gray60"),
+        )
+        self.last_backup_lbl.pack(padx=30, pady=(5, 20), anchor="w")
+
         self.settings_btn_frame = customtkinter.CTkFrame(self.settings_card, fg_color="transparent")
         self.settings_btn_frame.pack(padx=30, pady=10, anchor="w")
 
@@ -2668,6 +2902,10 @@ class MainWindow(customtkinter.CTk):
 
         current = customtkinter.get_appearance_mode()
         self.set_theme_menu.set("Σκούρο" if current == "Dark" else "Φωτεινό")
+
+        # Auto-backup preference
+        auto_backup = self.db_service.get_config("auto_backup", "0")
+        self.set_autobackup_var.set(auto_backup == "1")
 
     def change_appearance_theme(self, new_theme: str):
         if new_theme == "Σκούρο":
@@ -2746,6 +2984,9 @@ class MainWindow(customtkinter.CTk):
         self.db_service.set_config("mydata_user", mydata_user)
         self.db_service.set_config("hdika_code", hdika_code)
 
+        # Auto-backup preference
+        self.db_service.set_config("auto_backup", "1" if self.set_autobackup_var.get() else "0")
+
         # --- License key verification ---
         if license_key:
             hwid = self.cached_hwid or generate_hwid()
@@ -2768,6 +3009,68 @@ class MainWindow(customtkinter.CTk):
         self.load_settings_values()
         self.refresh_dashboard()
         self.refresh_inventory_list()
+
+    # ── Backup & Restore Handlers ────────────────────────────────────
+
+    def backup_database_now(self):
+        """Create a manual backup from the Settings panel."""
+        def _do_backup():
+            try:
+                path = self.db_service.backup_database()
+                fname = os.path.basename(path)
+                self.after(0, lambda: [
+                    self.last_backup_lbl.configure(
+                        text=f"Τελευταίο αντίγραφο: {fname}"),
+                    messagebox.showinfo(
+                        "Επιτυχές Αντίγραφο",
+                        f"Η βάση δεδομένων αποθηκεύτηκε επιτυχώς!\n\n"
+                        f"Τοποθεσία: {path}")
+                ])
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror(
+                    "Σφάλμα", f"Αποτυχία δημιουργίας αντιγράφου:\n{e}"))
+        threading.Thread(target=_do_backup, daemon=True).start()
+
+    def restore_database_from_backup(self):
+        """Restore database from a user-selected backup file."""
+        file_path = filedialog.askopenfilename(
+            title="Επιλογή Αρχείου Αντιγράφου Ασφαλείας",
+            filetypes=[("SQLite Database", "*.db")]
+        )
+        if not file_path:
+            return
+
+        if not messagebox.askyesno(
+            "Επιβεβαίωση Επαναφοράς",
+            "⚠️ Προειδοποίηση: Η επαναφορά θα αντικαταστήσει "
+            "όλα τα τρέχοντα δεδομένα.\n\n"
+            "Η εφαρμογή θα κλείσει μετά την επαναφορά.\n"
+            "Παρακαλώ ανοίξτε την ξανά χειροκίνητα.\n\n"
+            "Είστε βέβαιοι ότι θέλετε να συνεχίσετε;",
+            icon="warning"
+        ):
+            return
+
+        # Safety backup of current state before overwriting
+        try:
+            self.db_service.backup_database()
+        except Exception:
+            pass
+
+        if self.db_service.restore_database(file_path):
+            messagebox.showinfo(
+                "Επιτυχής Επαναφορά",
+                "Η βάση δεδομένων επαναφέρθηκε επιτυχώς.\n\n"
+                "Η εφαρμογή θα κλείσει τώρα.\n"
+                "Παρακαλώ ανοίξτε την ξανά."
+            )
+            self.on_safe_close()
+        else:
+            messagebox.showerror(
+                "Σφάλμα",
+                "Αποτυχία επαναφοράς βάσης δεδομένων.\n"
+                "Ελέγξτε ότι το αρχείο είναι έγκυρο αντίγραφο."
+            )
 
     # =========================================================================
     # AI COMMAND BAR — Asynchronous Intent Processing
@@ -3072,6 +3375,146 @@ class MainWindow(customtkinter.CTk):
 
         threading.Thread(target=bg_import, daemon=True).start()
 
+    # =========================================================================
+    # VIEW: STOCK MOVEMENTS AUDIT TRAIL
+    # =========================================================================
+    def _init_stock_movements_frame(self):
+        self.stock_movements_frame = customtkinter.CTkFrame(
+            self.main_container, fg_color="transparent")
+        self.stock_movements_frame.grid_columnconfigure(0, weight=1)
+        self.stock_movements_frame.grid_rowconfigure(0, weight=0)  # title
+        self.stock_movements_frame.grid_rowconfigure(1, weight=0)  # filter bar
+        self.stock_movements_frame.grid_rowconfigure(2, weight=1)  # treeview
+
+        # Filter bar — single row, wraps to stay compact
+        self.mov_filter_bar = customtkinter.CTkFrame(
+            self.stock_movements_frame, fg_color="transparent")
+        self.mov_filter_bar.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="ew")
+        self.mov_filter_bar.grid_columnconfigure(5, weight=1)  # push search btn right
+
+        self.mov_barcode_entry = customtkinter.CTkEntry(
+            self.mov_filter_bar, width=130, placeholder_text="Barcode")
+        self.mov_barcode_entry.grid(row=0, column=0, padx=(0, 6))
+
+        self.mov_name_entry = customtkinter.CTkEntry(
+            self.mov_filter_bar, width=150, placeholder_text="Όνομα Προϊόντος")
+        self.mov_name_entry.grid(row=0, column=1, padx=(0, 6))
+
+        self.mov_reason_menu = customtkinter.CTkOptionMenu(
+            self.mov_filter_bar, width=170,
+            values=["Όλοι", "Πώληση", "Χειροκίνητη Ενημέρωση",
+                    "Εισαγωγή", "Παραλαβή Παραγγελίας", "Επαναφορά"])
+        self.mov_reason_menu.grid(row=0, column=2, padx=(0, 6))
+
+        self.mov_start_entry = customtkinter.CTkEntry(
+            self.mov_filter_bar, width=130, placeholder_text="Από (YYYY-MM-DD)")
+        self.mov_start_entry.grid(row=0, column=3, padx=(0, 6))
+
+        self.mov_end_entry = customtkinter.CTkEntry(
+            self.mov_filter_bar, width=130, placeholder_text="Έως (YYYY-MM-DD)")
+        self.mov_end_entry.grid(row=0, column=4, padx=(0, 6))
+
+        self.mov_search_btn = customtkinter.CTkButton(
+            self.mov_filter_bar, text="🔍 Αναζήτηση", width=100,
+            fg_color="#2980B9", hover_color="#1F618D",
+            text_color=("#FFFFFF", "#FFFFFF"),
+            command=self.refresh_stock_movements)
+        self.mov_search_btn.grid(row=0, column=5, sticky="e")
+
+        # Treeview — uses global ttk style for consistent typography
+        self.mov_tree = ttk.Treeview(
+            self.stock_movements_frame,
+            columns=("timestamp", "barcode", "product_name", "old_stock",
+                     "new_stock", "change", "reason", "source"),
+            show="headings", height=20,
+        )
+        self.mov_tree.heading("timestamp", text="Ημ/νία")
+        self.mov_tree.heading("barcode", text="Barcode")
+        self.mov_tree.heading("product_name", text="Προϊόν")
+        self.mov_tree.heading("old_stock", text="Παλιό")
+        self.mov_tree.heading("new_stock", text="Νέο")
+        self.mov_tree.heading("change", text="Μεταβολή")
+        self.mov_tree.heading("reason", text="Αιτία")
+        self.mov_tree.heading("source", text="Πηγή")
+
+        self.mov_tree.column("timestamp", width=140)
+        self.mov_tree.column("barcode", width=110)
+        self.mov_tree.column("product_name", width=200)
+        self.mov_tree.column("old_stock", width=55, anchor="center")
+        self.mov_tree.column("new_stock", width=55, anchor="center")
+        self.mov_tree.column("change", width=65, anchor="center")
+        self.mov_tree.column("reason", width=120)
+        self.mov_tree.column("source", width=90)
+
+        vsb = ttk.Scrollbar(self.stock_movements_frame, orient="vertical",
+                            command=self.mov_tree.yview)
+        self.mov_tree.configure(yscrollcommand=vsb.set)
+        self.mov_tree.grid(row=2, column=0, padx=20, pady=(0, 20), sticky="nsew")
+        vsb.grid(row=2, column=1, pady=(0, 20), sticky="ns")
+
+        # Tag config for red/green changes
+        self.mov_tree.tag_configure("negative", foreground="#E74C3C")
+        self.mov_tree.tag_configure("positive", foreground="#27AE60")
+
+        # Debounced refresh on filter changes
+        self._mov_refresh_timer = None
+        self.mov_barcode_entry.bind("<KeyRelease>", lambda e: self._debounce_mov_refresh())
+        self.mov_name_entry.bind("<KeyRelease>", lambda e: self._debounce_mov_refresh())
+        self.mov_reason_menu.configure(command=lambda _: self.refresh_stock_movements())
+
+    def _debounce_mov_refresh(self):
+        if self._mov_refresh_timer:
+            self.after_cancel(self._mov_refresh_timer)
+        self._mov_refresh_timer = self.after(400, self.refresh_stock_movements)
+
+    def refresh_stock_movements(self):
+        if not hasattr(self, 'stock_movements_frame') or self.stock_movements_frame is None:
+            return
+        if not hasattr(self, 'mov_tree') or self.mov_tree is None:
+            return
+
+        barcode = self.mov_barcode_entry.get().strip() or None
+        name_filter = self.mov_name_entry.get().strip().lower() or None
+        reason = self.mov_reason_menu.get()
+        reason = None if reason == "Όλοι" else reason
+        start_date = self.mov_start_entry.get().strip() or None
+        end_date = self.mov_end_entry.get().strip() or None
+
+        def _fetch():
+            try:
+                rows = self.db_service.get_stock_movements(
+                    limit=500, barcode=barcode, reason=reason,
+                    start_date=start_date, end_date=end_date)
+                # Client-side name filter
+                if name_filter:
+                    rows = [r for r in rows
+                            if name_filter in r.get("product_name", "").lower()]
+                self.after(0, lambda: self._render_stock_movements(rows))
+            except Exception as e:
+                logging.error("refresh_stock_movements failed: %s", e)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _render_stock_movements(self, rows):
+        if not hasattr(self, 'mov_tree') or self.mov_tree is None:
+            return
+        self.mov_tree.delete(*self.mov_tree.get_children())
+        for i, r in enumerate(rows):
+            change = r.get("change_amount") or r.get("difference", 0)
+            change_str = f"+{change}" if change > 0 else str(change)
+            tag = "positive" if change > 0 else ("negative" if change < 0 else None)
+            tags = (tag,) if tag else ()
+            self.mov_tree.insert("", "end", values=(
+                r.get("timestamp", ""),
+                r.get("barcode", ""),
+                r.get("product_name", ""),
+                r.get("old_stock", 0),
+                r.get("new_stock", 0),
+                change_str,
+                r.get("reason", ""),
+                r.get("source", ""),
+            ), tags=tags)
+
 
 class ProductFormDialog(customtkinter.CTkToplevel):
     """Secondary Modal popup for adding/updating products."""
@@ -3203,8 +3646,10 @@ class ProductFormDialog(customtkinter.CTkToplevel):
 
         supplier_name = self.supplier_var.get()
         supplier_id = self._supplier_map.get(supplier_name, None) if supplier_name != "Κανένας" else None
+        old_stock = self.product.stock if self.product else None
         self.result = {
             "barcode": barcode, "name": name, "stock": stock,
-            "expiry_date": expiry, "price": price, "supplier_id": supplier_id
+            "expiry_date": expiry, "price": price, "supplier_id": supplier_id,
+            "old_stock": old_stock
         }
         self.destroy()

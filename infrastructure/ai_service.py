@@ -14,7 +14,7 @@ from typing import Optional, Dict, Any
 logger = logging.getLogger(__name__)
 
 # ── System prompt that forces the LLM to return a structured intent ──
-SYSTEM_PROMPT = """Είσαι ο ClawBot AI, ο νοημονικός βοηθός του ENCOMM ERP (φαρμακευτικό σύστημα).
+SYSTEM_PROMPT = """Είσαι ο Encomm AI, ο νοημονικός βοηθός του ENCOMM ERP (φαρμακευτικό σύστημα).
 Ο χρήστης σου δίνει μια εντολή στα Ελληνικά ή στα Αγγλικά.
 Πρέπει να επιστρέψεις **ΜΟΝΟ** ένα έγκυρο JSON object (χωρίς markdown, χωρίς εξηγήσεις).
 
