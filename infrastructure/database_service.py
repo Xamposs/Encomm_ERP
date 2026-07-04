@@ -1,8 +1,9 @@
 import sqlite3
 import os
+import json
 import logging
 from typing import List, Optional, Dict, Tuple
-from core.domain_models import Product
+from core.domain_models import Product, Supplier
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "encomm_erp.db")
@@ -86,11 +87,17 @@ class DatabaseService:
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS suppliers (
-                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name    TEXT    NOT NULL UNIQUE,
-                    phone   TEXT,
-                    email   TEXT,
-                    address TEXT
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name                  TEXT    NOT NULL UNIQUE,
+                    tax_id                TEXT    DEFAULT '',
+                    contact_person        TEXT,
+                    phone                 TEXT,
+                    email                 TEXT,
+                    allowed_sender_emails TEXT    DEFAULT '[]',
+                    catalogue_format      TEXT    DEFAULT 'XLSX',
+                    default_markup        REAL    DEFAULT 0.25,
+                    pricing_notes         TEXT,
+                    created_at            TEXT    DEFAULT (datetime('now'))
                 )
             """)
 
@@ -113,6 +120,39 @@ class DatabaseService:
                 cursor.execute("ALTER TABLE ProductMaster ADD COLUMN supplier_id INTEGER")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+            # ── Schema migration: new ProductMaster columns (idempotent) ──
+            _migrations = [
+                ("supplier_code", "TEXT"),
+                ("barcode_type", "TEXT NOT NULL DEFAULT 'EAN13'"),
+                ("vat_category", "INTEGER NOT NULL DEFAULT 6"),
+                ("eof_code", "TEXT"),
+            ]
+            for col_name, col_def in _migrations:
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE ProductMaster ADD COLUMN {col_name} {col_def}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists — idempotent
+
+            # ── Schema migration: new suppliers columns (idempotent) ──
+            _supplier_migrations = [
+                ("tax_id", "TEXT DEFAULT ''"),
+                ("contact_person", "TEXT"),
+                ("allowed_sender_emails", "TEXT DEFAULT '[]'"),
+                ("catalogue_format", "TEXT DEFAULT 'XLSX'"),
+                ("default_markup", "REAL DEFAULT 0.25"),
+                ("pricing_notes", "TEXT"),
+                ("created_at", "TEXT DEFAULT (datetime('now'))"),
+            ]
+            for col_name, col_def in _supplier_migrations:
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE suppliers ADD COLUMN {col_name} {col_def}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists — idempotent
 
             # ── Performance Indexes ──
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date)")
@@ -175,18 +215,19 @@ class DatabaseService:
     def _insert_dummy_data(self, cursor: sqlite3.Cursor):
         """Seed the database with high-quality sample pharmacy items."""
         dummy_products = [
-            ("8801234567890", "Paracetamol 500mg (Panadol)", 150, "2027-08-15", 3.50, None),
-            ("8801234567891", "Amoxicillin 250mg (Antibiotic)", 8, "2026-06-10", 12.99, None), # Low stock & Near expiry (rel. to June 2026)
-            ("8801234567892", "Ibuprofen 400mg (Advil)", 80, "2027-01-20", 5.25, None),
-            ("8801234567893", "Atorvastatin 20mg (Lipitor)", 4, "2026-05-30", 25.00, None), # Low stock & Expired
-            ("8801234567894", "Metformin 850mg (Glucophage)", 200, "2028-11-05", 9.80, None),
-            ("8801234567895", "Omeprazole 20mg (Prilosec)", 12, "2026-06-22", 8.45, None), # Near expiry
-            ("8801234567896", "Lisinopril 10mg (Zestril)", 95, "2027-04-12", 11.20, None),
-            ("8801234567897", "Cetirizine 10mg (Zyrtec)", 180, "2028-02-18", 4.99, None),
+            ("8801234567890", "Paracetamol 500mg (Panadol)", 150, "2027-08-15", 3.50, None, None, "EAN13", 6, None),
+            ("8801234567891", "Amoxicillin 250mg (Antibiotic)", 8, "2026-06-10", 12.99, None, None, "EAN13", 6, None),
+            ("8801234567892", "Ibuprofen 400mg (Advil)", 80, "2027-01-20", 5.25, None, None, "EAN13", 6, None),
+            ("8801234567893", "Atorvastatin 20mg (Lipitor)", 4, "2026-05-30", 25.00, None, None, "EAN13", 6, None),
+            ("8801234567894", "Metformin 850mg (Glucophage)", 200, "2028-11-05", 9.80, None, None, "EAN13", 6, None),
+            ("8801234567895", "Omeprazole 20mg (Prilosec)", 12, "2026-06-22", 8.45, None, None, "EAN13", 6, None),
+            ("8801234567896", "Lisinopril 10mg (Zestril)", 95, "2027-04-12", 11.20, None, None, "EAN13", 6, None),
+            ("8801234567897", "Cetirizine 10mg (Zyrtec)", 180, "2028-02-18", 4.99, None, None, "EAN13", 6, None),
         ]
         cursor.executemany("""
-            INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id,
+                                       supplier_code, barcode_type, vat_category, eof_code)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, dummy_products)
 
     def get_all_products(self) -> List[Product]:
@@ -195,7 +236,9 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id FROM ProductMaster ORDER BY Name ASC")
+            cursor.execute("SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id, "
+                           "supplier_code, barcode_type, vat_category, eof_code "
+                           "FROM ProductMaster ORDER BY Name ASC")
             rows = cursor.fetchall()
             products = [
                 Product(
@@ -204,7 +247,11 @@ class DatabaseService:
                     stock=row["Stock"],
                     expiry_date=row["ExpiryDate"],
                     price=row["Price"],
-                    supplier_id=row["supplier_id"]
+                    supplier_id=row["supplier_id"],
+                    supplier_code=row["supplier_code"],
+                    barcode_type=row["barcode_type"] or "EAN13",
+                    vat_category=row["vat_category"] or 6,
+                    eof_code=row["eof_code"],
                 )
                 for row in rows
             ]
@@ -223,7 +270,8 @@ class DatabaseService:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id "
+                "SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id, "
+                "supplier_code, barcode_type, vat_category, eof_code "
                 "FROM ProductMaster WHERE Stock > 0 ORDER BY Name ASC LIMIT ?",
                 (limit,),
             )
@@ -236,6 +284,10 @@ class DatabaseService:
                     expiry_date=row["ExpiryDate"],
                     price=row["Price"],
                     supplier_id=row["supplier_id"],
+                    supplier_code=row["supplier_code"],
+                    barcode_type=row["barcode_type"] or "EAN13",
+                    vat_category=row["vat_category"] or 6,
+                    eof_code=row["eof_code"],
                 )
                 for row in rows
             ]
@@ -253,7 +305,9 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id FROM ProductMaster WHERE Barcode = ?", (barcode,))
+            cursor.execute("SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id, "
+                           "supplier_code, barcode_type, vat_category, eof_code "
+                           "FROM ProductMaster WHERE Barcode = ?", (barcode,))
             row = cursor.fetchone()
             product = None
             if row:
@@ -263,7 +317,11 @@ class DatabaseService:
                     stock=row["Stock"],
                     expiry_date=row["ExpiryDate"],
                     price=row["Price"],
-                    supplier_id=row["supplier_id"]
+                    supplier_id=row["supplier_id"],
+                    supplier_code=row["supplier_code"],
+                    barcode_type=row["barcode_type"] or "EAN13",
+                    vat_category=row["vat_category"] or 6,
+                    eof_code=row["eof_code"],
                 )
             return product
         except sqlite3.Error as e:
@@ -280,10 +338,16 @@ class DatabaseService:
             conn = self._get_connection()
             cursor = conn.cursor()
             sid = getattr(product, 'supplier_id', None)
+            sc = getattr(product, 'supplier_code', None)
+            bt = getattr(product, 'barcode_type', 'EAN13')
+            vc = getattr(product, 'vat_category', 6)
+            ec = getattr(product, 'eof_code', None)
             cursor.execute("""
-                INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (product.barcode, product.name, product.stock, product.expiry_date, product.price, sid))
+                INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id,
+                                          supplier_code, barcode_type, vat_category, eof_code)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (product.barcode, product.name, product.stock, product.expiry_date,
+                  product.price, sid, sc, bt, vc, ec))
             conn.commit()
             # ── Audit trail ──
             try:
@@ -310,11 +374,17 @@ class DatabaseService:
             conn = self._get_connection()
             cursor = conn.cursor()
             sid = getattr(product, 'supplier_id', None)
+            sc = getattr(product, 'supplier_code', None)
+            bt = getattr(product, 'barcode_type', 'EAN13')
+            vc = getattr(product, 'vat_category', 6)
+            ec = getattr(product, 'eof_code', None)
             cursor.execute("""
                 UPDATE ProductMaster
-                SET Name = ?, Stock = ?, ExpiryDate = ?, Price = ?, supplier_id = ?
+                SET Name = ?, Stock = ?, ExpiryDate = ?, Price = ?, supplier_id = ?,
+                    supplier_code = ?, barcode_type = ?, vat_category = ?, eof_code = ?
                 WHERE Barcode = ?
-            """, (product.name, product.stock, product.expiry_date, product.price, sid, product.barcode))
+            """, (product.name, product.stock, product.expiry_date, product.price, sid,
+                  sc, bt, vc, ec, product.barcode))
             conn.commit()
             # ── Audit trail ──
             try:
@@ -394,14 +464,19 @@ class DatabaseService:
             try:
                 cursor.executemany(
                     """
-                    INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id,
+                                              supplier_code, barcode_type, vat_category, eof_code)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(Barcode) DO UPDATE SET
-                        Name       = excluded.Name,
-                        Stock      = Stock + excluded.Stock,
-                        ExpiryDate = excluded.ExpiryDate,
-                        Price      = excluded.Price,
-                        supplier_id = COALESCE(excluded.supplier_id, ProductMaster.supplier_id)
+                        Name          = excluded.Name,
+                        Stock         = Stock + excluded.Stock,
+                        ExpiryDate    = excluded.ExpiryDate,
+                        Price         = excluded.Price,
+                        supplier_id   = COALESCE(excluded.supplier_id, ProductMaster.supplier_id),
+                        supplier_code = COALESCE(excluded.supplier_code, ProductMaster.supplier_code),
+                        barcode_type  = COALESCE(excluded.barcode_type, ProductMaster.barcode_type),
+                        vat_category  = COALESCE(excluded.vat_category, ProductMaster.vat_category),
+                        eof_code      = COALESCE(excluded.eof_code, ProductMaster.eof_code)
                     """,
                     products_list,
                 )
@@ -469,6 +544,7 @@ class DatabaseService:
             cursor.execute(
                 """
                 SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id,
+                       supplier_code, barcode_type, vat_category, eof_code,
                        CASE
                            WHEN date(ExpiryDate) < date('now')                          THEN 0
                            WHEN date(ExpiryDate) <= date('now', '+' || ? || ' days')    THEN 1
@@ -499,6 +575,10 @@ class DatabaseService:
                     expiry_date=row["ExpiryDate"],
                     price=row["Price"],
                     supplier_id=row["supplier_id"],
+                    supplier_code=row["supplier_code"],
+                    barcode_type=row["barcode_type"] or "EAN13",
+                    vat_category=row["vat_category"] or 6,
+                    eof_code=row["eof_code"],
                 )
                 reasons = []
                 if row["is_expiry_flag"]:
@@ -560,7 +640,8 @@ class DatabaseService:
 
             # Page slice
             cursor.execute(
-                f"SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id "
+                f"SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id, "
+                f"supplier_code, barcode_type, vat_category, eof_code "
                 f"FROM ProductMaster WHERE {where_clause} "
                 f"ORDER BY Name ASC LIMIT ? OFFSET ?",
                 params + [limit, offset],
@@ -579,6 +660,10 @@ class DatabaseService:
                     expiry_date=row["ExpiryDate"],
                     price=row["Price"],
                     supplier_id=row["supplier_id"],
+                    supplier_code=row["supplier_code"],
+                    barcode_type=row["barcode_type"] or "EAN13",
+                    vat_category=row["vat_category"] or 6,
+                    eof_code=row["eof_code"],
                 )
                 for row in rows
             ]
@@ -835,13 +920,21 @@ class DatabaseService:
 
     # ── Supplier CRUD ──
     def get_all_suppliers(self) -> List[Dict]:
-        """Return all suppliers as a list of dicts."""
+        """Return all suppliers as a list of dicts (backward-compatible)."""
         conn = None
         try:
             conn = self._get_connection()
-            rows = conn.execute("SELECT id, name, phone, email, address FROM suppliers ORDER BY name").fetchall()
-            return [{"id": r["id"], "name": r["name"], "phone": r["phone"] or "",
-                     "email": r["email"] or "", "address": r["address"] or ""} for r in rows]
+            rows = conn.execute("SELECT id, name, tax_id, contact_person, phone, email, "
+                                "allowed_sender_emails, catalogue_format, default_markup, "
+                                "pricing_notes, created_at FROM suppliers ORDER BY name").fetchall()
+            return [{"id": r["id"], "name": r["name"], "tax_id": r["tax_id"] or "",
+                     "contact_person": r["contact_person"] or "",
+                     "phone": r["phone"] or "", "email": r["email"] or "",
+                     "allowed_sender_emails": r["allowed_sender_emails"] or "[]",
+                     "catalogue_format": r["catalogue_format"] or "XLSX",
+                     "default_markup": r["default_markup"] or 0.25,
+                     "pricing_notes": r["pricing_notes"] or "",
+                     "created_at": r["created_at"] or ""} for r in rows]
         except sqlite3.Error as e:
             logging.error("Error fetching suppliers: %s", e)
             return []
@@ -849,13 +942,21 @@ class DatabaseService:
             if conn:
                 conn.close()
 
-    def add_supplier(self, name: str, phone: str = "", email: str = "", address: str = "") -> bool:
-        """Add a new supplier. Returns True on success."""
+    def add_supplier(self, name: str, phone: str = "", email: str = "",
+                     address: str = "", tax_id: str = "",
+                     contact_person: str = "", allowed_sender_emails: str = "[]",
+                     catalogue_format: str = "XLSX", default_markup: float = 0.25,
+                     pricing_notes: str = "") -> bool:
+        """Add a new supplier. Returns True on success.
+        Kept for backward compatibility with existing callers."""
         conn = None
         try:
             conn = self._get_connection()
-            conn.execute("INSERT INTO suppliers (name, phone, email, address) VALUES (?, ?, ?, ?)",
-                         (name, phone, email, address))
+            conn.execute("INSERT INTO suppliers (name, phone, email, tax_id, contact_person, "
+                         "allowed_sender_emails, catalogue_format, default_markup, pricing_notes) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (name, phone, email, tax_id, contact_person,
+                          allowed_sender_emails, catalogue_format, default_markup, pricing_notes))
             conn.commit()
             return True
         except sqlite3.Error as e:
@@ -1104,15 +1205,17 @@ class DatabaseService:
     def restore_product(self, data: dict) -> bool:
         """Restore a previously deleted product from captured state dict.
 
-        Keys expected: Barcode, Name, Stock, ExpiryDate, Price, supplier_id
-        (PascalCase to match ProductMaster schema column names).
-        """
+        Keys expected: Barcode, Name, Stock, ExpiryDate, Price, supplier_id,
+        supplier_code, barcode_type, vat_category, eof_code
+        (PascalCase to match ProductMaster schema column names)."""
+        conn = None
         conn = None
         try:
             conn = self._get_connection()
             conn.execute(
-                "INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id, "
+                "supplier_code, barcode_type, vat_category, eof_code) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     data.get("Barcode"),
                     data.get("Name"),
@@ -1120,6 +1223,10 @@ class DatabaseService:
                     data.get("ExpiryDate"),
                     data.get("Price"),
                     data.get("supplier_id"),
+                    data.get("supplier_code"),
+                    data.get("barcode_type", "EAN13"),
+                    data.get("vat_category", 6),
+                    data.get("eof_code"),
                 ),
             )
             conn.commit()
@@ -1215,14 +1322,21 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             conn.execute(
-                "INSERT INTO suppliers (id, name, phone, email, address) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO suppliers (id, name, tax_id, contact_person, phone, email, "
+                "allowed_sender_emails, catalogue_format, default_markup, pricing_notes, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     data.get("id"),
                     data.get("name"),
+                    data.get("tax_id", ""),
+                    data.get("contact_person", ""),
                     data.get("phone", ""),
                     data.get("email", ""),
-                    data.get("address", ""),
+                    data.get("allowed_sender_emails", "[]"),
+                    data.get("catalogue_format", "XLSX"),
+                    data.get("default_markup", 0.25),
+                    data.get("pricing_notes", ""),
+                    data.get("created_at", ""),
                 ),
             )
             conn.commit()
@@ -1256,30 +1370,6 @@ class DatabaseService:
         except sqlite3.Error as e:
             logging.error("log_stock_movement failed: %s", e)
             return False
-        finally:
-            if conn:
-                conn.close()
-
-    def get_stock_movements(self, barcode: str = None, limit: int = 200,
-                            offset: int = 0) -> List[Dict]:
-        """Query stock movements, optionally filtered by barcode."""
-        conn = None
-        try:
-            conn = self._get_connection()
-            if barcode:
-                rows = conn.execute(
-                    "SELECT * FROM stock_movements WHERE barcode = ? "
-                    "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                    (barcode, limit, offset)).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM stock_movements "
-                    "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                    (limit, offset)).fetchall()
-            return [dict(r) for r in rows]
-        except sqlite3.Error as e:
-            logging.error("get_stock_movements failed: %s", e)
-            return []
         finally:
             if conn:
                 conn.close()
@@ -1415,7 +1505,8 @@ class DatabaseService:
             if conn:
                 conn.close()
 
-    def get_stock_movements(self, limit: int = 200, barcode: str = None,
+    def get_stock_movements(self, limit: int = 200, offset: int = 0,
+                            barcode: str = None,
                             reason: str = None, start_date: str = None,
                             end_date: str = None) -> List[Dict]:
         """Query the audit trail with optional filters.
@@ -1442,8 +1533,8 @@ class DatabaseService:
                 query += " AND timestamp <= ?"
                 params.append(end_date)
 
-            query += " ORDER BY timestamp DESC LIMIT ?"
-            params.append(limit)
+            query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
 
             rows = conn.execute(query, params).fetchall()
             result = []
@@ -1466,3 +1557,126 @@ class DatabaseService:
     def get_product_movement_history(self, barcode: str, limit: int = 50) -> List[Dict]:
         """Convenience: all movements for a single product."""
         return self.get_stock_movements(barcode=barcode, limit=limit)
+
+    # =================================================================
+    # SUPPLIER CRUD (returns Supplier domain objects)
+    # =================================================================
+
+    def get_supplier(self, supplier_id: int) -> Optional[Supplier]:
+        """Fetch a single supplier by ID as a Supplier domain object."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute(
+                "SELECT id, name, tax_id, contact_person, phone, email, "
+                "allowed_sender_emails, catalogue_format, default_markup, "
+                "pricing_notes, created_at FROM suppliers WHERE id = ?",
+                (supplier_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return Supplier(
+                id=row["id"],
+                name=row["name"],
+                tax_id=row["tax_id"] or "",
+                contact_person=row["contact_person"],
+                phone=row["phone"],
+                email=row["email"],
+                allowed_sender_emails=json.loads(row["allowed_sender_emails"] or "[]"),
+                catalogue_format=row["catalogue_format"] or "XLSX",
+                default_markup=row["default_markup"] or 0.25,
+                pricing_notes=row["pricing_notes"],
+                created_at=row["created_at"],
+            )
+        except (sqlite3.Error, json.JSONDecodeError) as e:
+            logging.error("Error fetching supplier %s: %s", supplier_id, e)
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def add_supplier_obj(self, supplier: Supplier) -> bool:
+        """Insert a new supplier from a Supplier domain object. Returns True on success."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute(
+                "INSERT INTO suppliers (name, tax_id, contact_person, phone, email, "
+                "allowed_sender_emails, catalogue_format, default_markup, pricing_notes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    supplier.name,
+                    supplier.tax_id,
+                    supplier.contact_person,
+                    supplier.phone,
+                    supplier.email,
+                    json.dumps(supplier.allowed_sender_emails, ensure_ascii=False),
+                    supplier.catalogue_format,
+                    supplier.default_markup,
+                    supplier.pricing_notes,
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("Error adding supplier '%s': %s", supplier.name, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def update_supplier(self, supplier: Supplier) -> bool:
+        """Update an existing supplier from a Supplier domain object. Returns True on success."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            conn.execute(
+                "UPDATE suppliers SET name=?, tax_id=?, contact_person=?, phone=?, email=?, "
+                "allowed_sender_emails=?, catalogue_format=?, default_markup=?, pricing_notes=? "
+                "WHERE id=?",
+                (
+                    supplier.name,
+                    supplier.tax_id,
+                    supplier.contact_person,
+                    supplier.phone,
+                    supplier.email,
+                    json.dumps(supplier.allowed_sender_emails, ensure_ascii=False),
+                    supplier.catalogue_format,
+                    supplier.default_markup,
+                    supplier.pricing_notes,
+                    supplier.id,
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error("Error updating supplier %s: %s", supplier.id, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def get_all_allowed_sender_emails(self) -> List[str]:
+        """Flat list of all allowed sender emails across all suppliers."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            rows = conn.execute(
+                "SELECT allowed_sender_emails FROM suppliers "
+                "WHERE allowed_sender_emails IS NOT NULL AND allowed_sender_emails != '[]'"
+            ).fetchall()
+            all_emails: List[str] = []
+            for r in rows:
+                try:
+                    parsed = json.loads(r["allowed_sender_emails"] or "[]")
+                    if isinstance(parsed, list):
+                        all_emails.extend(parsed)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return all_emails
+        except sqlite3.Error as e:
+            logging.error("Error fetching allowed sender emails: %s", e)
+            return []
+        finally:
+            if conn:
+                conn.close()

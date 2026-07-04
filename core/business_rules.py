@@ -46,3 +46,17 @@ def calculate_invoice_totals(items: List[Tuple[Product, int]], vat_rate: float) 
     vat_amount = calculate_vat(subtotal, vat_rate)
     grand_total = round(subtotal + vat_amount, 2)
     return vat_amount, grand_total
+
+# ── Greek Pharmacy VAT Categories ────────────────────────────────────
+
+VALID_PHARMACY_VAT_CATEGORIES = (6, 13, 24)
+
+def get_vat_rate(vat_category: int) -> float:
+    """Map Greek pharmacy VAT category integer to decimal rate."""
+    rates = {6: 0.06, 13: 0.13, 24: 0.24}
+    if vat_category not in rates:
+        raise ValueError(
+            f"Invalid VAT category: {vat_category}. "
+            f"Valid values: {VALID_PHARMACY_VAT_CATEGORIES}"
+        )
+    return rates[vat_category]
