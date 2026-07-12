@@ -177,46 +177,20 @@ class InvoiceHistoryView(BaseView):
         start_date = self.hist_export_start.get().strip() or None
         end_date = self.hist_export_end.get().strip() or None
 
-        def _write():
-            try:
-                rows = self.db_service.get_all_invoices(
-                    search_id="", start_date=start_date, end_date=end_date)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                total_revenue = sum(r["total"] for r in rows)
-                if is_csv:
-                    dest = os.path.join(
-                        os.path.expanduser("~"), "Desktop", f"InvoiceHistory_{ts}.csv")
-                    lines = ["Αρ.Παραστατικού,Ημερομηνία,Υποσύνολο,ΦΠΑ,Σύνολο,Πελάτης"]
-                    for r in rows:
-                        lines.append(
-                            f'{BaseView._csv_cell(r["id"])},{BaseView._csv_cell(r["date"])},'
-                            f'{r["subtotal"]:.2f},{r["vat"]:.2f},{r["total"]:.2f},'
-                            f'{BaseView._csv_cell(r.get("customer_name",""))}')
-                    with open(dest, "w", encoding="utf-8-sig") as f:
-                        f.write("\n".join(lines))
-                else:
-                    dest = os.path.join(
-                        os.path.expanduser("~"), "Desktop", f"InvoiceHistory_{ts}.txt")
-                    lines = [
-                        "=" * 60, "  ENCOMM — ΙΣΤΟΡΙΚΟ ΠΑΡΑΣΤΑΤΙΚΩΝ", "=" * 60,
-                        f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-                        f"Πλήθος: {len(rows)}  |  Σύνολο Εσόδων: €{total_revenue:.2f}",
-                        "=" * 60]
-                    for r in rows:
-                        lines.append(
-                            f"📋 {r['id']}  |  {r['date']}  |  "
-                            f"Υποσ: €{r['subtotal']:.2f}  |  "
-                            f"ΦΠΑ: €{r['vat']:.2f}  |  "
-                            f"Σύνολο: €{r['total']:.2f}  |  "
-                            f"{r.get('customer_name','')}")
-                    lines.append("=" * 60)
-                    with open(dest, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines))
-                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
-                    "Το αρχείο αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
-        threading.Thread(target=_write, daemon=True).start()
+        rows = self.db_service.get_all_invoices(
+            search_id="", start_date=start_date, end_date=end_date)
+        data = [
+            [r["id"], r["date"], f'{r["subtotal"]:.2f}', f'{r["vat"]:.2f}',
+             f'{r["total"]:.2f}', r.get("customer_name", "")]
+            for r in rows
+        ]
+        self._run_export(
+            "InvoiceHistory",
+            ["Αρ.Παραστατικού", "Ημερομηνία", "Υποσύνολο", "ΦΠΑ", "Σύνολο", "Πελάτης"],
+            data, is_csv,
+            txt_title="ΙΣΤΟΡΙΚΟ ΠΑΡΑΣΤΑΤΙΚΩΝ",
+            txt_row_fmt="📋 {0}  |  {1}  |  Υποσ: €{2}  |  ΦΠΑ: €{3}  |  Σύνολο: €{4}  |  {5}",
+        )
 
     # ------------------------------------------------------------------
     # Refresh

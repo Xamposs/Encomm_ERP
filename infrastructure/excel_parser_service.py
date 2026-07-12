@@ -9,10 +9,33 @@ the bulk_upsert_products database method.
 import csv
 import logging
 import os
+from datetime import datetime
 
 from openpyxl import load_workbook
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_expiry(raw: str) -> str:
+    """Normalize a raw expiry value to ``YYYY-MM-DD`` or ``""``.
+
+    Accepts ``YYYY-MM-DD`` (optionally with a trailing time component) and
+    the common European ``DD/MM/YYYY`` form. Empty/whitespace → ``""``.
+    Raises ``ValueError`` for anything that cannot be normalized, so the
+    caller (``_cast_row``) skips the row with a clear warning instead of
+    letting a garbage date silently hide expired stock in the DB.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    # Strip a trailing timestamp if present.
+    candidate = raw.split(" ")[0]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(candidate, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise ValueError(f"Unparseable expiry date: {raw!r}")
 
 
 class ExcelParserService:
@@ -122,8 +145,12 @@ class ExcelParserService:
             barcode = str(values[0]).strip()
             name = str(values[1]).strip()
             stock = int(float(values[2])) if values[2] is not None else 0
-            expiry_date = str(values[3]).strip() if values[3] is not None else ""
+            raw_expiry = str(values[3]).strip() if values[3] is not None else ""
             price = round(float(values[4]), 2) if values[4] is not None else 0.0
+
+            # Validate expiry so malformed dates never reach the DB (where they
+            # would defeat SQLite date() comparisons and hide expired stock).
+            expiry_date = _normalize_expiry(raw_expiry)
 
             if not barcode:
                 raise ValueError("Empty barcode")

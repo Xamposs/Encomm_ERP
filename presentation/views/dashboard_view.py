@@ -180,47 +180,30 @@ class DashboardView(BaseView):
         fmt = self.dash_export_format.get()
         is_csv = "csv" in fmt.lower()
 
-        def _write():
-            try:
-                rows = []
-                for child in self.alert_tree.get_children():
-                    vals = self.alert_tree.item(child)["values"]
-                    rows.append({"name": str(vals[0]), "stock": str(vals[1]),
-                                 "expiry": str(vals[2]), "reason": str(vals[3])})
-                if filter_text:
-                    rows = [r for r in rows if filter_text in r["name"].lower()]
-                if start_date:
-                    rows = [r for r in rows if r["expiry"] >= start_date]
-                if end_date:
-                    rows = [r for r in rows if r["expiry"] <= end_date]
-                try:
-                    limit = int(limit_str)
-                    rows = rows[:limit]
-                except ValueError:
-                    pass
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                if is_csv:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Dashboard_Export_{ts}.csv")
-                    lines = ["Όνομα,Στοκ,Ημ.Λήξης,Αιτία"]
-                    for r in rows:
-                        lines.append(f'{BaseView._csv_cell(r["name"])},{r["stock"]},{BaseView._csv_cell(r["expiry"])},{BaseView._csv_cell(r["reason"])}')
-                    with open(dest, "w", encoding="utf-8-sig") as f:
-                        f.write("\n".join(lines))
-                else:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Dashboard_Export_{ts}.txt")
-                    lines = ["=" * 50, "  ENCOMM DASHBOARD — ΚΡΙΣΙΜΑ ΠΡΟΪΟΝΤΑ", "=" * 50,
-                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-                             f"Εύρος ημ/νιών: {start_date or '—'} έως {end_date or '—'}", "-" * 50]
-                    for r in rows:
-                        lines.append(f"{r['name']:<30} | Στοκ: {r['stock']:<6} | Λήξη: {r['expiry']:<12} | {r['reason']}")
-                    lines.append("=" * 50)
-                    with open(dest, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines))
-                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
-                    "Το φιλτραρισμένο αρχείο βάσει ημερομηνιών αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
-        threading.Thread(target=_write, daemon=True).start()
+        # Pull rows from the alert tree, then apply filters/limit.
+        rows = []
+        for child in self.alert_tree.get_children():
+            vals = self.alert_tree.item(child)["values"]
+            rows.append([str(vals[0]), str(vals[1]), str(vals[2]), str(vals[3])])
+        if filter_text:
+            rows = [r for r in rows if filter_text in r[0].lower()]
+        if start_date:
+            rows = [r for r in rows if r[2] >= start_date]
+        if end_date:
+            rows = [r for r in rows if r[2] <= end_date]
+        try:
+            limit = int(limit_str)
+            rows = rows[:limit]
+        except ValueError:
+            pass
+
+        self._run_export(
+            "Dashboard_Export",
+            ["Όνομα", "Στοκ", "Ημ.Λήξης", "Αιτία"],
+            rows, is_csv,
+            txt_title="DASHBOARD — ΚΡΙΣΙΜΑ ΠΡΟΪΟΝΤΑ",
+            txt_row_fmt="{0:<30} | Στοκ: {1:<6} | Λήξη: {2:<12} | {3}",
+        )
 
     # ------------------------------------------------------------------
     # Refresh

@@ -11,15 +11,29 @@ DB_PATH = os.path.join(BASE_DIR, "encomm_erp.db")
 class DatabaseService:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
+        # journal_mode is database-scoped and persistent — set it once at
+        # init rather than redundantly on every connection.
+        self._ensure_wal_mode()
         self._initialize_db()
+
+    def _ensure_wal_mode(self) -> None:
+        """Enable WAL journal mode once for the database file."""
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error as e:
+            logging.warning(f"Could not enable WAL journal mode: {e}")
+        finally:
+            if conn:
+                conn.close()
 
     def _get_connection(self) -> sqlite3.Connection:
         """Establish a connection to the SQLite database with Row factory enabled."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        # PRAGMA optimizations for high-performance bulk operations
+        # Connection-scoped PRAGMAs (must be set per connection).
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-64000")
         return conn
@@ -41,9 +55,9 @@ class DatabaseService:
                 CREATE TABLE IF NOT EXISTS ProductMaster (
                     Barcode TEXT PRIMARY KEY,
                     Name TEXT NOT NULL,
-                    Stock INTEGER NOT NULL,
+                    Stock INTEGER NOT NULL CHECK (Stock >= 0),
                     ExpiryDate TEXT NOT NULL,
-                    Price REAL NOT NULL
+                    Price REAL NOT NULL CHECK (Price >= 0)
                 )
             """)
 
@@ -70,9 +84,10 @@ class DatabaseService:
                     invoice_id TEXT    NOT NULL,
                     barcode    TEXT    NOT NULL,
                     name       TEXT    NOT NULL,
-                    quantity   INTEGER NOT NULL,
-                    price      REAL    NOT NULL,
-                    FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+                    quantity   INTEGER NOT NULL CHECK (quantity > 0),
+                    price      REAL    NOT NULL CHECK (price >= 0),
+                    FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
+                    FOREIGN KEY (barcode) REFERENCES ProductMaster(Barcode) ON DELETE RESTRICT
                 )
             """)
 
@@ -93,25 +108,12 @@ class DatabaseService:
                     contact_person        TEXT,
                     phone                 TEXT,
                     email                 TEXT,
+                    address               TEXT,
                     allowed_sender_emails TEXT    DEFAULT '[]',
                     catalogue_format      TEXT    DEFAULT 'XLSX',
                     default_markup        REAL    DEFAULT 0.25,
                     pricing_notes         TEXT,
                     created_at            TEXT    DEFAULT (datetime('now'))
-                )
-            """)
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS stock_movements (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp    TEXT    NOT NULL,
-                    barcode      TEXT    NOT NULL,
-                    product_name TEXT    NOT NULL,
-                    old_stock    INTEGER NOT NULL,
-                    new_stock    INTEGER NOT NULL,
-                    difference   INTEGER NOT NULL,
-                    reason       TEXT    NOT NULL,
-                    reference_id TEXT
                 )
             """)
 
@@ -140,6 +142,7 @@ class DatabaseService:
             _supplier_migrations = [
                 ("tax_id", "TEXT DEFAULT ''"),
                 ("contact_person", "TEXT"),
+                ("address", "TEXT"),
                 ("allowed_sender_emails", "TEXT DEFAULT '[]'"),
                 ("catalogue_format", "TEXT DEFAULT 'XLSX'"),
                 ("default_markup", "REAL DEFAULT 0.25"),
@@ -351,11 +354,14 @@ class DatabaseService:
             conn.commit()
             # ── Audit trail ──
             try:
-                self.log_stock_movement(
-                    product.barcode, product.name, 0, product.stock,
+                self._log_stock_movement_on_conn(
+                    cursor, product.barcode, product.name, 0, product.stock,
                     reason="Εισαγωγή", source="Φόρμα Προϊόντος")
+                conn.commit()
             except Exception:
-                pass
+                logging.debug(
+                    "Stock-movement log failed during add_product for %s",
+                    product.barcode, exc_info=True)
             return True
         except sqlite3.Error as e:
             logging.error(f"Error adding product '{product.name}': {e}")
@@ -365,12 +371,14 @@ class DatabaseService:
                 conn.close()
 
     def update_product(self, product: Product) -> bool:
-        """Update an existing product record."""
+        """Update an existing product record.
+
+        Reads old stock, writes the update, and logs the movement on the
+        same connection so the audit trail reflects the true prior value
+        (no read-then-write race across separate connections).
+        """
         conn = None
         try:
-            # Capture old stock for audit before updating
-            old = self.get_product(product.barcode)
-            old_stock = old.stock if old else 0
             conn = self._get_connection()
             cursor = conn.cursor()
             sid = getattr(product, 'supplier_id', None)
@@ -378,6 +386,12 @@ class DatabaseService:
             bt = getattr(product, 'barcode_type', 'EAN13')
             vc = getattr(product, 'vat_category', 6)
             ec = getattr(product, 'eof_code', None)
+            # Capture old stock on THIS connection (same transaction).
+            row = cursor.execute(
+                "SELECT Stock FROM ProductMaster WHERE Barcode = ?",
+                (product.barcode,),
+            ).fetchone()
+            old_stock = row["Stock"] if row else 0
             cursor.execute("""
                 UPDATE ProductMaster
                 SET Name = ?, Stock = ?, ExpiryDate = ?, Price = ?, supplier_id = ?,
@@ -386,14 +400,17 @@ class DatabaseService:
             """, (product.name, product.stock, product.expiry_date, product.price, sid,
                   sc, bt, vc, ec, product.barcode))
             conn.commit()
-            # ── Audit trail ──
-            try:
-                if old_stock != product.stock:
-                    self.log_stock_movement(
-                        product.barcode, product.name, old_stock, product.stock,
+            # ── Audit trail (real old_stock, logged on the same txn) ──
+            if old_stock != product.stock:
+                try:
+                    self._log_stock_movement_on_conn(
+                        cursor, product.barcode, product.name, old_stock, product.stock,
                         reason="Χειροκίνητη Ενημέρωση", source="Φόρμα Προϊόντος")
-            except Exception:
-                pass
+                    conn.commit()
+                except Exception:
+                    logging.debug(
+                        "Stock-movement log failed during update_product for %s",
+                        product.barcode, exc_info=True)
             return True
         except sqlite3.Error as e:
             logging.error(f"Error updating product '{product.barcode}': {e}")
@@ -403,14 +420,21 @@ class DatabaseService:
                 conn.close()
 
     def update_stock(self, barcode: str, new_stock: int) -> bool:
-        """Update the stock count of an existing product."""
+        """Update the stock count of an existing product.
+
+        Reads old stock and writes the update on the same connection so
+        the audit trail is consistent (no TOCTOU race).
+        """
         conn = None
         try:
-            # Capture old stock for audit before updating
-            old = self.get_product(barcode)
-            old_stock = old.stock if old else 0
             conn = self._get_connection()
             cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT Name, Stock FROM ProductMaster WHERE Barcode = ?",
+                (barcode,),
+            ).fetchone()
+            name = row["Name"] if row else ""
+            old_stock = row["Stock"] if row else 0
             cursor.execute("""
                 UPDATE ProductMaster
                 SET Stock = ?
@@ -418,13 +442,16 @@ class DatabaseService:
             """, (new_stock, barcode))
             conn.commit()
             # ── Audit trail ──
-            try:
-                if old_stock != new_stock:
-                    self.log_stock_movement(
-                        barcode, old.name if old else "", old_stock, new_stock,
+            if old_stock != new_stock:
+                try:
+                    self._log_stock_movement_on_conn(
+                        cursor, barcode, name, old_stock, new_stock,
                         reason="Χειροκίνητη Ενημέρωση", source="Ενημέρωση Στοκ")
-            except Exception:
-                pass
+                    conn.commit()
+                except Exception:
+                    logging.debug(
+                        "Stock-movement log failed during update_stock for %s",
+                        barcode, exc_info=True)
             return True
         except sqlite3.Error as e:
             logging.error(f"Error updating stock for barcode '{barcode}': {e}")
@@ -453,15 +480,51 @@ class DatabaseService:
     # BULK UPSERT  (high-speed mass import)
     # =================================================================
     def bulk_upsert_products(self, products_list):
-        """Insert or update a large batch of products in one transaction."""
+        """Insert or update a large batch of products in one transaction.
+
+        Accepts either 5-element tuples (barcode, name, stock, expiry_date,
+        price) as produced by ExcelParserService, or full 10-element tuples
+        matching the ProductMaster schema. Short tuples are padded with
+        sensible defaults for the extra columns.
+        """
         if not products_list:
             return
-        logging.info(f"Bulk upsert started for {len(products_list)} products.")
+        # Normalize all rows to 10-element tuples so executemany matches
+        # the INSERT column list regardless of input width.
+        normalized = []
+        for row in products_list:
+            row = list(row)
+            if len(row) < 5:
+                logging.warning(f"Skipping malformed row in bulk_upsert (len={len(row)}): {row}")
+                continue
+            # Pad to 10 columns: supplier_id, supplier_code, barcode_type, vat_category, eof_code
+            while len(row) < 10:
+                if len(row) == 5:
+                    row.extend([None, None, "EAN13", 6, None])
+                else:
+                    row.append(None)
+            normalized.append(tuple(row[:10]))
+        if not normalized:
+            return
+        logging.info(f"Bulk upsert started for {len(normalized)} products.")
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute("BEGIN TRANSACTION")
             try:
+                # Capture real prior stock so the audit trail records the
+                # true old→new transition (not a fabricated 0→N).
+                barcodes = [row[0] for row in normalized]
+                prior_stock: Dict[str, int] = {}
+                if barcodes:
+                    placeholders = ",".join("?" * len(barcodes))
+                    for r in cursor.execute(
+                        f"SELECT Barcode, Stock FROM ProductMaster "
+                        f"WHERE Barcode IN ({placeholders})",
+                        barcodes,
+                    ):
+                        prior_stock[r["Barcode"]] = r["Stock"]
+
                 cursor.executemany(
                     """
                     INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price, supplier_id,
@@ -469,7 +532,7 @@ class DatabaseService:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(Barcode) DO UPDATE SET
                         Name          = excluded.Name,
-                        Stock         = Stock + excluded.Stock,
+                        Stock         = excluded.Stock,
                         ExpiryDate    = excluded.ExpiryDate,
                         Price         = excluded.Price,
                         supplier_id   = COALESCE(excluded.supplier_id, ProductMaster.supplier_id),
@@ -478,27 +541,32 @@ class DatabaseService:
                         vat_category  = COALESCE(excluded.vat_category, ProductMaster.vat_category),
                         eof_code      = COALESCE(excluded.eof_code, ProductMaster.eof_code)
                     """,
-                    products_list,
+                    normalized,
                 )
                 conn.commit()
-                logging.info(f"Bulk upsert completed for {len(products_list)} items.")
-                # ── Audit trail: log each product import ──
-                for prod in products_list:
-                    try:
-                        barcode, name, stock = prod[0], prod[1], prod[2]
-                        self.log_stock_movement(
-                            barcode, name, 0, stock,
-                            reason="Εισαγωγή", source="Τιμολόγιο")
-                    except Exception:
-                        pass
+                logging.info(f"Bulk upsert completed for {len(normalized)} items.")
+                # ── Audit trail: log each product import with real old_stock ──
+                for prod in normalized:
+                    barcode, name, new_stock = prod[0], prod[1], prod[2]
+                    old_stock = prior_stock.get(barcode, 0)
+                    if old_stock != new_stock:
+                        try:
+                            self._log_stock_movement_on_conn(
+                                cursor, barcode, name, old_stock, new_stock,
+                                reason="Εισαγωγή", source="Τιμολόγιο")
+                        except Exception:
+                            logging.debug(
+                                "Stock-movement log failed during bulk upsert for %s",
+                                barcode, exc_info=True)
+                conn.commit()
             except Exception:
                 conn.rollback()
-                logging.exception(f"Bulk upsert failed for batch of {len(products_list)} items — rolled back.")
+                logging.exception(f"Bulk upsert failed for batch of {len(normalized)} items — rolled back.")
                 raise
             finally:
                 conn.close()
         except Exception:
-            logging.exception(f"Bulk upsert connection error for batch of {len(products_list)} items.")
+            logging.exception(f"Bulk upsert connection error for batch of {len(normalized)} items.")
             raise
 
     # =================================================================
@@ -531,6 +599,48 @@ class DatabaseService:
         except sqlite3.Error as e:
             logging.error(f"Error in get_dashboard_counts: {e}")
             return {"total": 0, "low_stock": 0, "expiry": 0}
+        finally:
+            if conn:
+                conn.close()
+
+    def get_expiry_data_issues(self, limit: int = 200) -> List[Product]:
+        """Return products whose ``ExpiryDate`` SQLite cannot parse as a date.
+
+        These records are invisible to expiry SQL (``date()`` returns NULL, so
+        comparisons silently fall through) — a patient-safety hazard. Surfacing
+        them lets an operator clean up legacy/garbage data. Empty/blank dates
+        are excluded (those are an allowed "no expiry" sentinel).
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT Barcode, Name, Stock, ExpiryDate, Price, supplier_id,
+                       supplier_code, barcode_type, vat_category, eof_code
+                FROM ProductMaster
+                WHERE ExpiryDate != ''
+                  AND date(ExpiryDate) IS NULL
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            results: List[Product] = []
+            for row in cursor.fetchall():
+                results.append(Product(
+                    barcode=row["Barcode"], name=row["Name"],
+                    stock=row["Stock"], expiry_date=row["ExpiryDate"],
+                    price=row["Price"], supplier_id=row["supplier_id"],
+                    supplier_code=row["supplier_code"],
+                    barcode_type=row["barcode_type"] or "EAN13",
+                    vat_category=row["vat_category"] or 6,
+                    eof_code=row["eof_code"],
+                ))
+            return results
+        except sqlite3.Error as e:
+            logging.error(f"Error in get_expiry_data_issues: {e}")
+            return []
         finally:
             if conn:
                 conn.close()
@@ -894,6 +1004,123 @@ class DatabaseService:
             if conn:
                 conn.close()
 
+    def process_checkout_transaction(
+        self,
+        invoice_id: str,
+        cart_items: List[Tuple[Product, int]],
+        customer_id: Optional[int],
+        vat_rate: float,
+    ) -> Tuple[bool, List[Tuple[Product, int]], List[Tuple[str, str]], Dict[str, float]]:
+        """Atomically complete a sale: decrement stock, persist the invoice,
+        and write the stock-movement audit trail — all in one transaction.
+
+        If **any** cart item is unavailable (missing product or insufficient
+        stock) the whole sale is rejected and nothing is persisted. This is
+        the single source of truth for checkout; the POS layer should not
+        touch stock or invoice tables directly.
+
+        Returns ``(ok, succeeded, failed, totals)`` where:
+          * ``ok``         — True if the sale committed.
+          * ``succeeded``  — list of ``(Product, qty)`` actually sold, with
+                             each Product reflecting the *pre-sale* snapshot.
+          * ``failed``     — list of ``(name, reason)`` for rejected items
+                             (empty when ``ok`` is True).
+          * ``totals``     — ``{"subtotal", "vat", "grand"}``.
+        """
+        succeeded: List[Tuple[Product, int]] = []
+        failed: List[Tuple[str, str]] = []
+        totals = {"subtotal": 0.0, "vat": 0.0, "grand": 0.0}
+        if not cart_items:
+            return False, succeeded, failed, totals
+
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE TRANSACTION")
+            try:
+                # ── Validate every item against live stock ──
+                for p, qty in cart_items:
+                    row = cursor.execute(
+                        "SELECT Barcode, Name, Stock, ExpiryDate, Price, "
+                        "supplier_id, supplier_code, barcode_type, "
+                        "vat_category, eof_code "
+                        "FROM ProductMaster WHERE Barcode = ?",
+                        (p.barcode,),
+                    ).fetchone()
+                    if row is None:
+                        failed.append((p.name, "Δεν βρέθηκε το προϊόν"))
+                        continue
+                    if row["Stock"] < qty:
+                        failed.append((p.name, "Ανεπαρκές απόθεμα"))
+                        continue
+                    # Snapshot the pre-sale product (fresh from DB).
+                    db_p = Product(
+                        barcode=row["Barcode"], name=row["Name"],
+                        stock=row["Stock"], expiry_date=row["ExpiryDate"],
+                        price=row["Price"], supplier_id=row["supplier_id"],
+                        supplier_code=row["supplier_code"],
+                        barcode_type=row["barcode_type"] or "EAN13",
+                        vat_category=row["vat_category"] or 6,
+                        eof_code=row["eof_code"],
+                    )
+                    succeeded.append((db_p, qty))
+
+                if failed:
+                    conn.rollback()
+                    succeeded.clear()
+                    return False, [], failed, totals
+
+                # ── All items available: decrement stock + audit in one txn ──
+                for p, qty in succeeded:
+                    new_stock = p.stock - qty
+                    cursor.execute(
+                        "UPDATE ProductMaster SET Stock = ? WHERE Barcode = ?",
+                        (new_stock, p.barcode),
+                    )
+                    self._log_stock_movement_on_conn(
+                        cursor, p.barcode, p.name, p.stock, new_stock,
+                        reason="Πώληση", source="POS",
+                    )
+
+                # ── Persist invoice master + line items ──
+                subtotal = round(sum(p.price * q for p, q in succeeded), 2)
+                vat = round(subtotal * vat_rate, 2)
+                grand = round(subtotal + vat, 2)
+                cursor.execute(
+                    "INSERT INTO invoices (id, invoice_date, subtotal, "
+                    "vat_amount, grand_total, customer_id) "
+                    "VALUES (?, datetime('now'), ?, ?, ?, ?)",
+                    (invoice_id, subtotal, vat, grand, customer_id),
+                )
+                cursor.executemany(
+                    "INSERT INTO invoice_items "
+                    "(invoice_id, barcode, name, quantity, price) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(invoice_id, p.barcode, p.name, qty, p.price)
+                     for p, qty in succeeded],
+                )
+
+                conn.commit()
+                totals = {"subtotal": subtotal, "vat": vat, "grand": grand}
+                logging.info(
+                    "Checkout %s committed: %d items, €%.2f.",
+                    invoice_id, len(succeeded), grand,
+                )
+                return True, succeeded, failed, totals
+            except Exception:
+                conn.rollback()
+                logging.exception(
+                    "Checkout %s failed — transaction rolled back.", invoice_id)
+                succeeded.clear()
+                return False, [], failed, totals
+        except sqlite3.Error as e:
+            logging.error("DB error during checkout %s: %s", invoice_id, e)
+            return False, [], failed, totals
+        finally:
+            if conn:
+                conn.close()
+
     # =================================================================
     # CUSTOMER REGISTRY
     # =================================================================
@@ -924,12 +1151,13 @@ class DatabaseService:
         conn = None
         try:
             conn = self._get_connection()
-            rows = conn.execute("SELECT id, name, tax_id, contact_person, phone, email, "
+            rows = conn.execute("SELECT id, name, tax_id, contact_person, phone, email, address, "
                                 "allowed_sender_emails, catalogue_format, default_markup, "
                                 "pricing_notes, created_at FROM suppliers ORDER BY name").fetchall()
             return [{"id": r["id"], "name": r["name"], "tax_id": r["tax_id"] or "",
                      "contact_person": r["contact_person"] or "",
                      "phone": r["phone"] or "", "email": r["email"] or "",
+                     "address": r["address"] or "",
                      "allowed_sender_emails": r["allowed_sender_emails"] or "[]",
                      "catalogue_format": r["catalogue_format"] or "XLSX",
                      "default_markup": r["default_markup"] or 0.25,
@@ -952,10 +1180,10 @@ class DatabaseService:
         conn = None
         try:
             conn = self._get_connection()
-            conn.execute("INSERT INTO suppliers (name, phone, email, tax_id, contact_person, "
+            conn.execute("INSERT INTO suppliers (name, phone, email, address, tax_id, contact_person, "
                          "allowed_sender_emails, catalogue_format, default_markup, pricing_notes) "
-                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                         (name, phone, email, tax_id, contact_person,
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (name, phone, email, address, tax_id, contact_person,
                           allowed_sender_emails, catalogue_format, default_markup, pricing_notes))
             conn.commit()
             return True
@@ -1209,7 +1437,6 @@ class DatabaseService:
         supplier_code, barcode_type, vat_category, eof_code
         (PascalCase to match ProductMaster schema column names)."""
         conn = None
-        conn = None
         try:
             conn = self._get_connection()
             conn.execute(
@@ -1350,30 +1577,6 @@ class DatabaseService:
 
     # ── Stock Movement Audit Trail ───────────────────────────────────
 
-    def log_stock_movement(self, barcode: str, product_name: str,
-                           old_stock: int, new_stock: int, reason: str,
-                           reference_id: str = None) -> bool:
-        """Insert a stock movement audit record. Returns True on success."""
-        conn = None
-        try:
-            conn = self._get_connection()
-            diff = new_stock - old_stock
-            conn.execute(
-                "INSERT INTO stock_movements "
-                "(timestamp, barcode, product_name, old_stock, new_stock, "
-                " difference, reason, reference_id) "
-                "VALUES (datetime('now','localtime'), ?, ?, ?, ?, ?, ?, ?)",
-                (barcode, product_name, old_stock, new_stock, diff,
-                 reason, reference_id))
-            conn.commit()
-            return True
-        except sqlite3.Error as e:
-            logging.error("log_stock_movement failed: %s", e)
-            return False
-        finally:
-            if conn:
-                conn.close()
-
     def get_recent_movements(self, limit: int = 50) -> List[Dict]:
         """Get the most recent stock movements."""
         return self.get_stock_movements(limit=limit)
@@ -1457,6 +1660,43 @@ class DatabaseService:
 
     # ── Stock Movement Audit Trail ───────────────────────────────────
 
+    @staticmethod
+    def _log_stock_movement_on_conn(cursor, barcode: str, product_name: str,
+                                    old_stock: int, new_stock: int, reason: str,
+                                    source: str = "", operator: str = "Σύστημα") -> None:
+        """Insert a stock-movement row using an existing cursor/connection.
+
+        This runs on the caller's transaction — it neither commits nor
+        opens its own connection — so it can be used atomically inside
+        larger operations such as checkout. No return value: callers
+        that care about resilience should wrap this in try/except.
+        """
+        from datetime import datetime
+
+        change_amount = new_stock - old_stock
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            cursor.execute(
+                """INSERT INTO stock_movements
+                   (timestamp, barcode, product_name, old_stock, new_stock,
+                    change_amount, reason, source, operator)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (timestamp, barcode, product_name,
+                 old_stock, new_stock, change_amount,
+                 reason, source, operator),
+            )
+        except sqlite3.Error:
+            # Fallback: old schema (difference, reference_id)
+            cursor.execute(
+                """INSERT INTO stock_movements
+                   (timestamp, barcode, product_name, old_stock, new_stock,
+                    difference, reason, reference_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (timestamp, barcode, product_name,
+                 old_stock, new_stock, change_amount,
+                 reason, source),
+            )
+
     def log_stock_movement(self, barcode: str, product_name: str,
                            old_stock: int, new_stock: int, reason: str,
                            source: str = "", operator: str = "Σύστημα") -> bool:
@@ -1466,36 +1706,13 @@ class DatabaseService:
         must never crash the calling operation — callers should wrap
         in try/except.
         """
-        from datetime import datetime
-
         conn = None
         try:
-            change_amount = new_stock - old_stock
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             conn = self._get_connection()
-
-            # Try new schema first (change_amount, source, operator)
-            try:
-                conn.execute(
-                    """INSERT INTO stock_movements
-                       (timestamp, barcode, product_name, old_stock, new_stock,
-                        change_amount, reason, source, operator)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (timestamp, barcode, product_name,
-                     old_stock, new_stock, change_amount,
-                     reason, source, operator),
-                )
-            except sqlite3.Error:
-                # Fallback: old schema (difference, reference_id)
-                conn.execute(
-                    """INSERT INTO stock_movements
-                       (timestamp, barcode, product_name, old_stock, new_stock,
-                        difference, reason, reference_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (timestamp, barcode, product_name,
-                     old_stock, new_stock, change_amount,
-                     reason, source),
-                )
+            self._log_stock_movement_on_conn(
+                conn.cursor(), barcode, product_name,
+                old_stock, new_stock, reason, source, operator,
+            )
             conn.commit()
             return True
         except sqlite3.Error as e:

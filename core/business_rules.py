@@ -1,4 +1,5 @@
 from datetime import datetime, date
+import logging
 from typing import List, Tuple
 from .domain_models import Product
 
@@ -7,13 +8,21 @@ def is_low_stock(product: Product, threshold: int = 10) -> bool:
     return product.stock <= threshold
 
 def parse_date(date_str: str) -> date:
-    """Helper to parse YYYY-MM-DD date strings safely."""
+    """Helper to parse YYYY-MM-DD date strings safely.
+
+    Returns ``date.max`` on malformed/empty input (backward compatible) so
+    callers never crash, but **logs a warning** so silent data-quality
+    problems — critical in a pharmacy — are visible instead of masked.
+    """
     try:
         # Strip timestamp part if present
         date_only = date_str.strip().split(" ")[0]
         return datetime.strptime(date_only, "%Y-%m-%d").date()
     except Exception:
-        # Fallback to a far future date to avoid spurious alerts on malformed input
+        logging.warning(
+            "Unparseable expiry date %r — treating as far-future. "
+            "Fix this record to restore correct expiry alerts.", date_str,
+        )
         return date.max
 
 def get_days_until_expiry(product: Product, current_date: date = None) -> int:
@@ -60,3 +69,46 @@ def get_vat_rate(vat_category: int) -> float:
             f"Valid values: {VALID_PHARMACY_VAT_CATEGORIES}"
         )
     return rates[vat_category]
+
+
+# ── Barcode Validation ────────────────────────────────────────────────
+
+
+def is_valid_ean13(barcode: str) -> bool:
+    """Ελέγχει αν ένας γραμμωτός κώδικας είναι έγκυρο EAN-13.
+    Επιστρέφει False (δεν εκτοξεύει εξαίρεση) για λάθος μήκος,
+    μη-ψηφιακούς χαρακτήρες ή αποτυχία checksum.
+    """
+    if barcode is None:
+        return False
+    if not isinstance(barcode, str):
+        return False
+    barcode = barcode.strip()
+    if len(barcode) != 13:
+        return False
+    if not barcode.isdigit():
+        return False
+
+    # EAN-13 checksum: odd positions (1-indexed: 1,3,5,7,9,11) × 1,
+    #                  even positions (2,4,6,8,10,12) × 3
+    odd_sum = sum(int(barcode[i]) for i in range(0, 12, 2))   # indices 0,2,4,6,8,10
+    even_sum = sum(int(barcode[i]) for i in range(1, 12, 2))  # indices 1,3,5,7,9,11
+    total = odd_sum + even_sum * 3
+    check_digit = (10 - (total % 10)) % 10
+    return check_digit == int(barcode[12])
+
+
+def validate_product_barcode(product: Product) -> bool:
+    """Επικυρώνει τον γραμμωτό κώδικα ενός προϊόντος με βάση τον τύπο του."""
+    if product.barcode is None or product.barcode.strip() == "":
+        return False
+
+    barcode_type = product.barcode_type or ""
+
+    if barcode_type == "EAN13":
+        return is_valid_ean13(product.barcode)
+    elif barcode_type in ("GS1", "CUSTOM", "OTHER"):
+        return True
+    else:
+        # Άγνωστος τύπος — safe default, δεν απορρίπτουμε
+        return True

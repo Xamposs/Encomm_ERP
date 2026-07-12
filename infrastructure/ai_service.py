@@ -84,6 +84,26 @@ class AIService:
 
         self._load_config()  # refresh in case settings changed
 
+        # Safety gate: never send the Bearer API key over a non-HTTPS URL.
+        # A mistyped or maliciously-set ai_api_url could otherwise leak the
+        # key + user command to an arbitrary server.
+        from urllib.parse import urlparse
+        parsed = urlparse(self.api_url)
+        if parsed.scheme != "https":
+            logger.warning(
+                "Refusing AI request to non-HTTPS URL (%s) — would leak API key.",
+                self.api_url,
+            )
+            return {
+                "intent": "unknown",
+                "parameters": {
+                    "reason": (
+                        "Η διεύθυνση του AI API πρέπει να χρησιμοποιεί HTTPS. "
+                        "Δεν έγινε αποστολή για λόγους ασφαλείας του κλειδιού."
+                    )
+                }
+            }
+
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",

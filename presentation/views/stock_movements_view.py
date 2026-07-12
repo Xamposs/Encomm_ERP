@@ -149,49 +149,22 @@ class StockMovementsView(BaseView):
         barcode = self.sm_barcode_entry.get().strip() or None
         reason = self.sm_reason_var.get().strip() or None
 
-        def _write():
-            try:
-                rows = self.db_service.get_stock_movements(
-                    barcode=barcode, reason=reason, limit=5000)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                if is_csv:
-                    dest = os.path.join(
-                        os.path.expanduser("~"), "Desktop", f"StockMovements_{ts}.csv")
-                    lines = ["Ημερομηνία,Barcode,Προϊόν,Παλιό Στοκ,Νέο Στοκ,Διαφορά,Αιτία,Πηγή"]
-                    for r in rows:
-                        lines.append(
-                            f'{BaseView._csv_cell(r.get("timestamp",""))},'
-                            f'{BaseView._csv_cell(r.get("barcode",""))},'
-                            f'{BaseView._csv_cell(r.get("product_name",""))},'
-                            f'{r.get("old_stock",0)},{r.get("new_stock",0)},'
-                            f'{r.get("change_amount",0)},'
-                            f'{BaseView._csv_cell(r.get("reason",""))},'
-                            f'{BaseView._csv_cell(r.get("source",""))}')
-                    with open(dest, "w", encoding="utf-8-sig") as f:
-                        f.write("\n".join(lines))
-                else:
-                    dest = os.path.join(
-                        os.path.expanduser("~"), "Desktop", f"StockMovements_{ts}.txt")
-                    lines = [
-                        "=" * 70, "  ENCOMM — ΚΙΝΗΣΕΙΣ ΑΠΟΘΕΜΑΤΟΣ", "=" * 70,
-                        f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-                        f"Κινήσεις: {len(rows)}", "=" * 70]
-                    for r in rows:
-                        diff = r.get("change_amount", 0)
-                        sym = "+" if diff >= 0 else ""
-                        lines.append(
-                            f"{r.get('timestamp',''):<20} {r.get('barcode',''):<12} "
-                            f"{r.get('product_name','')[:25]:<25} "
-                            f"{r.get('old_stock',0):>5} → {r.get('new_stock',0):<5} "
-                            f"({sym}{diff}) | {r.get('reason','')}")
-                    lines.append("=" * 70)
-                    with open(dest, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines))
-                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
-                    "Το αρχείο αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
-        threading.Thread(target=_write, daemon=True).start()
+        rows = self.db_service.get_stock_movements(
+            barcode=barcode, reason=reason, limit=5000)
+        data = [
+            [r.get("timestamp", ""), r.get("barcode", ""), r.get("product_name", ""),
+             r.get("old_stock", 0), r.get("new_stock", 0), r.get("change_amount", 0),
+             r.get("reason", ""), r.get("source", "")]
+            for r in rows
+        ]
+        self._run_export(
+            "StockMovements",
+            ["Ημερομηνία", "Barcode", "Προϊόν", "Παλιό Στοκ", "Νέο Στοκ",
+             "Διαφορά", "Αιτία", "Πηγή"],
+            data, is_csv,
+            txt_title="ΚΙΝΗΣΕΙΣ ΑΠΟΘΕΜΑΤΟΣ",
+            txt_row_fmt="{0:<20} {1:<12} {2:<25} {3:>5} → {4:<5} ({5}) | {6}",
+        )
 
     # ------------------------------------------------------------------
     # Refresh

@@ -5,6 +5,7 @@ Oldest entry is evicted when the stack exceeds MAX_STACK.
 Pushing a new action automatically clears any redo history.
 """
 
+import logging
 from typing import Callable, List, Tuple, Optional
 
 ActionEntry = Tuple[str, Callable, Callable]  # (description_greek, undo_fn, redo_fn)
@@ -53,11 +54,22 @@ class ActionHistory:
 
         Moves the undone entry onto the redo stack so it can be redone later.
         Returns the action description, or None if the undo stack is empty.
+
+        If ``undo_fn`` raises, the entry is **re-pushed** onto the undo stack
+        (not the redo stack) so the stack state stays consistent and the error
+        propagates to the caller to report.
         """
         if not self._undo_stack:
             return None
         desc, undo_fn, redo_fn = self._undo_stack.pop()
-        undo_fn()
+        try:
+            undo_fn()
+        except Exception:
+            # Undo failed partway — restore the entry and re-raise so the
+            # caller can report it. Do NOT move it to the redo stack.
+            self._undo_stack.append((desc, undo_fn, redo_fn))
+            logging.exception("Undo action '%s' failed — entry left on undo stack.", desc)
+            raise
         self._redo_stack.append((desc, undo_fn, redo_fn))
         if len(self._redo_stack) > self.MAX_STACK:
             self._redo_stack.pop(0)
@@ -68,11 +80,19 @@ class ActionHistory:
 
         Moves the redone entry back onto the undo stack.
         Returns the action description, or None if the redo stack is empty.
+
+        If ``redo_fn`` raises, the entry is re-pushed onto the redo stack
+        and the error propagates to the caller.
         """
         if not self._redo_stack:
             return None
         desc, undo_fn, redo_fn = self._redo_stack.pop()
-        redo_fn()
+        try:
+            redo_fn()
+        except Exception:
+            self._redo_stack.append((desc, undo_fn, redo_fn))
+            logging.exception("Redo action '%s' failed — entry left on redo stack.", desc)
+            raise
         self._undo_stack.append((desc, undo_fn, redo_fn))
         if len(self._undo_stack) > self.MAX_STACK:
             self._undo_stack.pop(0)

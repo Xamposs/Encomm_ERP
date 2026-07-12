@@ -1,5 +1,9 @@
 import customtkinter as ctk
+import os
+import threading
 from abc import ABC, abstractmethod
+from datetime import datetime
+from tkinter import messagebox
 
 
 class BaseView(ctk.CTkFrame, ABC):
@@ -87,3 +91,63 @@ class BaseView(ctk.CTkFrame, ABC):
     @staticmethod
     def _card_title_text() -> tuple:
         return ("gray45", "gray60")
+
+    # ------------------------------------------------------------------
+    # Shared export helpers (CSV/TXT → Desktop, background-threaded)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _export_path(prefix: str, ext: str) -> str:
+        """Build a timestamped export destination on the user's Desktop."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(
+            os.path.expanduser("~"), "Desktop", f"{prefix}_{ts}.{ext}")
+
+    def _run_export(self, prefix: str, headers: list, rows: list,
+                    is_csv: bool, txt_title: str = "",
+                    txt_row_fmt: str = "{0}", success_msg: str = "") -> None:
+        """Shared export pipeline used by every view's export action.
+
+        Parameters
+        ----------
+        prefix     : filename prefix (e.g. ``"Inventory_Export"``).
+        headers    : list of CSV column headers.
+        rows       : list of row-lists; each inner list must align with
+                     ``headers`` in both length and order.
+        is_csv     : True → CSV (utf-8-sig); False → TXT (utf-8).
+        txt_title  : banner title printed in the TXT header block.
+        txt_row_fmt: ``str.format`` template applied to each row for TXT
+                     output (defaults to space-joined values).
+        success_msg: optional custom success message; a sensible default
+                     is used when empty.
+        """
+        def _write():
+            try:
+                if is_csv:
+                    dest = self._export_path(prefix, "csv")
+                    lines = [",".join(str(h) for h in headers)]
+                    for r in rows:
+                        lines.append(
+                            ",".join(self._csv_cell(v) for v in r))
+                    encoding = "utf-8-sig"
+                else:
+                    dest = self._export_path(prefix, "txt")
+                    bar = "=" * 60
+                    lines = [bar, f"  ENCOMM — {txt_title}", bar,
+                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+                             f"Εγγραφές: {len(rows)}", "-" * 60]
+                    for r in rows:
+                        lines.append(txt_row_fmt.format(*r))
+                    lines.append(bar)
+                    encoding = "utf-8"
+                with open(dest, "w", encoding=encoding) as f:
+                    f.write("\n".join(lines))
+                msg = success_msg or (
+                    "Το αρχείο αποθηκεύτηκε στην Επιφάνεια Εργασίας!")
+                self.after(0, lambda: messagebox.showinfo(
+                    "Επιτυχής Εξαγωγή", msg))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror(
+                    "Σφάλμα Εξαγωγής", str(e)))
+
+        threading.Thread(target=_write, daemon=True).start()

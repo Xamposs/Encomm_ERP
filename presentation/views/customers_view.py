@@ -184,39 +184,21 @@ class CustomersView(BaseView):
         fmt = self.cust_export_format.get()
         is_csv = "csv" in fmt.lower()
 
-        def _write():
-            try:
-                rows = self.db_service.get_all_customers()
-                if filter_text:
-                    rows = [r for r in rows if
-                            filter_text in r["name"].lower() or
-                            filter_text in r.get("amka", "").lower() or
-                            filter_text in r.get("phone", "").lower()]
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                if is_csv:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Customers_Export_{ts}.csv")
-                    lines = ["ID,Όνομα,ΑΜΚΑ,Τηλέφωνο"]
-                    for r in rows:
-                        lines.append(
-                            f'{BaseView._csv_cell(r["id"])},{BaseView._csv_cell(r["name"])},'
-                            f'{BaseView._csv_cell(r.get("amka",""))},{BaseView._csv_cell(r.get("phone",""))}')
-                    with open(dest, "w", encoding="utf-8-sig") as f:
-                        f.write("\n".join(lines))
-                else:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Customers_Export_{ts}.txt")
-                    lines = ["=" * 50, "  ENCOMM — ΜΗΤΡΩΟ ΠΕΛΑΤΩΝ", "=" * 50,
-                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}"]
-                    for r in rows:
-                        lines.append(
-                            f"• {r['name']:<30} | ΑΜΚΑ: {r.get('amka','—'):<15} | Τηλ: {r.get('phone','—')}")
-                    lines.append("=" * 50)
-                    with open(dest, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines))
-                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
-                    "Το αρχείο αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
-        threading.Thread(target=_write, daemon=True).start()
+        rows = self.db_service.get_all_customers()
+        if filter_text:
+            rows = [r for r in rows if
+                    filter_text in r["name"].lower() or
+                    filter_text in r.get("amka", "").lower() or
+                    filter_text in r.get("phone", "").lower()]
+        data = [[r["id"], r["name"], r.get("amka", ""), r.get("phone", "")]
+                for r in rows]
+        self._run_export(
+            "Customers_Export",
+            ["ID", "Όνομα", "ΑΜΚΑ", "Τηλέφωνο"],
+            data, is_csv,
+            txt_title="ΜΗΤΡΩΟ ΠΕΛΑΤΩΝ",
+            txt_row_fmt="• {1:<30} | ΑΜΚΑ: {2:<15} | Τηλ: {3}",
+        )
 
     # ------------------------------------------------------------------
     # Refresh

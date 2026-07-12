@@ -5,3 +5,14 @@ venv/
 *.db
 *.log
 *.csv
+
+# Tooling artifacts (not part of the app)
+.hermes/
+.obsidian/
+graphify-out/
+
+# Test cache
+.pytest_cache/
+
+# Tooling plans
+.zcode/

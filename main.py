@@ -59,6 +59,7 @@ def main():
                 "vat_rate": str(config["vat_rate"]),
                 "low_stock_threshold": str(config["low_stock_threshold"]),
                 "expiry_alert_days": str(config["expiry_alert_days"]),
+                "theme": "Dark",
             })
             db_config = db_service.get_all_config()
 
@@ -76,9 +77,12 @@ def main():
         config["low_stock_threshold"] = _cfg_db_or_env("low_stock_threshold", int)
         config["expiry_alert_days"] = _cfg_db_or_env("expiry_alert_days", int)
 
+        # Load persisted theme before window creation so it's correct from frame 1
+        config["theme"] = db_config.get("theme", "Dark")
         logging.info(f"Final config — VAT: {config['vat_rate']*100}%, "
                      f"LowStock: {config['low_stock_threshold']}, "
-                     f"ExpiryAlert: {config['expiry_alert_days']}d")
+                     f"ExpiryAlert: {config['expiry_alert_days']}d, "
+                     f"Theme: {config['theme']}")
 
         # 3. Instantiate MainWindow — renders empty window immediately via internal update_idletasks()
         app = MainWindow(db_service=db_service, config=config)

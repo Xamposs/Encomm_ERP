@@ -308,53 +308,21 @@ class POSView(BaseView):
             messagebox.showwarning("Προειδοποίηση", "Το καλάθι είναι άδειο.")
             return
 
-        succeeded: List[Tuple[Product, int]] = []
-        failed_items: List[Tuple[str, str]] = []
-
-        conn = None
-        try:
-            conn = self.db_service._get_connection()
-            conn.execute("BEGIN TRANSACTION")
-
-            for p, qty in self.invoice_cart:
-                db_p = self.db_service.get_product(p.barcode)
-                if not db_p or db_p.stock < qty:
-                    failed_items.append((p.name, "Ανεπαρκές απόθεμα"))
-                    continue
-                conn.execute("UPDATE ProductMaster SET Stock = ? WHERE Barcode = ?",
-                    (db_p.stock - qty, p.barcode))
-                succeeded.append((p, qty))
-
-            if not failed_items:
-                conn.commit()
-            else:
-                conn.rollback()
-                succeeded.clear()
-        except Exception:
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            succeeded.clear()
-        finally:
-            if conn:
-                conn.close()
-
-        if failed_items:
-            msg = "Η πώληση ακυρώθηκε. Προβλήματα:\n\n" + "\n".join(f"• {name}: {reason}" for name, reason in failed_items)
-            messagebox.showerror("Σφάλμα Πώλησης", msg)
-            return
-
-        # Full success: save invoice
-        subtotal = sum(p.price * q for p, q in succeeded)
         vat_rate = float(self.config.get("vat_rate", 0.15))
-        vat = round(subtotal * vat_rate, 2)
-        grand = round(subtotal + vat, 2)
         inv_id = f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
-        self.db_service.save_invoice_transaction(inv_id, subtotal, vat, grand,
-            succeeded, customer_id=self._selected_customer_id)
+        # Single atomic transaction: stock decrement + invoice save + audit
+        # trail all commit (or roll back) together. The DB layer owns this.
+        ok, succeeded, failed_items, totals = self.db_service.process_checkout_transaction(
+            inv_id, self.invoice_cart, self._selected_customer_id, vat_rate,
+        )
+
+        if failed_items or not ok:
+            msg = "Η πώληση ακυρώθηκε. Προβλήματα:\n\n" + "\n".join(
+                f"• {name}: {reason}" for name, reason in failed_items
+            ) if failed_items else "Η πώληση ακυρώθηκε λόγω σφάλματος βάσης."
+            messagebox.showerror("Σφάλμα Πώλησης", msg)
+            return
 
         for row in self.cart_rows_tracked:
             try:
@@ -365,6 +333,7 @@ class POSView(BaseView):
         self.invoice_cart = []
         self.refresh_cart_list()
 
+        grand = totals["grand"]
         msg = f"✅ Πώληση ολοκληρώθηκε!\n\nΑρ. Παραστατικού: {inv_id}\nΣύνολο: €{grand:.2f}"
         messagebox.showinfo("Επιτυχής Πώληση", msg)
 
@@ -453,51 +422,33 @@ class POSView(BaseView):
         fmt = self.pos_export_format.get()
         is_csv = "csv" in fmt.lower()
 
-        def _write():
-            try:
-                items = [(p, q) for p, q in self.invoice_cart]
-                if filter_text:
-                    items = [(p, q) for p, q in items if filter_text in p.name.lower() or filter_text in p.barcode.lower()]
-                try:
-                    limit = int(limit_str)
-                    items = items[:limit]
-                except ValueError:
-                    pass
-                subtotal = sum(p.price * q for p, q in items)
-                total_qty = sum(q for _, q in items)
-                vat_rate = float(self.config.get("vat_rate", 0.15))
-                vat = subtotal * vat_rate
-                grand = subtotal + vat
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                if is_csv:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"POS_Cart_Export_{ts}.csv")
-                    lines = ["Barcode,Όνομα,Ποσότητα,Τιμή Μον.,Σύνολο"]
-                    for p, q in items:
-                        lines.append(f'{BaseView._csv_cell(p.barcode)},{BaseView._csv_cell(p.name)},{q},{p.price:.2f},{p.price*q:.2f}')
-                    lines += ["", f"Υποσύνολο,,{total_qty},,{subtotal:.2f}",
-                              f"ΦΠΑ {vat_rate*100:.1f}%,,,,{vat:.2f}", f"ΓΕΝΙΚΟ ΣΥΝΟΛΟ,,,,{grand:.2f}"]
-                    with open(dest, "w", encoding="utf-8-sig") as f:
-                        f.write("\n".join(lines))
-                else:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"POS_Προσφορά_{ts}.txt")
-                    lines = ["=" * 55, "  ENCOMM — ΠΡΟΣΦΟΡΑ / PROFORMA", "=" * 55,
-                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-                             f"Είδη: {len(items)}  |  Τεμάχια: {total_qty}", "-" * 55]
-                    lines.append(f"{'Barcode':<14} {'Όνομα':<22} {'Ποσ.':<6} {'Τιμή':<8} {'Σύνολο':<10}")
-                    lines.append("-" * 55)
-                    for p, q in items:
-                        lines.append(f"{p.barcode:<14} {p.name[:22]:<22} {q:<6} €{p.price:<7.2f} €{p.price*q:<9.2f}")
-                    lines.append("-" * 55)
-                    lines.extend([f"{'Υποσύνολο:':<42} €{subtotal:.2f}",
-                                  f"ΦΠΑ ({vat_rate*100:.1f}%):".ljust(42) + f" €{vat:.2f}",
-                                  f"{'ΓΕΝΙΚΟ ΣΥΝΟΛΟ:':<42} €{grand:.2f}", "=" * 55])
-                    with open(dest, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines))
-                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
-                    f"Το αρχείο αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
-        threading.Thread(target=_write, daemon=True).start()
+        items = [(p, q) for p, q in self.invoice_cart]
+        if filter_text:
+            items = [(p, q) for p, q in items if filter_text in p.name.lower() or filter_text in p.barcode.lower()]
+        try:
+            limit = int(limit_str)
+            items = items[:limit]
+        except ValueError:
+            pass
+        subtotal = sum(p.price * q for p, q in items)
+        total_qty = sum(q for _, q in items)
+        vat_rate = float(self.config.get("vat_rate", 0.15))
+        vat = subtotal * vat_rate
+        grand = subtotal + vat
+
+        data = [[p.barcode, p.name, q, f"{p.price:.2f}", f"{p.price*q:.2f}"]
+                for p, q in items]
+        # Append a summary block as trailing rows.
+        data += [["", f"Υποσύνολο ({total_qty} τεμ.)", "", "", f"{subtotal:.2f}"],
+                 ["", f"ΦΠΑ {vat_rate*100:.1f}%", "", "", f"{vat:.2f}"],
+                 ["", "ΓΕΝΙΚΟ ΣΥΝΟΛΟ", "", "", f"{grand:.2f}"]]
+        self._run_export(
+            "POS_Cart_Export",
+            ["Barcode", "Όνομα", "Ποσότητα", "Τιμή Μον.", "Σύνολο"],
+            data, is_csv,
+            txt_title="ΠΡΟΣΦΟΡΑ / PROFORMA",
+            txt_row_fmt="{0:<14} {1:<22} {2:<6} €{3:<7} €{4:<9}",
+        )
 
     def export_pos_sales(self):
         start_date = self.pos_sales_export_start.get().strip() if hasattr(self, 'pos_sales_export_start') else ""

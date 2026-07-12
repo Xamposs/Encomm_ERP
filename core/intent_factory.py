@@ -61,8 +61,14 @@ class IntentFactory:
             logger.warning("IntentFactory received None — returning unknown.")
             return self._unknown("Κενή απάντηση από το AI.")
 
-        # --- Extract intent ---
-        intent = raw_response.get("intent", "").strip().lower()
+        # --- Extract intent (coerce to str so a null/list value can't crash) ---
+        raw_intent = raw_response.get("intent", "")
+        if not isinstance(raw_intent, str):
+            logger.warning(
+                f"Safety Gate: intent is not a string ({type(raw_intent).__name__}). "
+                "Falling back to 'unknown'.")
+            return self._unknown("Μη έγκυρη μορφή απάντησης από το AI.")
+        intent = raw_intent.strip().lower()
 
         # --- Safety Gate: reject unknown intents ---
         if intent not in VALID_INTENTS:

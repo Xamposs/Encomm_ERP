@@ -9,6 +9,7 @@ from tkinter import ttk
 from typing import List, Tuple
 from .base_view import BaseView
 from core.domain_models import Product
+from core.business_rules import is_valid_ean13, is_low_stock, is_expired, is_near_expiry
 
 
 class InventoryView(BaseView):
@@ -317,45 +318,28 @@ class InventoryView(BaseView):
         fmt = self.inv_export_format.get()
         is_csv = "csv" in fmt.lower()
 
-        def _write():
-            try:
-                products = self.db_service.get_all_products()
-                if filter_text:
-                    products = [p for p in products if filter_text in p.name.lower() or filter_text in p.barcode.lower()]
-                if start_date:
-                    products = [p for p in products if p.expiry_date >= start_date]
-                if end_date:
-                    products = [p for p in products if p.expiry_date <= end_date]
-                try:
-                    limit = int(limit_str)
-                    products = products[:limit]
-                except ValueError:
-                    pass
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                if is_csv:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Inventory_Export_{ts}.csv")
-                    lines = ["Barcode,Όνομα,Στοκ,Ημ.Λήξης,Τιμή"]
-                    for p in products:
-                        lines.append(f'{BaseView._csv_cell(p.barcode)},{BaseView._csv_cell(p.name)},{p.stock},{BaseView._csv_cell(p.expiry_date)},{p.price:.2f}')
-                    with open(dest, "w", encoding="utf-8-sig") as f:
-                        f.write("\n".join(lines))
-                else:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Inventory_Export_{ts}.txt")
-                    lines = ["=" * 60, "  ENCOMM INVENTORY — ΕΞΑΓΩΓΗ ΑΠΟΘΗΚΗΣ", "=" * 60,
-                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}  |  Προϊόντα: {len(products)}",
-                             f"Εύρος ημ/νιών λήξης: {start_date or '—'} έως {end_date or '—'}", "-" * 60]
-                    lines.append(f"{'Barcode':<15} {'Όνομα':<30} {'Στοκ':<8} {'Λήξη':<12} {'Τιμή':<10}")
-                    lines.append("-" * 60)
-                    for p in products:
-                        lines.append(f"{p.barcode:<15} {p.name[:30]:<30} {p.stock:<8} {p.expiry_date:<12} €{p.price:.2f}")
-                    lines.append("=" * 60)
-                    with open(dest, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines))
-                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
-                    "Το φιλτραρισμένο αρχείο βάσει ημερομηνιών αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
-        threading.Thread(target=_write, daemon=True).start()
+        products = self.db_service.get_all_products()
+        if filter_text:
+            products = [p for p in products if filter_text in p.name.lower() or filter_text in p.barcode.lower()]
+        if start_date:
+            products = [p for p in products if p.expiry_date >= start_date]
+        if end_date:
+            products = [p for p in products if p.expiry_date <= end_date]
+        try:
+            limit = int(limit_str)
+            products = products[:limit]
+        except ValueError:
+            pass
+
+        data = [[p.barcode, p.name, p.stock, p.expiry_date, f"{p.price:.2f}"]
+                for p in products]
+        self._run_export(
+            "Inventory_Export",
+            ["Barcode", "Όνομα", "Στοκ", "Ημ.Λήξης", "Τιμή"],
+            data, is_csv,
+            txt_title="INVENTORY — ΕΞΑΓΩΓΗ ΑΠΟΘΗΚΗΣ",
+            txt_row_fmt="{0:<15} {1:<30} {2:<8} {3:<12} €{4}",
+        )
 
     # ==================================================================
     # Refresh
@@ -387,15 +371,14 @@ class InventoryView(BaseView):
         self.inv_tree.delete(*self.inv_tree.get_children())
         threshold = int(self.config.get("low_stock_threshold", 10))
         alert_days = int(self.config.get("expiry_alert_days", 30))
-        today = datetime.now().strftime("%Y-%m-%d")
         for p in page_products:
             tag = ()
-            if p.stock <= threshold:
+            if is_low_stock(p, threshold):
                 tag = ("low_stock",)
-            if p.expiry_date < today:
+            if is_expired(p):
                 tag = ("expired",)
-            elif p.expiry_date <= datetime.now().strftime("%Y-%m-%d") if False else p.expiry_date:
-                pass
+            elif is_near_expiry(p, threshold_days=alert_days):
+                tag = ("near_expiry",)
             self.inv_tree.insert("", "end", values=(p.barcode, p.name, p.stock, p.expiry_date, f"€{p.price:.2f}"), tags=tag)
         self.inv_page_info.configure(text=f"Σελίδα {self.inv_page + 1}/{total_pages}  |  Σύνολο: {total_count}")
 
@@ -486,6 +469,13 @@ class ProductFormDialog(ctk.CTkToplevel):
         if not barcode or not name:
             messagebox.showwarning("Προειδοποίηση", "Barcode και Όνομα είναι υποχρεωτικά.", parent=self)
             return
+        # Validate barcode checksum (soft warning — allows non-EAN13 or manual override)
+        if len(barcode) == 13 and barcode.isdigit() and not is_valid_ean13(barcode):
+            if not messagebox.askyesno("Προσοχή",
+                f"Ο γραμμωτός κώδικας '{barcode}' δεν περνά τον έλεγχο EAN-13.\n"
+                "Θέλετε να συνεχίσετε;",
+                parent=self):
+                return
         try:
             stock = int(self.stock_entry.get().strip())
             price = float(self.price_entry.get().strip().replace(",", "."))

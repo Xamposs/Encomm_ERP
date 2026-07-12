@@ -7,13 +7,15 @@ from .base_view import BaseView
 class AIView(BaseView):
     """AI Assistant chat view — placeholder for future AI integration."""
 
-    def __init__(self, parent, db_service, config: dict, **kwargs):
+    def __init__(self, parent, db_service, config: dict, on_send_message=None, **kwargs):
         kwargs.setdefault('fg_color', 'transparent')
         super().__init__(parent, db_service, config, **kwargs)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=0)
         self.grid_rowconfigure(1, weight=1)
         self.grid_rowconfigure(2, weight=0)
+
+        self._on_send_message = on_send_message
 
         self.ai_title_label = ctk.CTkLabel(
             self,
@@ -89,15 +91,21 @@ class AIView(BaseView):
         self._append_chat_message("Εσείς", text)
         self.ai_input_entry.delete(0, "end")
 
-        def bg_chat_process():
-            try:
-                time.sleep(0.4)
-                reply = "Λήψη εντολής επιτυχής. Το backend AI interface είναι έτοιμο για διασύνδεση!"
-                self.after(0, lambda: self._append_chat_message("Encomm AI", reply))
-            except Exception as e:
-                self.after(0, lambda: self._append_chat_message("Encomm AI", f"⚠️ Σφάλμα: {str(e)}"))
-
-        threading.Thread(target=bg_chat_process, daemon=True).start()
+        # If a backend callback is wired, use it; otherwise show a helpful message
+        if self._on_send_message:
+            def bg_chat_process():
+                try:
+                    reply = self._on_send_message(text)
+                    if reply is None:
+                        reply = "Δεν μπόρεσα να επεξεργαστώ την εντολή."
+                    self.after(0, lambda: self._append_chat_message("Encomm AI", reply))
+                except Exception as e:
+                    self.after(0, lambda: self._append_chat_message("Encomm AI", f"⚠️ Σφάλμα: {e}"))
+            threading.Thread(target=bg_chat_process, daemon=True).start()
+        else:
+            # Fallback when no AI backend is configured
+            self.after(100, lambda: self._append_chat_message("Encomm AI",
+                "⚠️ Το AI backend δεν έχει ρυθμιστεί. Πηγαίνετε στις Ρυθμίσεις και εισάγετε ένα API Key."))
 
     def refresh(self) -> None:
         pass

@@ -97,7 +97,8 @@ class SettingsView(BaseView):
         self._add_section_label("🎨 Εμφάνιση")
         self.set_theme_var = tk.StringVar(value="Dark")
         self.set_theme_menu = ctk.CTkOptionMenu(self.settings_card,
-            variable=self.set_theme_var, values=["Dark", "Light"], width=200)
+            variable=self.set_theme_var, values=["Dark", "Light"], width=200,
+            command=self._on_theme_changed)
         self.set_theme_menu.pack(padx=30, pady=(5, 20), anchor="w")
 
         # ── Section 6: About ──
@@ -116,8 +117,9 @@ class SettingsView(BaseView):
             command=self.save_settings_values)
         self.save_settings_btn.pack(pady=(15, 30))
 
-        # Callback to trigger global refresh after save (set by MainWindow)
+        # Callbacks to trigger global refresh after save (set by MainWindow)
         self._on_settings_saved = None
+        self._on_theme_applied = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -154,6 +156,15 @@ class SettingsView(BaseView):
 
         # HWID is set externally by MainWindow via _set_cached_hwid
 
+    def _on_theme_changed(self, choice: str):
+        """Live theme preview — applies instantly when dropdown changes."""
+        ctk.set_appearance_mode(choice)
+        self.db_service.set_config("theme", choice)
+        self.config["theme"] = choice
+        # Notify MainWindow to re-apply ttk styles (Treeviews etc.)
+        if self._on_theme_applied:
+            self._on_theme_applied(choice)
+
     def save_settings_values(self):
         """Validate and persist all settings to SystemConfig."""
         # VAT: 0.0-1.0, supports Greek comma
@@ -188,7 +199,8 @@ class SettingsView(BaseView):
         self.db_service.set_config("low_stock_threshold", str(stock))
         self.db_service.set_config("expiry_alert_days", str(expiry))
         self.db_service.set_config("auto_backup", "1" if self.set_autobackup_var.get() else "0")
-        self.db_service.set_config("theme", self.set_theme_var.get())
+        # Theme is already persisted live by _on_theme_changed; sync config dict
+        self.config["theme"] = self.set_theme_var.get()
         self.db_service.set_config("license_key", self.set_license_entry.get().strip())
 
         self.config["vat_rate"] = vat

@@ -220,41 +220,20 @@ class SuppliersView(BaseView):
         fmt = self.supp_export_format.get()
         is_csv = "csv" in fmt.lower()
 
-        def _write():
-            try:
-                rows = self.db_service.get_all_suppliers()
-                if filter_text:
-                    rows = [r for r in rows if
-                            filter_text in r["name"].lower() or
-                            filter_text in r.get("email", "").lower()]
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                if is_csv:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Suppliers_Export_{ts}.csv")
-                    lines = ["ID,Όνομα,Τηλέφωνο,Email,Διεύθυνση"]
-                    for r in rows:
-                        lines.append(
-                            f'{BaseView._csv_cell(r["id"])},{BaseView._csv_cell(r["name"])},'
-                            f'{BaseView._csv_cell(r.get("phone",""))},{BaseView._csv_cell(r.get("email",""))},'
-                            f'{BaseView._csv_cell(r.get("address",""))}')
-                    with open(dest, "w", encoding="utf-8-sig") as f:
-                        f.write("\n".join(lines))
-                else:
-                    dest = os.path.join(os.path.expanduser("~"), "Desktop", f"Suppliers_Export_{ts}.txt")
-                    lines = ["=" * 55, "  ENCOMM — ΜΗΤΡΩΟ ΠΡΟΜΗΘΕΥΤΩΝ", "=" * 55,
-                             f"Ημ/νία: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-                             f"Προμηθευτές: {len(rows)}"]
-                    for r in rows:
-                        lines.append(
-                            f"• {r['name']:<30} | Τηλ: {r.get('phone','—'):<12} | "
-                            f"Email: {r.get('email','—'):<25}")
-                    lines.append("=" * 55)
-                    with open(dest, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines))
-                self.after(0, lambda: messagebox.showinfo("Επιτυχής Εξαγωγή",
-                    "Το αρχείο αποθηκεύτηκε στην Επιφάνεια Εργασίας!"))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Σφάλμα Εξαγωγής", str(e)))
-        threading.Thread(target=_write, daemon=True).start()
+        rows = self.db_service.get_all_suppliers()
+        if filter_text:
+            rows = [r for r in rows if
+                    filter_text in r["name"].lower() or
+                    filter_text in r.get("email", "").lower()]
+        data = [[r["id"], r["name"], r.get("phone", ""), r.get("email", ""),
+                 r.get("address", "")] for r in rows]
+        self._run_export(
+            "Suppliers_Export",
+            ["ID", "Όνομα", "Τηλέφωνο", "Email", "Διεύθυνση"],
+            data, is_csv,
+            txt_title="ΜΗΤΡΩΟ ΠΡΟΜΗΘΕΥΤΩΝ",
+            txt_row_fmt="• {1:<30} | Τηλ: {2:<12} | Email: {3:<25}",
+        )
 
     # ------------------------------------------------------------------
     # Refresh
