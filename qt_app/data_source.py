@@ -1,25 +1,20 @@
 """Read-only SQLite data source for the Qt application shell.
 
-Every function opens a fresh ``sqlite3`` connection in read-only mode
-(``mode=ro`` via URI), runs its queries, and closes the connection.
-
-NO writes, migrations, or schema changes — safe to use alongside the
-running CustomTkinter application (which uses a separate connection
-pool via ``DatabaseService``).
+Opens **one** read-only connection per ``load_dashboard()`` call
+(``mode=ro`` via URI).  NO additional connections are opened inside
+loops — all expiry logic is pushed into the critical-products SELECT
+as computed ``is_expired`` / ``is_near_expiry`` flags.
 
 Typed result contract
 ---------------------
-Functions return ``DashboardResult``:
-
-- ``.ok``                  — ``True`` on success, ``False`` on error
-- ``.snapshot``            — ``DashboardSnapshot`` (only when ``ok``)
-- ``.error_message``       — Greek human-readable string (only when not ``ok``)
+``DashboardResult`` carries either a ``DashboardSnapshot`` (``.ok``) or
+a Greek error message (``.ok == False``).
 """
 
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Tuple
 
 
@@ -33,7 +28,7 @@ class CriticalProduct:
     stock: int
     expiry_date: str
     price: float
-    reasons: Tuple[str, ...]  # one or more Greek reason strings
+    reasons: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -45,7 +40,7 @@ class DashboardSnapshot:
     revenue_today: float
     vat_today: float
     invoice_count: int
-    critical_products: Tuple[CriticalProduct, ...]  # max 20
+    critical_products: Tuple[CriticalProduct, ...]
 
 
 @dataclass(frozen=True)
@@ -67,11 +62,6 @@ class DashboardResult:
 # ── Internal helpers ───────────────────────────────────────────────────
 
 def _connect_ro(db_path: str) -> sqlite3.Connection:
-    """Open a read-only connection.
-
-    Converts a plain path like ``encomm_erp.db`` into a URI with
-    ``mode=ro`` so that any write attempt raises ``sqlite3.OperationalError``.
-    """
     path = db_path.replace("\\", "/")
     uri = f"file:{path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
@@ -79,28 +69,20 @@ def _connect_ro(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def _build_reasons(
-    stock: int, expiry_date: str, threshold: int, alert_days: int,
+def _build_reasons_from_flags(
+    is_expired: int, is_near_expiry: int,
+    stock: int, threshold: int,
+    expiry_date: str, alert_days: int,
 ) -> Tuple[str, ...]:
-    """Return all applicable Greek reason strings for one product."""
+    """Pure-Python reason builder — NO SQLite calls.
+
+    Flags come directly from the critical-products SELECT (0/1).
+    """
     reasons: List[str] = []
-    # Check expiry first (most severe)
-    if expiry_date:
-        try:
-            cur = sqlite3.connect(":memory:").cursor()
-            cur.execute("SELECT date(?) < date('now')", (expiry_date,))
-            if cur.fetchone()[0]:
-                reasons.append("Ληγμένο")
-            else:
-                cur.execute(
-                    "SELECT date(?) <= date('now', '+' || ? || ' days')",
-                    (expiry_date, alert_days),
-                )
-                if cur.fetchone()[0]:
-                    reasons.append(f"Λήγει σύντομα ({expiry_date})")
-        except Exception:
-            reasons.append(f"Μη έγκυρη ημερομηνία λήξης: {expiry_date}")
-    # Then stock
+    if is_expired:
+        reasons.append("Ληγμένο")
+    elif is_near_expiry:
+        reasons.append(f"Λήγει σύντομα ({expiry_date})")
     if stock <= threshold:
         reasons.append("Χαμηλό απόθεμα")
     if not reasons:
@@ -116,7 +98,7 @@ def load_dashboard(
     alert_days: int = 30,
     critical_limit: int = 20,
 ) -> DashboardResult:
-    """Run all three dashboard queries in one read-only transaction.
+    """Run all three dashboard queries in **one** read-only transaction.
 
     Returns ``DashboardResult`` — on failure, ``.ok`` is False and
     ``.error_message`` contains a Greek description.
@@ -155,7 +137,7 @@ def load_dashboard(
             "SELECT COUNT(*) FROM invoices"
         ).fetchone()[0]
 
-        # ── Critical products ──
+        # ── Critical products (flags computed in SQL — zero extra connections) ──
         cur.execute(
             """
             SELECT Barcode, Name, Stock, ExpiryDate, Price,
@@ -166,7 +148,15 @@ def load_dashboard(
                             date('now', '+' || ? || ' days')
                            THEN 2
                        ELSE 3
-                   END AS severity
+                   END AS severity,
+                   CASE WHEN ExpiryDate != ''
+                             AND date(ExpiryDate) < date('now')
+                        THEN 1 ELSE 0 END AS is_expired,
+                   CASE WHEN ExpiryDate != ''
+                             AND date(ExpiryDate) >= date('now')
+                             AND date(ExpiryDate) <=
+                                 date('now', '+' || ? || ' days')
+                        THEN 1 ELSE 0 END AS is_near_expiry
             FROM ProductMaster
             WHERE Stock <= ?
                OR (ExpiryDate != '' AND date(ExpiryDate) < date('now'))
@@ -175,12 +165,18 @@ def load_dashboard(
             ORDER BY severity ASC, ExpiryDate ASC
             LIMIT ?
             """,
-            (alert_days, threshold, alert_days, critical_limit),
+            (alert_days, alert_days, threshold, alert_days, critical_limit),
         )
         crit: List[CriticalProduct] = []
         for row in cur.fetchall():
-            reasons = _build_reasons(
-                row["Stock"], row["ExpiryDate"], threshold, alert_days)
+            reasons = _build_reasons_from_flags(
+                is_expired=row["is_expired"],
+                is_near_expiry=row["is_near_expiry"],
+                stock=row["Stock"],
+                threshold=threshold,
+                expiry_date=row["ExpiryDate"] or "—",
+                alert_days=alert_days,
+            )
             crit.append(CriticalProduct(
                 barcode=row["Barcode"],
                 name=row["Name"],

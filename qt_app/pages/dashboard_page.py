@@ -10,14 +10,12 @@ from PySide6.QtCore import Qt, QThread, Signal, QObject
 from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QFrame, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QSpacerItem,
+    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy,
 )
 
 from qt_app.pages.base_page import BasePage
 from qt_app import styles
-from qt_app.data_source import (
-    load_dashboard, DashboardResult, DashboardSnapshot,
-)
+from qt_app.data_source import load_dashboard, DashboardResult
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -268,6 +266,25 @@ class DashboardPage(BasePage):
             self._thread.wait(2000)
         self._worker = None
         self._thread = None
+
+    def shutdown(self) -> None:
+        """Gracefully stop an active worker thread during app exit.
+
+        Disconnects the finished signal so callbacks don't touch
+        half-destroyed widgets, then quits with a bounded wait.
+        No terminate() — the OS reaps the thread on process exit.
+        """
+        if self._thread is None or not self._thread.isRunning():
+            return
+        try:
+            self._worker.finished.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self._thread.quit()
+        self._thread.wait(2000)
+        self._worker = None
+        self._thread = None
+        self._loading = False
 
     # ── Helpers ─────────────────────────────────────────────────────
     def _set_state(self, text: str, color: str) -> None:

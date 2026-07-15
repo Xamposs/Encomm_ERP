@@ -200,6 +200,13 @@ class MainWindow(QMainWindow):
             f"🕒  {gr.toString(now, 'dddd, yyyy-MM-dd HH:mm:ss')}")
 
     # ── Navigation ────────────────────────────────────────────────────
+    def closeEvent(self, event) -> None:
+        """Shut down any active background workers before closing."""
+        for page in self._pages.values():
+            if hasattr(page, "shutdown"):
+                page.shutdown()
+        super().closeEvent(event)
+
     def _on_nav_clicked(self, idx: int) -> None:
         """QButtonGroup slot — translate button index → page key."""
         if 0 <= idx < len(self._nav_keys):
