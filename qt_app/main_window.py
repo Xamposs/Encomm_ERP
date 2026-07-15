@@ -122,6 +122,9 @@ class MainWindow(QMainWindow):
 
         # ── Content area (header + stacked pages) ──────────────────────
         content_wrapper = QWidget()
+        content_wrapper.setObjectName("contentWrapper")
+        content_wrapper.setStyleSheet(
+            f"#contentWrapper {{ background: {styles.DARK_BG}; }}")
         content_lay = QVBoxLayout(content_wrapper)
         content_lay.setContentsMargins(30, 25, 30, 25)
         content_lay.setSpacing(16)
@@ -166,6 +169,9 @@ class MainWindow(QMainWindow):
 
         # Stacked pages
         self._stack = QStackedWidget()
+        self._stack.setObjectName("pageStack")
+        self._stack.setStyleSheet(
+            f"#pageStack {{ background: {styles.DARK_BG}; }}")
         self._pages: dict[str, QWidget] = {}
         self._page_indices: dict[str, int] = {}
 
@@ -254,9 +260,13 @@ class MainWindow(QMainWindow):
         # Update header title
         self._title_lbl.setText(PAGE_TITLES.get(key, key))
 
-        # Ensure page is built
-        self._ensure_page(key)
-        self._stack.setCurrentIndex(self._page_indices[key])
+        # Build destination page, switch deterministically
+        dest = self._ensure_page(key)
+        dest.show()
+        dest.raise_()
+        dest.updateGeometry()
+        self._stack.setCurrentWidget(dest)
+        self._stack.update()
 
         # Update status bar
         self._status_lbl.setText(

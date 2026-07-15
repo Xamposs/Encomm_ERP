@@ -79,14 +79,12 @@ class InventoryPage(BasePage):
         self._page_size = 50
         self._search_text = ""
         self._status_filter = "all"
-        # Queued state: if a refresh is running and the user changes
-        # something, we save the latest request here and run it once
-        # the current worker finishes.
         self._pending_req: dict | None = None
+        super().__init__(db_service, config, parent)
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.timeout.connect(self._do_refresh)
-        super().__init__(db_service, config, parent)
+        self.refresh()
 
     # ── UI construction ──────────────────────────────────────────────
     def build_ui(self) -> None:
@@ -167,7 +165,6 @@ class InventoryPage(BasePage):
         self.root_layout.addLayout(pag_bar)
 
         self._built = True
-        self.refresh()
 
     # ── User actions ─────────────────────────────────────────────────
     def _on_search_changed(self, text: str) -> None:
