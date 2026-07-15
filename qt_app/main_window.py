@@ -9,7 +9,7 @@ Navigation is via sidebar button clicks.  The active button is highlighted.
 Pages are created lazily on first access and cached.
 """
 
-from PySide6.QtCore import Qt, QTimer, QDateTime
+from PySide6.QtCore import Qt, QTimer, QDateTime, QLocale
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -195,8 +195,9 @@ class MainWindow(QMainWindow):
     # ── Clock ─────────────────────────────────────────────────────────
     def _update_clock(self):
         now = QDateTime.currentDateTime()
+        gr = QLocale(QLocale.Greek)
         self._clock_lbl.setText(
-            f"🕒  {now.toString('dddd, yyyy-MM-dd HH:mm:ss')}")
+            f"🕒  {gr.toString(now, 'dddd, yyyy-MM-dd HH:mm:ss')}")
 
     # ── Navigation ────────────────────────────────────────────────────
     def _on_nav_clicked(self, idx: int) -> None:
@@ -209,6 +210,15 @@ class MainWindow(QMainWindow):
         if self._current_page == key:
             return
         self._current_page = key
+
+        # Check the matching sidebar button via QButtonGroup
+        try:
+            idx = self._nav_keys.index(key)
+            btn = self._nav_group.button(idx)
+            if btn:
+                btn.setChecked(True)
+        except ValueError:
+            pass
 
         # Update header title
         self._title_lbl.setText(PAGE_TITLES.get(key, key))
