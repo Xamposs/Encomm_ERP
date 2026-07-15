@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, QTimer, QDateTime
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QFrame, QLineEdit,
+    QLabel, QPushButton, QFrame, QLineEdit, QButtonGroup,
     QStackedWidget, QStatusBar, QSizePolicy,
 )
 
@@ -46,6 +46,18 @@ PAGE_TITLES = {
     "ai_assistant":     "AI Βοηθός",
 }
 
+# ── Sidebar button QSS (active state via :checked pseudo-class) ───────
+NAV_QSS = (
+    "QPushButton {"
+    "  background: transparent; color: #8a8f98; "
+    "  border-radius: 8px; padding: 10px 14px; "
+    "  text-align: left; font-size: 13px; border: none; }"
+    "QPushButton:hover { background: #22252C; color: #b0b8c4; }"
+    "QPushButton:checked {"
+    "  background: #252b36; color: #3B82F6; "
+    "  font-weight: bold; }"
+)
+
 
 class MainWindow(QMainWindow):
     """ENCOMM ERP Qt application shell."""
@@ -55,6 +67,7 @@ class MainWindow(QMainWindow):
 
         self.db_service = db_service
         self.config = config or {}
+        self._current_page: str | None = None
 
         self.setWindowTitle("ENCOMM ERP 🧪")
         self.resize(1150, 730)
@@ -82,17 +95,21 @@ class MainWindow(QMainWindow):
         brand.setStyleSheet("color: #d0d4dc; padding-bottom: 12px;")
         side_lay.addWidget(brand)
 
-        # Nav buttons
-        self._nav_btns: dict[str, QPushButton] = {}
-        self._current_page: str | None = None
+        # Nav buttons (exclusive QButtonGroup)
+        self._nav_group = QButtonGroup(self)
+        self._nav_group.setExclusive(True)
+        self._nav_keys: list[str] = []
 
-        for key, label in NAV_ITEMS:
+        for idx, (key, label) in enumerate(NAV_ITEMS):
             btn = QPushButton(label)
+            btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(self._nav_style(active=False))
-            btn.clicked.connect(lambda checked, k=key: self.navigate_to(k))
+            btn.setStyleSheet(NAV_QSS)
+            self._nav_group.addButton(btn, idx)
             side_lay.addWidget(btn)
-            self._nav_btns[key] = btn
+            self._nav_keys.append(key)
+
+        self._nav_group.idClicked.connect(self._on_nav_clicked)
 
         side_lay.addStretch()
 
@@ -182,25 +199,25 @@ class MainWindow(QMainWindow):
             f"🕒  {now.toString('dddd, yyyy-MM-dd HH:mm:ss')}")
 
     # ── Navigation ────────────────────────────────────────────────────
+    def _on_nav_clicked(self, idx: int) -> None:
+        """QButtonGroup slot — translate button index → page key."""
+        if 0 <= idx < len(self._nav_keys):
+            self.navigate_to(self._nav_keys[idx])
+
     def navigate_to(self, key: str) -> None:
         """Switch to the named page, creating it lazily if needed."""
         if self._current_page == key:
             return
         self._current_page = key
 
-        # Highlight the active sidebar button
-        for k, btn in self._nav_btns.items():
-            btn.setStyleSheet(self._nav_style(active=(k == key)))
-
         # Update header title
         self._title_lbl.setText(PAGE_TITLES.get(key, key))
 
         # Ensure page is built
-        page = self._ensure_page(key)
-        idx = self._page_indices[key]
-        self._stack.setCurrentIndex(idx)
+        self._ensure_page(key)
+        self._stack.setCurrentIndex(self._page_indices[key])
 
-        # Update status bar with page title
+        # Update status bar
         self._status_lbl.setText(
             f"{PAGE_TITLES.get(key, key)}  —  Έτοιμο")
 
@@ -224,22 +241,3 @@ class MainWindow(QMainWindow):
 
         self._pages[key] = page
         return page
-
-    # ── Sidebar button style ──────────────────────────────────────────
-    @staticmethod
-    def _nav_style(active: bool) -> str:
-        if active:
-            return (
-                "QPushButton {"
-                "  background: #252b36; color: #3B82F6; "
-                "  border-radius: 8px; padding: 10px 14px; "
-                "  text-align: left; font-weight: bold; "
-                "  font-size: 13px; border: none; }"
-            )
-        return (
-            "QPushButton {"
-            "  background: transparent; color: #8a8f98; "
-            "  border-radius: 8px; padding: 10px 14px; "
-            "  text-align: left; font-size: 13px; border: none; }"
-            "QPushButton:hover { background: #22252C; color: #b0b8c4; }"
-        )
