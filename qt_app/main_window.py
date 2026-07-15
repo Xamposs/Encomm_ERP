@@ -201,11 +201,35 @@ class MainWindow(QMainWindow):
 
     # ── Navigation ────────────────────────────────────────────────────
     def closeEvent(self, event) -> None:
-        """Shut down any active background workers before closing."""
+        """Shut down any active background workers before closing.
+
+        Returns immediately if all pages return True from shutdown().
+        Otherwise ignores the event, connects each pending page's
+        shutdown_ready signal to a retry, and closes when all are ready."""
+        pending: list = []
         for page in self._pages.values():
-            if hasattr(page, "shutdown"):
-                page.shutdown()
-        super().closeEvent(event)
+            if hasattr(page, "shutdown") and not page.shutdown():
+                pending.append(page)
+
+        if not pending:
+            super().closeEvent(event)
+            return
+
+        event.ignore()
+        # Avoid duplicate connections on repeated close attempts
+        if getattr(self, "_close_retry_armed", False):
+            return
+        self._close_retry_armed = True
+
+        def _try_close():
+            for p in pending:
+                if hasattr(p, "_close_pending") and p._close_pending:
+                    return  # still waiting
+            self._close_retry_armed = False
+            self.close()
+
+        for page in pending:
+            page.shutdown_ready.connect(_try_close)
 
     def _on_nav_clicked(self, idx: int) -> None:
         """QButtonGroup slot — translate button index → page key."""

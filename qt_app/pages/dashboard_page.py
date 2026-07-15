@@ -85,6 +85,8 @@ def _stat_card(title: str, accent: str = styles.GREEN
 class DashboardPage(BasePage):
     """System overview with real stat cards and critical alerts."""
 
+    shutdown_ready = Signal()  # emitted when a pending worker finally stops
+
     @classmethod
     def page_title(cls) -> str:
         return "Επισκόπηση Συστήματος"
@@ -96,6 +98,7 @@ class DashboardPage(BasePage):
         self._worker: _DashboardWorker | None = None
         self._thread: QThread | None = None
         self._loading = False
+        self._close_pending = False
         super().__init__(db_service, config, parent)
 
     # ── UI construction ──────────────────────────────────────────────
@@ -210,7 +213,13 @@ class DashboardPage(BasePage):
         self._thread.start()
 
     def _on_data_ready(self, result: DashboardResult) -> None:
-        """Handle the worker's result (runs on UI thread via signal)."""
+        """Handle the worker's result (runs on UI thread via signal).
+
+        When a close is pending, the result is discarded — no widget updates
+        because the widgets may already be half-destroyed.
+        """
+        if self._close_pending:
+            return
         if not result.ok:
             self._set_state(result.error_message, styles.RED)
             self._clear_table()
@@ -253,11 +262,16 @@ class DashboardPage(BasePage):
                     self._alerts_table.item(r, c).setForeground(fg)
 
     def _on_thread_done(self) -> None:
-        """Clean up after the thread finishes."""
+        """Clean up after normal worker completion (not during shutdown).
+
+        If close is pending, emit shutdown_ready so MainWindow can retry."""
         self._loading = False
         self._refresh_btn.setEnabled(True)
         self._worker = None
         self._thread = None
+        if self._close_pending:
+            self._close_pending = False
+            self.shutdown_ready.emit()
 
     def _cleanup_worker(self) -> None:
         """Safely tear down any existing worker thread."""
@@ -267,24 +281,34 @@ class DashboardPage(BasePage):
         self._worker = None
         self._thread = None
 
-    def shutdown(self) -> None:
-        """Gracefully stop an active worker thread during app exit.
+    def shutdown(self) -> bool:
+        """Request a graceful stop.  Returns True only when the thread is
+        already stopped or stops within a bounded wait.
 
-        Disconnects the finished signal so callbacks don't touch
-        half-destroyed widgets, then quits with a bounded wait.
-        No terminate() — the OS reaps the thread on process exit.
-        """
+        On timeout, the worker/thread references are PRESERVED and a
+        close-pending flag is set.  When the thread eventually finishes,
+        shutdown_ready is emitted and the pending close can retry."""
         if self._thread is None or not self._thread.isRunning():
-            return
+            return True
+
+        # Disconnect only the UI data callback — the quit/deleteLater
+        # chain still needs finished → quit.
         try:
-            self._worker.finished.disconnect()
+            self._worker.finished.disconnect(self._on_data_ready)
         except (RuntimeError, TypeError):
             pass
+
+        self._close_pending = True
         self._thread.quit()
-        self._thread.wait(2000)
-        self._worker = None
-        self._thread = None
-        self._loading = False
+        if self._thread.wait(2000):
+            # Thread stopped — finalise
+            self._loading = False
+            self._worker = None
+            self._thread = None
+            self._close_pending = False
+            return True
+        # Timed out — keep refs, signal will fire when thread finishes
+        return False
 
     # ── Helpers ─────────────────────────────────────────────────────
     def _set_state(self, text: str, color: str) -> None:

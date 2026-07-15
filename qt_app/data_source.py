@@ -72,7 +72,7 @@ def _connect_ro(db_path: str) -> sqlite3.Connection:
 def _build_reasons_from_flags(
     is_expired: int, is_near_expiry: int,
     stock: int, threshold: int,
-    expiry_date: str, alert_days: int,
+    expiry_date: str,
 ) -> Tuple[str, ...]:
     """Pure-Python reason builder — NO SQLite calls.
 
@@ -175,7 +175,6 @@ def load_dashboard(
                 stock=row["Stock"],
                 threshold=threshold,
                 expiry_date=row["ExpiryDate"] or "—",
-                alert_days=alert_days,
             )
             crit.append(CriticalProduct(
                 barcode=row["Barcode"],
