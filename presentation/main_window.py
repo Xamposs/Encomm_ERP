@@ -144,20 +144,6 @@ class MainWindow(customtkinter.CTk):
         self._active_timers = []
         self.protocol("WM_DELETE_WINDOW", self.on_safe_close)
 
-        # ── Resize coalescing: prevent layout thrash during window drag ──
-        # CustomTkinter binds <Configure> → _update_dimensions_event which
-        # forces geometry recalculation on every resize pixel. With 138+
-        # widgets that's ~70ms per event, making drag-resize extremely laggy.
-        #
-        # We add a coalesced handler alongside CTk's own (add="+"). During a
-        # resize burst we set self._block_update_dimensions_event = True, which
-        # CTk's _update_dimensions_event already checks, so CTk's handler
-        # becomes a no-op until _flush_configure defers the final update.
-        self._resize_coalesce_id = None
-        self._content_hidden = False
-        self._original_configure_handler = self._update_dimensions_event
-        self.bind("<Configure>", self._throttled_configure, add="+")
-
         self.after(0, self._post_init)
 
         self.configure(takefocus=True)
@@ -171,52 +157,6 @@ class MainWindow(customtkinter.CTk):
                 w.master.focus_set() if hasattr(w, 'master') else None
         except Exception:
             pass
-
-    def _throttled_configure(self, event):
-        """Freeze main content during resize for smooth drag.
-
-        CustomTkinter's 39 Canvas widgets each redraw rounded corners +
-        gradients on every resize pixel — very expensive. grid_forget on
-        main_container removes them from the layout manager so Tk has
-        nothing to redraw. Sidebar (fixed-width) stays visible.
-
-        Position-only moves (title-bar drag) are ignored via size diff."""
-        if event.widget is not self:
-            return
-
-        new_w, new_h = event.width, event.height
-        last_w = getattr(self, '_last_configure_w', new_w)
-        last_h = getattr(self, '_last_configure_h', new_h)
-        self._last_configure_w = new_w
-        self._last_configure_h = new_h
-        if new_w == last_w and new_h == last_h:
-            return  # pure move — ignore
-
-        self._block_update_dimensions_event = True
-
-        # First resize pixel: hide content (one grid_forget, fast)
-        if not self._content_hidden and hasattr(self, 'main_container'):
-            self.main_container.grid_forget()
-            self._content_hidden = True
-
-        if self._resize_coalesce_id is not None:
-            try:
-                self.after_cancel(self._resize_coalesce_id)
-            except Exception:
-                pass
-        self._resize_coalesce_id = self.after(250, self._flush_configure)
-
-    def _flush_configure(self):
-        """Restore content and run CTk's final dimension update."""
-        self._resize_coalesce_id = None
-        self._block_update_dimensions_event = False
-        self._original_configure_handler()
-
-        if self._content_hidden and hasattr(self, 'main_container'):
-            self.main_container.grid(row=0, column=1, sticky="nsew",
-                                     padx=35, pady=35)
-            self._content_hidden = False
-        self.update_idletasks()
 
     def _post_init(self):
         self._apply_global_ttk_style()
