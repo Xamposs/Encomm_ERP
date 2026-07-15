@@ -15,15 +15,20 @@ python prototypes/qt_resize_prototype.py
 
 ## What it simulates
 
-| Component | Widget count | Notes |
-|-----------|:-----------:|-------|
-| Sidebar | 9 nav buttons + brand + version | Fixed 220 px, matches production layout |
-| Dashboard page | 4 stat cards + 8-row table | Dense Row 1 |
-| Inventory page | search bar + 2 combos + 14-row table + paginator | Closest to real ERP |
-| POS page | 6-row cart table + 15 product buttons | Two-panel layout |
-| Settings page | 7 form controls in a scrollable group | Form density |
+One single scrollable **Dense ERP Dashboard** packing ~90–110 widgets across
+four labelled regions. Every widget is visible simultaneously — the scrollbar
+handles windows too small to show everything.
 
-Total: ~90–110 widgets visible at any time, comparable to the real app.
+| Region | Widgets |
+|--------|---------|
+| 📊 Στατιστικά (Dashboard) | 4 stat cards + 8-row activity table |
+| 📦 Αποθήκη (Inventory) | search bar + 2 combos + add button + 14-row table + paginator |
+| 🧾 Ταμείο / Πωλήσεις (POS) | 6-row cart table + 15 product buttons in a grid |
+| ⚙️ Ρυθμίσεις (Settings) | 7 form controls (spinboxes, combo, checkbox, password field) |
+
+The sidebar displays all 9 Greek navigation buttons (display-only, not
+functional — they exist only as widget-density contributors to the resize
+test, not as a working navigation system).
 
 ## What to evaluate
 
@@ -31,18 +36,20 @@ Total: ~90–110 widgets visible at any time, comparable to the real app.
    content must remain visible. No white/blank panels, no flickering, no
    delayed content restoration.
 
-2. **Smoothness** — the FPS counter in the status bar (bottom-right) should
-   stay ≥40 fps during continuous resize.
+2. **Event-loop responsiveness** — the UI pulse-rate counter in the status bar
+   (bottom-right) should stay ≥50 Hz during continuous resize.
 
-3. **Responsiveness after resize** — after releasing the mouse, switching
-   between pages (sidebar buttons) should feel instant. The clock and FPS
-   counter continue updating.
+3. **After resize** — after releasing the mouse, scrolling the dense dashboard
+   should feel smooth. The pulse-rate counter continues updating.
 
 ## Metrics collected
 
-- **FPS** (rolling 60-frame window, sampled at display refresh rate)
-- **Minimum FPS** ever observed (floor)
-- **Maximum inter-frame gap** (ms) — spikes in resize-event processing
+- **UI pulse rate** (Hz) — rolling 60-sample window from a 16 ms QTimer.
+  This is NOT rendered-frame FPS. It measures *event-loop responsiveness*:
+  how regularly Qt dispatches a high-frequency timer while the window is
+  being resized.
+- **Minimum pulse rate** ever observed (floor)
+- **Maximum inter-tick gap** (ms) — worst-case event-loop stall
 - **Resize event count** — total number of resize events received
 
 ## Acceptance criteria
@@ -51,9 +58,9 @@ Total: ~90–110 widgets visible at any time, comparable to the real app.
 |--------|:----:|
 | Content visible during resize | ✅ Must |
 | No white flash or blank panels | ✅ Must |
-| FPS stays ≥40 during resize | ✅ Must |
-| FPS stays ≥50 at rest | ✅ Must |
-| Page switching works after resize | ✅ Must |
+| UI pulse rate ≥50 Hz during resize | ✅ Must |
+| UI pulse rate ≥55 Hz at rest | ✅ Must |
+| Dense dashboard scrollable after resize | ✅ Must |
 
 If all criteria pass, Qt/PySide6 is a viable alternative for the
 presentation layer. The next step would be a partial migration plan
@@ -65,5 +72,7 @@ presentation layer. The next step would be a partial migration plan
   nothing to disk.
 - It does not touch any existing ENCOMM ERP source file (`main.py`,
   `core/`, `infrastructure/`, `presentation/`, `tests/`).
+- Sidebar navigation buttons are display-only widget density; they do not
+  switch views.
 - Remove the prototype directory (`prototypes/`) once the technology
   decision is made — it has no ongoing value.

@@ -11,61 +11,65 @@ Run:
 
 What to watch:
   - Drag any window edge or corner continuously for 10+ seconds.
-  - The sidebar, header, table, and all widgets should remain visible.
-  - The FPS counter (status bar, bottom-right) should stay ≥40 fps.
+  - All sidebar buttons, header, tables, and widgets should remain visible.
+  - The UI pulse-rate counter (status bar, bottom-right) should stay ≥50 Hz.
   - No white flash, no content disappearance, no delayed layout.
 """
 
 import sys
 import time
 from collections import deque
-from random import randint, choice
+from random import randint
 
-from PySide6.QtCore import Qt, QTimer, QDateTime, QSize
-from PySide6.QtGui import QFont, QColor, QPalette, QAction
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QFont, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QLineEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QStackedWidget, QStatusBar, QSizePolicy, QScrollArea,
-    QGridLayout, QComboBox, QSpinBox, QCheckBox, QGroupBox, QSplitter
+    QHeaderView, QStatusBar, QScrollArea,
+    QGridLayout, QComboBox, QSpinBox, QCheckBox, QGroupBox
 )
 
 # ---------------------------------------------------------------------------
-# Metrics — FPS + resize-event timing
+# Metrics — UI pulse rate + resize-event timing
 # ---------------------------------------------------------------------------
 class PerfMonitor:
-    """Tracks paint-event timestamps to compute rolling FPS."""
+    """Tracks timer-tick timestamps to compute rolling UI pulse rate.
+
+    This is NOT rendered-frame FPS (no swap-buffer / vsync hook).
+    It measures how regularly the Qt event loop dispatches a high-frequency
+    QTimer — an *event-loop responsiveness* signal."""
 
     def __init__(self, window_size: int = 60):
         self._timestamps: deque[float] = deque(maxlen=window_size)
         self._resize_count = 0
         self._resize_start: float | None = None
         self._max_frame_gap_ms = 0.0
-        self._min_fps_ever = 999.0
+        self._min_pulse_ever = 999.0
 
     def tick(self):
         now = time.perf_counter()
         self._timestamps.append(now)
 
     @property
-    def fps(self) -> float:
+    def pulse_rate(self) -> float:
         if len(self._timestamps) < 2:
             return 0.0
         elapsed = self._timestamps[-1] - self._timestamps[0]
         if elapsed <= 0:
             return 0.0
-        fps_val = (len(self._timestamps) - 1) / elapsed
-        if fps_val < self._min_fps_ever and len(self._timestamps) >= 10:
-            self._min_fps_ever = fps_val
-        return fps_val
+        rate_val = (len(self._timestamps) - 1) / elapsed
+        if rate_val < self._min_pulse_ever and len(self._timestamps) >= 10:
+            self._min_pulse_ever = rate_val
+        return rate_val
 
     @property
     def max_gap_ms(self) -> float:
         return self._max_frame_gap_ms
 
     @property
-    def min_fps(self) -> float:
-        return self._min_fps_ever if self._min_fps_ever < 999.0 else 0.0
+    def min_pulse_rate(self) -> float:
+        return self._min_pulse_ever if self._min_pulse_ever < 999.0 else 0.0
 
     def record_resize_event(self):
         now = time.perf_counter()
@@ -77,9 +81,9 @@ class PerfMonitor:
         self._resize_count += 1
 
     def stats_text(self) -> str:
-        parts = [f"FPS: {self.fps:.0f}"]
-        if self.min_fps:
-            parts.append(f"min: {self.min_fps:.0f}")
+        parts = [f"UI pulse: {self.pulse_rate:.0f} Hz"]
+        if self.min_pulse_rate:
+            parts.append(f"min: {self.min_pulse_rate:.0f}")
         if self.max_gap_ms:
             parts.append(f"max gap: {self.max_gap_ms:.0f}ms")
         parts.append(f"resize events: {self._resize_count}")
@@ -140,14 +144,27 @@ def _accent() -> str:
     return "#3B82F6"
 
 
-# ── Dashboard page (simulates the real ERP dashboard) ──
-def make_dashboard_page() -> QWidget:
+# ── Dense ERP Dashboard — all 4 page widgets packed into one scrollable layout ──
+def make_dense_dashboard() -> QScrollArea:
+    """One single page with every widget from Dashboard, Inventory, Settings,
+    and POS regions.  Packed into a QScrollArea so the window can be resized
+    smaller than the content and the user still sees everything.
+    Approximate widget count: ~90–110."""
+    outer = QScrollArea()
+    outer.setWidgetResizable(True)
+    outer.setFrameShape(QFrame.NoFrame)
+
     page = QWidget()
     main_lay = QVBoxLayout(page)
-    main_lay.setContentsMargins(30, 25, 30, 25)
+    main_lay.setContentsMargins(30, 20, 30, 20)
     main_lay.setSpacing(16)
 
-    # Row of stat cards
+    # ── Region: Dashboard ──
+    region_lbl = QLabel("📊  Στατιστικά (Dashboard)")
+    region_lbl.setFont(QFont("Segoe UI", 14, QFont.Bold))
+    region_lbl.setStyleSheet("color: #d0d4dc;")
+    main_lay.addWidget(region_lbl)
+
     cards = QHBoxLayout()
     cards.setSpacing(12)
     cards.addWidget(_stat_card("Προϊόντα σε απόθεμα", "2,847"))
@@ -155,28 +172,22 @@ def make_dashboard_page() -> QWidget:
     cards.addWidget(_stat_card("Πωλήσεις σήμερα", "€4,230"))
     cards.addWidget(_stat_card("Ληγμένα", "3", "#EF4444"))
     main_lay.addLayout(cards)
-
     main_lay.addWidget(_h_line())
 
-    # Activity table
-    lbl = QLabel("📋 Πρόσφατη Δραστηριότητα")
-    lbl.setFont(QFont("Segoe UI", 13, QFont.Bold))
-    lbl.setStyleSheet("color: #d0d4dc;")
-    main_lay.addWidget(lbl)
-    table = _make_table(page, 8, 4, ["Ημερομηνία", "Τύπος", "Περιγραφή", "Ποσό"])
-    main_lay.addWidget(table, 1)
+    activity_lbl = QLabel("Πρόσφατη Δραστηριότητα")
+    activity_lbl.setFont(QFont("Segoe UI", 12, QFont.Bold))
+    activity_lbl.setStyleSheet("color: #d0d4dc;")
+    main_lay.addWidget(activity_lbl)
+    main_lay.addWidget(_make_table(page, 8, 4,
+        ["Ημερομηνία", "Τύπος", "Περιγραφή", "Ποσό"]))
+    main_lay.addWidget(_h_line())
 
-    return page
+    # ── Region: Inventory ──
+    region_lbl2 = QLabel("📦  Αποθήκη (Inventory)")
+    region_lbl2.setFont(QFont("Segoe UI", 14, QFont.Bold))
+    region_lbl2.setStyleSheet("color: #d0d4dc;")
+    main_lay.addWidget(region_lbl2)
 
-
-# ── Inventory page (simulates the real inventory view) ──
-def make_inventory_page() -> QWidget:
-    page = QWidget()
-    main_lay = QVBoxLayout(page)
-    main_lay.setContentsMargins(30, 20, 30, 20)
-    main_lay.setSpacing(12)
-
-    # Search + filters bar
     bar = QHBoxLayout()
     search = QLineEdit()
     search.setPlaceholderText("🔍 Αναζήτηση προϊόντος...")
@@ -194,12 +205,9 @@ def make_inventory_page() -> QWidget:
     bar.addWidget(add_btn)
     main_lay.addLayout(bar)
 
-    # Table
     headers = ["Barcode", "Περιγραφή", "Κατηγορία", "Τιμή", "Stock", "Ημ/νία Λήξης"]
-    table = _make_table(page, 14, len(headers), headers)
-    main_lay.addWidget(table, 1)
+    main_lay.addWidget(_make_table(page, 14, len(headers), headers))
 
-    # Bottom bar
     bot = QHBoxLayout()
     pg_lbl = QLabel("Σελίδα 1 από 12  ·  142 προϊόντα")
     pg_lbl.setStyleSheet("color: #8a8f98;")
@@ -210,23 +218,51 @@ def make_inventory_page() -> QWidget:
         btn.setFixedSize(32, 32)
         bot.addWidget(btn)
     main_lay.addLayout(bot)
+    main_lay.addWidget(_h_line())
 
-    return page
+    # ── Region: POS ──
+    region_lbl3 = QLabel("🧾  Ταμείο / Πωλήσεις (POS)")
+    region_lbl3.setFont(QFont("Segoe UI", 14, QFont.Bold))
+    region_lbl3.setStyleSheet("color: #d0d4dc;")
+    main_lay.addWidget(region_lbl3)
 
+    pos_row = QHBoxLayout()
+    pos_row.setSpacing(16)
 
-# ── Settings page (dense form) ──
-def make_settings_page() -> QWidget:
-    page = QWidget()
-    scroll = QScrollArea()
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(QFrame.NoFrame)
+    left = QVBoxLayout()
+    left.addWidget(QLabel("🧾 Καλάθι"))
+    cart_table = _make_table(None, 6, 3, ["Προϊόν", "Ποσότητα", "Τιμή"])
+    left.addWidget(cart_table, 1)
+    total = QLabel("Σύνολο: €0.00")
+    total.setFont(QFont("Segoe UI", 16, QFont.Bold))
+    total.setStyleSheet("color: #34C759;")
+    left.addWidget(total)
+    pos_row.addLayout(left, 3)
 
-    inner = QWidget()
-    lay = QGridLayout(inner)
-    lay.setContentsMargins(30, 20, 30, 20)
-    lay.setSpacing(14)
+    right = QVBoxLayout()
+    right.addWidget(QLabel("📦 Προϊόντα"))
+    grid = QGridLayout()
+    grid.setSpacing(4)
+    prods = ["Depon", "Algofren", "Panadol", "Aspirin", "Nurofen",
+             "Aerius", "Zyrtec", "Xozal", "Claritin", "Moment",
+             "Buscapina", "Imodium", "Maalox", "Gaviscon", "Lasix"]
+    for i, name in enumerate(prods):
+        btn = QPushButton(name)
+        btn.setMinimumHeight(48)
+        grid.addWidget(btn, i // 3, i % 3)
+    right.addLayout(grid)
+    right.addStretch()
+    pos_row.addLayout(right, 2)
+    main_lay.addLayout(pos_row)
+    main_lay.addWidget(_h_line())
 
-    group = QGroupBox("⚙️ Γενικές Ρυθμίσεις")
+    # ── Region: Settings ──
+    region_lbl4 = QLabel("⚙️  Ρυθμίσεις (Settings)")
+    region_lbl4.setFont(QFont("Segoe UI", 14, QFont.Bold))
+    region_lbl4.setStyleSheet("color: #d0d4dc;")
+    main_lay.addWidget(region_lbl4)
+
+    group = QGroupBox("Γενικές Ρυθμίσεις")
     g_lay = QGridLayout(group)
     g_lay.setSpacing(8)
     rows = [
@@ -254,50 +290,11 @@ def make_settings_page() -> QWidget:
             if "echo" in kwargs:
                 w.setEchoMode(kwargs["echo"])
         g_lay.addWidget(w, i, 1)
+    main_lay.addWidget(group)
 
-    lay.addWidget(group, 0, 0)
-    scroll.setWidget(inner)
-    outer = QVBoxLayout(page)
-    outer.setContentsMargins(0, 0, 0, 0)
-    outer.addWidget(scroll)
-    return page
-
-
-# ── POS page ──
-def make_pos_page() -> QWidget:
-    page = QWidget()
-    h = QHBoxLayout(page)
-    h.setContentsMargins(20, 20, 20, 20)
-    h.setSpacing(16)
-
-    # Left: cart
-    left = QVBoxLayout()
-    left.addWidget(QLabel("🧾 Καλάθι"))
-    cart_table = _make_table(None, 6, 3, ["Προϊόν", "Ποσότητα", "Τιμή"])
-    left.addWidget(cart_table, 1)
-    total = QLabel("Σύνολο: €0.00")
-    total.setFont(QFont("Segoe UI", 16, QFont.Bold))
-    total.setStyleSheet("color: #34C759;")
-    left.addWidget(total)
-    h.addLayout(left, 3)
-
-    # Right: product grid (simulates many buttons)
-    right = QVBoxLayout()
-    right.addWidget(QLabel("📦 Προϊόντα"))
-    grid = QGridLayout()
-    grid.setSpacing(4)
-    prods = ["Depon", "Algofren", "Panadol", "Aspirin", "Nurofen",
-             "Aerius", "Zyrtec", "Xozal", "Claritin", "Moment",
-             "Buscapina", "Imodium", "Maalox", "Gaviscon", "Lasix"]
-    for i, name in enumerate(prods):
-        btn = QPushButton(name)
-        btn.setMinimumHeight(48)
-        grid.addWidget(btn, i // 3, i % 3)
-    right.addLayout(grid)
-    right.addStretch()
-    h.addLayout(right, 2)
-
-    return page
+    main_lay.addStretch()
+    outer.setWidget(page)
+    return outer
 
 
 # ---------------------------------------------------------------------------
@@ -333,26 +330,22 @@ class PrototypeWindow(QMainWindow):
         brand.setStyleSheet("color: #d0d4dc; padding-bottom: 12px;")
         side_lay.addWidget(brand)
 
-        self._nav_btns: dict[str, QPushButton] = {}
+        # Display-only nav buttons (visual density, not functional)
         nav_items = [
-            ("dashboard",   "📊  Αρχική"),
-            ("inventory",   "📦  Αποθήκη"),
-            ("suppliers",   "🏭  Προμηθευτές"),
-            ("pos",         "🧾  Ταμείο / Πωλήσεις"),
-            ("customers",   "👥  Πελάτες"),
-            ("history",     "🔎  Ιστορικό"),
-            ("movements",   "📋  Κινήσεις"),
-            ("settings",    "⚙️  Ρυθμίσεις"),
-            ("ai",          "🤖  AI Βοηθός"),
+            "📊  Αρχική",
+            "📦  Αποθήκη",
+            "🏭  Προμηθευτές",
+            "🧾  Ταμείο / Πωλήσεις",
+            "👥  Πελάτες",
+            "🔎  Ιστορικό",
+            "📋  Κινήσεις",
+            "⚙️  Ρυθμίσεις",
+            "🤖  AI Βοηθός",
         ]
-        for key, label in nav_items:
+        for label in nav_items:
             btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setStyleSheet(self._nav_btn_style(active=False))
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda checked, k=key: self._switch_page(k))
+            btn.setStyleSheet(self._nav_btn_style())
             side_lay.addWidget(btn)
-            self._nav_btns[key] = btn
 
         side_lay.addStretch()
         ver = QLabel("v1.0.0 Stable | ENCOMM Tensor Intelligence")
@@ -364,12 +357,7 @@ class PrototypeWindow(QMainWindow):
         # ── Main content ──
         right = QVBoxLayout()
         right.setContentsMargins(30, 25, 30, 25)
-        right.setSpacing(16)
-
-        self._title_lbl = QLabel("Επισκόπηση Συστήματος")
-        self._title_lbl.setFont(QFont("Segoe UI", 22, QFont.Bold))
-        self._title_lbl.setStyleSheet("color: #e0e4ec;")
-        right.addWidget(self._title_lbl)
+        right.setSpacing(12)
 
         self._ai_bar = QLineEdit()
         self._ai_bar.setPlaceholderText(
@@ -380,18 +368,14 @@ class PrototypeWindow(QMainWindow):
             f"border-radius: 6px; padding: 6px 12px; color: #c0c8d4; }}")
         right.addWidget(self._ai_bar)
 
-        self._stack = QStackedWidget()
-        self._stack.addWidget(make_dashboard_page())   # index 0
-        self._stack.addWidget(make_inventory_page())   # index 1
-        self._stack.addWidget(make_settings_page())    # index 2
-        self._stack.addWidget(make_pos_page())         # index 3
-        right.addWidget(self._stack, 1)
+        # Single dense scrollable dashboard — all 4 regions in one page
+        right.addWidget(make_dense_dashboard(), 1)
 
         content_wrapper = QWidget()
         content_wrapper.setLayout(right)
         root.addWidget(content_wrapper, 1)
 
-        # ── Status bar with FPS ──
+        # ── Status bar with UI pulse rate ──
         self._status_lbl = QLabel()
         self._status_lbl.setStyleSheet("color: #34C759; padding: 2px 8px;")
         sb = QStatusBar()
@@ -399,61 +383,23 @@ class PrototypeWindow(QMainWindow):
         self.setStatusBar(sb)
 
         # ── Timers ──
-        # Paint-event ticker: drive perf monitor at display refresh rate
-        self._paint_timer = QTimer(self)
-        self._paint_timer.timeout.connect(self._perf.tick)
-        self._paint_timer.start(16)  # ~60 Hz
+        # UI pulse ticker: samples event-loop responsiveness at ~60 Hz
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.timeout.connect(self._perf.tick)
+        self._pulse_timer.start(16)
 
         # Status-bar refresh
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_status)
         self._status_timer.start(250)
 
-        # Start on dashboard
-        self._switch_page("dashboard")
-
     # ── Resize-tracking via resizeEvent override ──
     def resizeEvent(self, event):
         self._perf.record_resize_event()
         super().resizeEvent(event)
 
-    # ── Page switching ──
-    def _switch_page(self, key: str):
-        titles = {
-            "dashboard": "Επισκόπηση Συστήματος",
-            "inventory": "Διαχείριση Αποθήκης",
-            "suppliers": "Μητρώο Προμηθευτών",
-            "pos": "Ταμείο / Πωλήσεις (POS)",
-            "customers": "Μητρώο Πελατών",
-            "history": "Ιστορικό Παραστατικών",
-            "movements": "Κινήσεις Αποθέματος",
-            "settings": "Ρυθμίσεις Συστήματος",
-            "ai": "AI Βοηθός",
-        }
-        page_map = {
-            "dashboard": 0, "inventory": 1, "settings": 2, "pos": 3,
-            "suppliers": 2, "customers": 2, "history": 2,
-            "movements": 2, "ai": 2,  # fall back to settings page
-        }
-        self._title_lbl.setText(titles.get(key, key))
-        idx = page_map.get(key, 0)
-        if idx < self._stack.count():
-            self._stack.setCurrentIndex(idx)
-
-        for k, btn in self._nav_btns.items():
-            active = (k == key)
-            btn.setChecked(active)
-            btn.setStyleSheet(self._nav_btn_style(active=active))
-
-    def _nav_btn_style(self, active: bool) -> str:
-        if active:
-            return (
-                "QPushButton {"
-                "  background: #252b36; color: #3B82F6; "
-                "  border-radius: 8px; padding: 10px 14px; "
-                "  text-align: left; font-weight: bold; "
-                "  font-size: 13px; border: none; }"
-            )
+    @staticmethod
+    def _nav_btn_style() -> str:
         return (
             "QPushButton {"
             "  background: transparent; color: #8a8f98; "
