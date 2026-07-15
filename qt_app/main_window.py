@@ -9,11 +9,11 @@ Navigation is via sidebar button clicks.  The active button is highlighted.
 Pages are created lazily on first access and cached.
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer, QDateTime
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QFrame,
+    QLabel, QPushButton, QFrame, QLineEdit,
     QStackedWidget, QStatusBar, QSizePolicy,
 )
 
@@ -103,18 +103,62 @@ class MainWindow(QMainWindow):
 
         root.addWidget(sidebar)
 
-        # ── Content area (stacked pages) ─────────────────────────────
+        # ── Content area (header + stacked pages) ──────────────────────
+        content_wrapper = QWidget()
+        content_lay = QVBoxLayout(content_wrapper)
+        content_lay.setContentsMargins(30, 25, 30, 25)
+        content_lay.setSpacing(16)
+
+        # Header frame
+        header = QFrame()
+        header.setStyleSheet("background: transparent;")
+        header_lay = QVBoxLayout(header)
+        header_lay.setContentsMargins(0, 0, 0, 0)
+        header_lay.setSpacing(10)
+
+        # Row 1: title + clock
+        title_row = QHBoxLayout()
+        title_row.setSpacing(12)
+
+        self._title_lbl = QLabel("Επισκόπηση Συστήματος")
+        self._title_lbl.setFont(QFont("Segoe UI", 22, QFont.Bold))
+        self._title_lbl.setStyleSheet("color: #e0e4ec;")
+        title_row.addWidget(self._title_lbl, 1)
+
+        self._clock_lbl = QLabel("")
+        self._clock_lbl.setFont(QFont("Courier New", 13))
+        self._clock_lbl.setStyleSheet(f"color: {styles.GREEN};")
+        title_row.addWidget(self._clock_lbl)
+
+        header_lay.addLayout(title_row)
+
+        # Row 2: AI command bar
+        self._ai_cmd_bar = QLineEdit()
+        self._ai_cmd_bar.setPlaceholderText(
+            "💡 Πείτε στο Encomm AI τι θέλετε να κάνετε...")
+        self._ai_cmd_bar.setMinimumHeight(40)
+        self._ai_cmd_bar.setStyleSheet(
+            f"QLineEdit {{ background: {styles.DARK_SURFACE}; "
+            f"border: 1px solid {styles.BORDER_FOCUS}; "
+            f"border-radius: 6px; padding: 8px 12px; "
+            f"color: {styles.TEXT_PRIMARY}; font-size: 13px; }}"
+            "QLineEdit:focus { border-color: #3B82F6; }")
+        header_lay.addWidget(self._ai_cmd_bar)
+
+        content_lay.addWidget(header)
+
+        # Stacked pages
         self._stack = QStackedWidget()
         self._pages: dict[str, QWidget] = {}
         self._page_indices: dict[str, int] = {}
 
         for idx, (key, _label) in enumerate(NAV_ITEMS):
-            # Placeholder — real page created lazily in _ensure_page()
             placeholder = QWidget()
             self._stack.addWidget(placeholder)
             self._page_indices[key] = idx
 
-        root.addWidget(self._stack, 1)
+        content_lay.addWidget(self._stack, 1)
+        root.addWidget(content_wrapper, 1)
 
         # ── Status bar ───────────────────────────────────────────────
         self._status_lbl = QLabel("Έτοιμο")
@@ -124,8 +168,18 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._status_lbl)
         self.setStatusBar(sb)
 
-        # ── Start on dashboard ───────────────────────────────────────
+        # ── Start on dashboard + start clock ─────────────────────────
         self.navigate_to("dashboard")
+        self._update_clock()
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(1000)
+
+    # ── Clock ─────────────────────────────────────────────────────────
+    def _update_clock(self):
+        now = QDateTime.currentDateTime()
+        self._clock_lbl.setText(
+            f"🕒  {now.toString('dddd, yyyy-MM-dd HH:mm:ss')}")
 
     # ── Navigation ────────────────────────────────────────────────────
     def navigate_to(self, key: str) -> None:
@@ -137,6 +191,9 @@ class MainWindow(QMainWindow):
         # Highlight the active sidebar button
         for k, btn in self._nav_btns.items():
             btn.setStyleSheet(self._nav_style(active=(k == key)))
+
+        # Update header title
+        self._title_lbl.setText(PAGE_TITLES.get(key, key))
 
         # Ensure page is built
         page = self._ensure_page(key)
