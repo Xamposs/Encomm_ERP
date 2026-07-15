@@ -12,6 +12,7 @@ default entry point until the Qt migration is complete and approved.
 """
 
 import sys
+import os
 
 from PySide6.QtWidgets import QApplication
 
@@ -26,7 +27,11 @@ def main():
     app.setPalette(DARK_PALETTE)
     app.setStyleSheet(GLOBAL_QSS)
 
-    window = MainWindow()
+    config = {
+        "db_path": os.getenv("DB_PATH", "encomm_erp.db"),
+        "theme": "Dark",
+    }
+    window = MainWindow(config=config)
     window.show()
 
     sys.exit(app.exec())
