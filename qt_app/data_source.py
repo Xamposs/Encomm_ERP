@@ -227,6 +227,7 @@ class InventoryProduct:
     stock: int
     expiry_date: str
     price: float
+    supplier_id: int | None
     supplier_name: str
     status_labels: Tuple[str, ...]
 
@@ -260,6 +261,18 @@ def _escape_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _has_table(cur, name: str) -> bool:
+    return cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone() is not None
+
+
+def _has_column(cur, table: str, column: str) -> bool:
+    rows = cur.execute(f"PRAGMA table_info('{table}')").fetchall()
+    return any(r[1] == column for r in rows)
+
+
 def load_inventory_page(
     db_path: str,
     search_text: str = "",
@@ -273,24 +286,30 @@ def load_inventory_page(
 
     One read-only connection — no writes, no schema changes.
     """
-    # Clamp
     page = max(1, page)
     page_size = min(max(1, page_size), 100)
-    offset = (page - 1) * page_size
 
     conn = None
     try:
         conn = _connect_ro(db_path)
+        # Register Unicode casefold for Greek/Latin case-insensitive search
+        conn.create_function("unicode_casefold", 1, str.casefold, deterministic=True)
         cur = conn.cursor()
+
+        # ── Schema detection (read-only PRAGMA only) ──
+        has_suppliers_table = _has_table(cur, "suppliers")
+        has_supplier_id = _has_column(cur, "ProductMaster", "supplier_id")
 
         # ── Build WHERE clause ──
         conditions: List[str] = []
         params: List = []
 
         if search_text:
-            escaped = _escape_like(search_text)
+            folded = str.casefold(search_text)
+            escaped = _escape_like(folded)
             conditions.append(
-                "(p.Name LIKE ? ESCAPE '\\' OR p.Barcode LIKE ? ESCAPE '\\')")
+                "(unicode_casefold(p.Name) LIKE ? ESCAPE '\\' "
+                "OR unicode_casefold(p.Barcode) LIKE ? ESCAPE '\\')")
             params.extend([f"%{escaped}%", f"%{escaped}%"])
 
         if status_filter == "expired":
@@ -317,10 +336,28 @@ def load_inventory_page(
         count_sql = f"SELECT COUNT(*) FROM ProductMaster p{where}"
         total = cur.execute(count_sql, params).fetchone()[0]
 
+        # Pagination bounds — clamp after knowing total
+        if total == 0:
+            page = 1
+        else:
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(page, total_pages))
+        offset = (page - 1) * page_size
+
+        # ── Supplier column — build dynamically ──
+        if has_suppliers_table and has_supplier_id:
+            supplier_select = "p.supplier_id, COALESCE(s.name, '—') AS supplier_name"
+            supplier_join = "LEFT JOIN suppliers s ON p.supplier_id = s.id"
+        else:
+            supplier_select = (
+                "p.supplier_id AS supplier_id" if has_supplier_id
+                else "NULL AS supplier_id") + ", '—' AS supplier_name"
+            supplier_join = ""
+
         # ── Products ──
         data_sql = f"""
             SELECT p.Barcode, p.Name, p.Stock, p.ExpiryDate, p.Price,
-                   COALESCE(s.name, '—') AS supplier_name,
+                   {supplier_select},
                    CASE WHEN p.ExpiryDate != ''
                              AND date(p.ExpiryDate) < date('now')
                         THEN 1 ELSE 0 END AS is_expired,
@@ -330,7 +367,7 @@ def load_inventory_page(
                                  date('now', '+' || ? || ' days')
                         THEN 1 ELSE 0 END AS is_near_expiry
             FROM ProductMaster p
-            LEFT JOIN suppliers s ON p.supplier_id = s.id
+            {supplier_join}
             {where}
             ORDER BY p.Name ASC
             LIMIT ? OFFSET ?
@@ -346,12 +383,14 @@ def load_inventory_page(
                 threshold=threshold,
                 expiry_date=row["ExpiryDate"] or "—",
             )
+            sid = row["supplier_id"]
             products.append(InventoryProduct(
                 barcode=row["Barcode"],
                 name=row["Name"],
                 stock=row["Stock"],
                 expiry_date=row["ExpiryDate"] or "—",
                 price=row["Price"],
+                supplier_id=sid if sid is not None else None,
                 supplier_name=row["supplier_name"],
                 status_labels=statuses,
             ))
