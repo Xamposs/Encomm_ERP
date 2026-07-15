@@ -91,29 +91,18 @@ class TestInventoryLoad:
         assert load_inventory_page(str(db), search_text="Par").snapshot.total_matching == 1
 
     def test_search_greek_casefold(self, tmp_path):
-        """Greek uppercase/lowercase searches return the same result."""
+        """Greek accent-insensitive + case-insensitive search."""
         db = tmp_path / "test.db"
         _make_db(str(db), [
-            ("A", "Παρακεταμολη",  5, "2027-01-01", 1.0, None),
-            ("B", "Ασπιρινη",     10, "2027-06-01", 2.0, None),
+            ("A", "Παρακεταμόλη",  5, "2027-01-01", 1.0, None),
+            ("B", "Ασπιρίνη",     10, "2027-06-01", 2.0, None),
         ])
-        # Lowercase search
-        r1 = load_inventory_page(str(db), search_text="παρα")
-        assert r1.ok
-        assert r1.snapshot.total_matching == 1
-        assert "Παρακεταμολη" in r1.snapshot.products[0].name
-        # Uppercase search (all casefold to same)
-        r2 = load_inventory_page(str(db), search_text="ΠΑΡΑ")
-        assert r2.ok
-        assert r2.snapshot.total_matching == 1
-        # Mixed uppercase
-        r3 = load_inventory_page(str(db), search_text="ΑΣΠΙΡΙΝΗ")
-        assert r3.ok
-        assert r3.snapshot.total_matching == 1
-        # Substring across Greek words
-        r4 = load_inventory_page(str(db), search_text="κεταμο")
-        assert r4.ok
-        assert r4.snapshot.total_matching == 1
+        # All these searches must find the matching product
+        assert load_inventory_page(str(db), search_text="παρα").snapshot.total_matching == 1
+        assert load_inventory_page(str(db), search_text="ΠΑΡΑ").snapshot.total_matching == 1
+        assert load_inventory_page(str(db), search_text="ασπιρίνη").snapshot.total_matching == 1
+        assert load_inventory_page(str(db), search_text="ΑΣΠΙΡΙΝΗ").snapshot.total_matching == 1
+        assert load_inventory_page(str(db), search_text="ασπιρινη").snapshot.total_matching == 1
 
     def test_search_by_name(self, tmp_path):
         db = tmp_path / "test.db"

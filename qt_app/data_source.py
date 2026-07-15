@@ -14,6 +14,7 @@ a Greek error message (``.ok == False``).
 from __future__ import annotations
 
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -215,6 +216,9 @@ def load_dashboard(
     except Exception as e:
         return DashboardResult.failure(
             f"Αδυναμία φόρτωσης δεδομένων dashboard: {e}")
+    finally:
+        if conn:
+            conn.close()
 # ═══════════════════════════════════════════════════════════════════════
 # Inventory data source
 # ═══════════════════════════════════════════════════════════════════════
@@ -261,6 +265,23 @@ def _escape_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _normalize_search(value: str) -> str:
+    """Casefold + strip Greek tonos for accent-insensitive search.
+
+    Normalises to NFD, drops all combining marks (category ``Mn``),
+    then recomposes the remaining base characters.  Result is suitable
+    for both the SQLite registered function and for normalising user
+    input before LIKE escaping.
+    """
+    s = str(value).casefold()
+    decomposed = unicodedata.normalize("NFD", s)
+    stripped = "".join(
+        ch for ch in decomposed
+        if unicodedata.category(ch) != "Mn"
+    )
+    return unicodedata.normalize("NFC", stripped)
+
+
 def _has_table(cur, name: str) -> bool:
     return cur.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -292,8 +313,8 @@ def load_inventory_page(
     conn = None
     try:
         conn = _connect_ro(db_path)
-        # Register Unicode casefold for Greek/Latin case-insensitive search
-        conn.create_function("unicode_casefold", 1, str.casefold, deterministic=True)
+        # Register accent+case-normalised search function
+        conn.create_function("search_normalize", 1, _normalize_search, deterministic=True)
         cur = conn.cursor()
 
         # ── Schema detection (read-only PRAGMA only) ──
@@ -305,11 +326,11 @@ def load_inventory_page(
         params: List = []
 
         if search_text:
-            folded = str.casefold(search_text)
-            escaped = _escape_like(folded)
+            normalized = _normalize_search(search_text)
+            escaped = _escape_like(normalized)
             conditions.append(
-                "(unicode_casefold(p.Name) LIKE ? ESCAPE '\\' "
-                "OR unicode_casefold(p.Barcode) LIKE ? ESCAPE '\\')")
+                "(search_normalize(p.Name) LIKE ? ESCAPE '\\' "
+                "OR search_normalize(p.Barcode) LIKE ? ESCAPE '\\')")
             params.extend([f"%{escaped}%", f"%{escaped}%"])
 
         if status_filter == "expired":

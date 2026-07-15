@@ -209,3 +209,74 @@ class TestLoadDashboard:
         src = inspect.getsource(ds._build_reasons_from_flags)
         assert "sqlite3" not in src
         assert "connect" not in src
+
+    def test_dashboard_closes_connection_on_success(self, tmp_path):
+        """load_dashboard() closes its connection after a successful load."""
+        import sqlite3 as _sqlite3
+        from qt_app.data_source import load_dashboard, _connect_ro
+        closed = []
+
+        class _TrackedConn:
+            def __init__(self, real):
+                self._real = real
+            def cursor(self):
+                return self._real.cursor()
+            def close(self):
+                closed.append(True)
+                self._real.close()
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        original = _connect_ro
+        def _tracked(path):
+            return _TrackedConn(original(path))
+
+        import qt_app.data_source as ds
+        ds._connect_ro = _tracked
+        try:
+            db = tmp_path / "test.db"
+            _make_db(str(db), [("A", "X", 1, "2027-01-01", 1.0)])
+            r = load_dashboard(str(db))
+            assert r.ok
+            assert len(closed) == 1, "connection not closed on success"
+        finally:
+            ds._connect_ro = original
+
+    def test_dashboard_closes_connection_on_error(self, tmp_path):
+        """load_dashboard() closes its connection even on SQLite failure."""
+        import sqlite3 as _sqlite3
+        from qt_app.data_source import load_dashboard, _connect_ro
+        closed = []
+
+        class _TrackedConn:
+            def __init__(self, real):
+                self._real = real
+            def cursor(self):
+                c = self._real.cursor()
+                # Return a cursor that blows up on execute
+                class _Bomb:
+                    def execute(self, *a, **kw):
+                        raise _sqlite3.DatabaseError("boom")
+                    def fetchone(self):
+                        return None
+                return _Bomb()
+            def close(self):
+                closed.append(True)
+                self._real.close()
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        original = _connect_ro
+        def _tracked(path):
+            return _TrackedConn(original(path))
+
+        import qt_app.data_source as ds
+        ds._connect_ro = _tracked
+        try:
+            db = tmp_path / "test.db"
+            _make_db(str(db), [("A", "X", 1, "2027-01-01", 1.0)])
+            r = load_dashboard(str(db))
+            assert not r.ok
+            assert len(closed) == 1, "connection not closed on error"
+        finally:
+            ds._connect_ro = original
