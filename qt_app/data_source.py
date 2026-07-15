@@ -215,6 +215,173 @@ def load_dashboard(
     except Exception as e:
         return DashboardResult.failure(
             f"Αδυναμία φόρτωσης δεδομένων dashboard: {e}")
+# ═══════════════════════════════════════════════════════════════════════
+# Inventory data source
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class InventoryProduct:
+    """Single inventory row (immutable snapshot)."""
+    barcode: str
+    name: str
+    stock: int
+    expiry_date: str
+    price: float
+    supplier_name: str
+    status_labels: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class InventorySnapshot:
+    """Immutable page of inventory data."""
+    total_matching: int
+    page: int
+    page_size: int
+    products: Tuple[InventoryProduct, ...]
+
+
+@dataclass(frozen=True)
+class InventoryResult:
+    ok: bool
+    snapshot: InventorySnapshot | None = None
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, snapshot: InventorySnapshot) -> "InventoryResult":
+        return cls(ok=True, snapshot=snapshot)
+
+    @classmethod
+    def failure(cls, message: str) -> "InventoryResult":
+        return cls(ok=False, error_message=message)
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE wildcards so user input is treated as literal text."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def load_inventory_page(
+    db_path: str,
+    search_text: str = "",
+    status_filter: str = "all",
+    threshold: int = 10,
+    alert_days: int = 30,
+    page: int = 1,
+    page_size: int = 50,
+) -> InventoryResult:
+    """Return a paginated, filtered, searched inventory view.
+
+    One read-only connection — no writes, no schema changes.
+    """
+    # Clamp
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    offset = (page - 1) * page_size
+
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        cur = conn.cursor()
+
+        # ── Build WHERE clause ──
+        conditions: List[str] = []
+        params: List = []
+
+        if search_text:
+            escaped = _escape_like(search_text)
+            conditions.append(
+                "(p.Name LIKE ? ESCAPE '\\' OR p.Barcode LIKE ? ESCAPE '\\')")
+            params.extend([f"%{escaped}%", f"%{escaped}%"])
+
+        if status_filter == "expired":
+            conditions.append(
+                "p.ExpiryDate != '' AND date(p.ExpiryDate) < date('now')")
+        elif status_filter == "near_expiry":
+            conditions.append(
+                "p.ExpiryDate != '' AND date(p.ExpiryDate) >= date('now') "
+                "AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')")
+            params.append(alert_days)
+        elif status_filter == "low_stock":
+            conditions.append("p.Stock <= ?")
+            params.append(threshold)
+        elif status_filter == "available":
+            conditions.append(
+                "p.Stock > ? AND (p.ExpiryDate = '' "
+                "OR (date(p.ExpiryDate) >= date('now') "
+                "AND date(p.ExpiryDate) > date('now', '+' || ? || ' days')))")
+            params.extend([threshold, alert_days])
+
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        # ── Count ──
+        count_sql = f"SELECT COUNT(*) FROM ProductMaster p{where}"
+        total = cur.execute(count_sql, params).fetchone()[0]
+
+        # ── Products ──
+        data_sql = f"""
+            SELECT p.Barcode, p.Name, p.Stock, p.ExpiryDate, p.Price,
+                   COALESCE(s.name, '—') AS supplier_name,
+                   CASE WHEN p.ExpiryDate != ''
+                             AND date(p.ExpiryDate) < date('now')
+                        THEN 1 ELSE 0 END AS is_expired,
+                   CASE WHEN p.ExpiryDate != ''
+                             AND date(p.ExpiryDate) >= date('now')
+                             AND date(p.ExpiryDate) <=
+                                 date('now', '+' || ? || ' days')
+                        THEN 1 ELSE 0 END AS is_near_expiry
+            FROM ProductMaster p
+            LEFT JOIN suppliers s ON p.supplier_id = s.id
+            {where}
+            ORDER BY p.Name ASC
+            LIMIT ? OFFSET ?
+        """
+        all_params = [alert_days] + params + [page_size, offset]
+        cur.execute(data_sql, all_params)
+        products: List[InventoryProduct] = []
+        for row in cur.fetchall():
+            statuses = _build_reasons_from_flags(
+                is_expired=row["is_expired"],
+                is_near_expiry=row["is_near_expiry"],
+                stock=row["Stock"],
+                threshold=threshold,
+                expiry_date=row["ExpiryDate"] or "—",
+            )
+            products.append(InventoryProduct(
+                barcode=row["Barcode"],
+                name=row["Name"],
+                stock=row["Stock"],
+                expiry_date=row["ExpiryDate"] or "—",
+                price=row["Price"],
+                supplier_name=row["supplier_name"],
+                status_labels=statuses,
+            ))
+
+        return InventoryResult.success(InventorySnapshot(
+            total_matching=total,
+            page=page,
+            page_size=page_size,
+            products=tuple(products),
+        ))
+
+    except FileNotFoundError:
+        return InventoryResult.failure(
+            "Αδυναμία φόρτωσης δεδομένων αποθήκης: "
+            f"το αρχείο βάσης δεν βρέθηκε ({db_path})")
+    except sqlite3.OperationalError as e:
+        msg = str(e)
+        if "unable to open" in msg.lower() or "no such" in msg.lower():
+            return InventoryResult.failure(
+                "Αδυναμία φόρτωσης δεδομένων αποθήκης: "
+                f"αδυναμία ανοίγματος της βάσης ({db_path})")
+        return InventoryResult.failure(
+            f"Αδυναμία φόρτωσης δεδομένων αποθήκης: σφάλμα SQLite — {msg}")
+    except sqlite3.DatabaseError as e:
+        return InventoryResult.failure(
+            "Αδυναμία φόρτωσης δεδομένων αποθήκης: "
+            f"σφάλμα βάσης — {e}")
+    except Exception as e:
+        return InventoryResult.failure(
+            f"Αδυναμία φόρτωσης δεδομένων αποθήκης: {e}")
     finally:
         if conn:
             conn.close()

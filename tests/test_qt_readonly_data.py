@@ -103,22 +103,38 @@ class TestLoadDashboard:
         near = _date_str(20)
         far = _date_str(31)
         db = tmp_path / "test.db"
-        _make_db(str(db), [
+        conn = sqlite3.connect(str(db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE ProductMaster (
+                Barcode TEXT PRIMARY KEY, Name TEXT, Stock INTEGER,
+                ExpiryDate TEXT, Price REAL
+            );
+            CREATE TABLE invoices (
+                id TEXT PRIMARY KEY, invoice_date TEXT,
+                subtotal REAL, vat_amount REAL, grand_total REAL
+            );
+        """)
+        for p in [
             ("A", "OK",           50, far,     1.0),
             ("B", "Low",           3, far,     2.0),
             ("C", "Expired",      20, expired, 3.0),
             ("D", "Near-Expiry",  15, near,    4.0),
             ("E", "Far",           0, far,     5.0),
-        ], invoices=[
-            ("I1", date.today().isoformat(), 10, 1.5, 11.5),
-            ("I2", date.today().isoformat(), 20, 3.0, 23.0),
-        ])
+        ]:
+            conn.execute("INSERT INTO ProductMaster VALUES (?,?,?,?,?)", p)
+        conn.execute(
+            "INSERT INTO invoices VALUES ('I1', date('now'), 10, 1.5, 11.5)")
+        conn.execute(
+            "INSERT INTO invoices VALUES ('I2', date('now'), 20, 3.0, 23.0)")
+        conn.commit()
+        conn.close()
         r = load_dashboard(str(db), threshold=10, alert_days=30)
         assert r.ok
         s = r.snapshot
         assert s.total_products == 5
-        assert s.low_stock_count == 2        # stock 3 and 0
-        assert s.expiry_alert_count == 2      # expired(C) + near(D); far at 31d excluded
+        assert s.low_stock_count == 2
+        assert s.expiry_alert_count == 2
         assert s.revenue_today == 34.50
         assert s.vat_today == 4.50
         assert s.invoice_count == 2
