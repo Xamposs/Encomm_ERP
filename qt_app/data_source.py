@@ -1097,7 +1097,9 @@ def load_invoices_page(
                     f"Λείπει η υποχρεωτική στήλη '{col}' στον πίνακα invoices.")
 
         has_customers = _has_table(cur, "customers")
-        has_cid = has_customers and _has_column(cur, "invoices", "customer_id")
+        has_cust_id = has_customers and _has_column(cur, "customers", "id")
+        has_cust_name = has_customers and _has_column(cur, "customers", "name")
+        has_cid = has_cust_id and has_cust_name and _has_column(cur, "invoices", "customer_id")
         cust_join = (" LEFT JOIN customers cu ON i.customer_id=cu.id" if has_cid else "")
         cust_col = "cu.name" if has_cid else "''"
 
@@ -1168,12 +1170,13 @@ def load_invoice_detail(db_path, invoice_id):
                     f"Λείπει η υποχρεωτική στήλη '{col}' στον πίνακα invoices.")
 
         has_customers = _has_table(cur, "customers")
-        has_cid = has_customers and _has_column(cur, "invoices", "customer_id")
-        cust_name = "''"
+        has_cust_id = has_customers and _has_column(cur, "customers", "id")
+        has_cust_name = has_customers and _has_column(cur, "customers", "name")
+        has_cid = has_cust_id and has_cust_name and _has_column(cur, "invoices", "customer_id")
 
         cur.execute(f"""
             SELECT i.invoice_date, i.subtotal, i.vat_amount, i.grand_total,
-                   {cust_name if has_cid else "''"}
+                   {"cu.name" if has_cid else "''"}
             FROM invoices i {"LEFT JOIN customers cu ON i.customer_id=cu.id" if has_cid else ""}
             WHERE i.id=?
         """, (invoice_id,))
@@ -1189,7 +1192,7 @@ def load_invoice_detail(db_path, invoice_id):
         has_items = _has_table(cur, "invoice_items")
         has_item_cols = False
         if has_items:
-            item_cols = ["barcode", "name", "quantity", "price"]
+            item_cols = ["invoice_id", "barcode", "name", "quantity", "price"]
             has_item_cols = all(
                 _has_column(cur, "invoice_items", c) for c in item_cols)
         if has_items and has_item_cols:

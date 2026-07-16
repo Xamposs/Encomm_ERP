@@ -15,10 +15,11 @@ from qt_app import styles
 from qt_app.data_source import (
     load_invoices_page, load_invoice_detail,
     InvoicePageResult, InvoiceDetailResult,
+    InvoiceDetail,
 )
 
 
-class _InvoiceWorker(QObject):
+class _ListWorker(QObject):
     finished = Signal(InvoicePageResult)
 
     def __init__(self, db_path, search_text, date_from, date_to,
@@ -28,6 +29,18 @@ class _InvoiceWorker(QObject):
 
     def run(self):
         self.finished.emit(load_invoices_page(*self._args))
+
+
+class _DetailWorker(QObject):
+    finished = Signal(InvoiceDetailResult)
+
+    def __init__(self, db_path, inv_id, parent=None):
+        super().__init__(parent)
+        self._db = db_path
+        self._id = inv_id
+
+    def run(self):
+        self.finished.emit(load_invoice_detail(self._db, self._id))
 
 
 class InvoiceHistoryPage(BasePage):
@@ -49,6 +62,7 @@ class InvoiceHistoryPage(BasePage):
         self._close_pending = False
         self._page = 1
         self._page_size = 50
+        self._mode = "list"  # "list" | "detail" — single worker/thread slot
         super().__init__(db_service, config, parent)
 
     def build_ui(self):
@@ -168,12 +182,14 @@ class InvoiceHistoryPage(BasePage):
     def _do_refresh(self):
         if self._loading:
             return
+        self._mode = "list"
         self._loading = True
         self._refresh_btn.setEnabled(False)
+        self._detail_btn.setEnabled(False)
         self._set_state("🔄 Φόρτωση παραστατικών...", styles.TEXT_MUTED)
         self._cleanup_worker()
         self._thread = QThread(self)
-        self._worker = _InvoiceWorker(
+        self._worker = _ListWorker(
             self._db_path, self._search.text().strip(),
             self._date_from.text().strip(), self._date_to.text().strip(),
             self._page, self._page_size)
@@ -189,6 +205,10 @@ class InvoiceHistoryPage(BasePage):
     def _on_ready(self, result):
         if self._close_pending:
             return
+        if self._mode == "detail":
+            self._on_detail_ready(result)
+            return
+        # List result
         if not result.ok:
             self._set_state(result.error_message, styles.RED)
             self._table.setRowCount(0)
@@ -221,8 +241,15 @@ class InvoiceHistoryPage(BasePage):
         self._prev_btn.setEnabled(result.page > 1)
         self._next_btn.setEnabled(result.page < tp)
 
+    def _on_detail_ready(self, result: InvoiceDetailResult):
+        if not result.ok:
+            QMessageBox.warning(self, "Σφάλμα", result.error_message)
+            return
+        self._show_detail_dialog(result.invoice)
+
     def _on_done(self):
         self._loading = False
+        self._mode = "list"
         self._refresh_btn.setEnabled(True)
         self._worker = None
         self._thread = None
@@ -231,6 +258,8 @@ class InvoiceHistoryPage(BasePage):
             self.shutdown_ready.emit()
 
     def _show_detail(self):
+        if self._loading:
+            return
         rows = {it.row() for it in self._table.selectedItems()}
         if len(rows) != 1:
             return
@@ -239,11 +268,21 @@ class InvoiceHistoryPage(BasePage):
         if not inv_id:
             QMessageBox.warning(self, "Σφάλμα", "Αδυναμία εύρεσης παραστατικού.")
             return
-        detail = load_invoice_detail(self._db_path, inv_id)
-        if not detail.ok:
-            QMessageBox.warning(self, "Σφάλμα", detail.error_message)
-            return
-        self._show_detail_dialog(detail.invoice)
+        self._mode = "detail"
+        self._loading = True
+        self._refresh_btn.setEnabled(False)
+        self._detail_btn.setEnabled(False)
+        self._cleanup_worker()
+        self._thread = QThread(self)
+        self._worker = _DetailWorker(self._db_path, inv_id)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_ready)
+        self._worker.finished.connect(self._thread.quit)
+        self._thread.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._on_done)
+        self._thread.start()
 
     def _show_detail_dialog(self, inv):
         dlg = QDialog(self)

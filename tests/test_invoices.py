@@ -141,3 +141,50 @@ class TestInvoiceDetail:
                      "ALTER ", "CREATE TABLE", "REPLACE "]
         for pat in patterns:
             assert pat not in src.upper(), f"Forbidden '{pat}'"
+
+    def test_detail_customer_name_present(self, tmp_path):
+        """Linked customer name appears in detail when compatible."""
+        db = str(tmp_path / "t.db")
+        _make_db(db)
+        r = load_invoice_detail(db, "INV1")
+        assert r.ok
+        assert r.invoice.customer_name == "Γεώργιος Παπαδόπουλος"
+
+    def test_incompatible_customers_table(self, tmp_path):
+        """Customers table missing id/name → '—' in list and detail."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE invoices (id TEXT, invoice_date TEXT, subtotal REAL,
+                                   vat_amount REAL, grand_total REAL,
+                                   customer_id INTEGER);
+            INSERT INTO invoices VALUES ('X','2026-01-01',10,1.5,11.5,NULL);
+            CREATE TABLE customers (other_id INTEGER PRIMARY KEY, label TEXT);
+            INSERT INTO customers VALUES (1, 'Ghost');
+        """)
+        conn.commit()
+        conn.close()
+        rl = load_invoices_page(db)
+        assert rl.ok
+        assert rl.items[0].customer_name == "—"
+        rd = load_invoice_detail(db, "X")
+        assert rd.ok
+        assert rd.invoice.customer_name == "—"
+
+    def test_items_missing_invoice_id_col(self, tmp_path):
+        """invoice_items without invoice_id → header succeeds, empty items."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE invoices (id TEXT, invoice_date TEXT, subtotal REAL,
+                                   vat_amount REAL, grand_total REAL);
+            INSERT INTO invoices VALUES ('X','2026-01-01',10,1.5,11.5);
+            CREATE TABLE invoice_items (id INTEGER, barcode TEXT, name TEXT,
+                                        quantity INTEGER, price REAL);
+            INSERT INTO invoice_items VALUES (1, 'A', 'Test', 1, 10.0);
+        """)
+        conn.commit()
+        conn.close()
+        rd = load_invoice_detail(db, "X")
+        assert rd.ok
+        assert len(rd.invoice.items) == 0
