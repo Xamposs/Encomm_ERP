@@ -50,6 +50,23 @@ class TestHeaderMapping:
         assert not r.ok
         assert "μοναδική" in r.error_message
 
+    def test_explicit_mapping(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        _write_xlsx(p, ["ColA", "ColB", "ColC", "ColD", "ColE"],
+                     [["5200000000001", "Test", 10, 5.0, ""]])
+        r = preview_product_import_xlsx(p, ImportColumnMapping(
+            "ColA", "ColB", "ColC", "ColD", "ColE"))
+        assert r.ok
+        assert r.valid_rows == 1
+
+    def test_missing_mapped_column(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price"],
+                     [["A", "T", 1, 1.0]])
+        r = preview_product_import_xlsx(p, M)
+        assert not r.ok
+        assert "στήλη" in r.error_message
+
 
 class TestValidation:
 
@@ -73,10 +90,31 @@ class TestValidation:
     def test_numeric_barcode_15_digit_limit(self, tmp_path):
         p = str(tmp_path / "t.xlsx")
         _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
-                     [[1234567890123456, "T", 1, 1.0, ""]])  # 16 digits
+                     [[1234567890123456, "T", 1, 1.0, ""]])
         r = preview_product_import_xlsx(p, M)
         assert r.invalid_rows == 1
         assert "15" in r.errors[0].message
+
+    def test_bool_barcode_rejected(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+                     [[True, "T", 1, 1.0, ""]])
+        r = preview_product_import_xlsx(p, M)
+        assert r.invalid_rows == 1
+
+    def test_nan_barcode_rejected(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+                     [[float("nan"), "T", 1, 1.0, ""]])
+        r = preview_product_import_xlsx(p, M)
+        assert r.invalid_rows == 1
+
+    def test_inf_barcode_rejected(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+                     [[float("inf"), "T", 1, 1.0, ""]])
+        r = preview_product_import_xlsx(p, M)
+        assert r.invalid_rows == 1
 
     def test_stock_float_rejected(self, tmp_path):
         p = str(tmp_path / "t.xlsx")
@@ -85,6 +123,37 @@ class TestValidation:
         r = preview_product_import_xlsx(p, M)
         assert r.invalid_rows == 1
         assert "ακέραιο" in r.errors[0].message
+
+    def test_nan_stock_rejected(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+                     [["A", "T", float("nan"), 1.0, ""]])
+        r = preview_product_import_xlsx(p, M)
+        assert r.invalid_rows == 1
+
+    def test_inf_stock_rejected(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+                     [["A", "T", float("inf"), 1.0, ""]])
+        r = preview_product_import_xlsx(p, M)
+        assert r.invalid_rows == 1
+
+    def test_blank_expiry(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+                     [["A", "T", 1, 1.0, None]])
+        r = preview_product_import_xlsx(p, M)
+        assert r.ok
+        assert r.sample_rows[0][4] == ""
+
+    def test_date_expiry(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        from datetime import date
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+                     [["A", "T", 1, 1.0, date(2027, 12, 31)]])
+        r = preview_product_import_xlsx(p, M)
+        assert r.ok
+        assert r.sample_rows[0][4] == "2027-12-31"
 
     def test_price_not_rounded(self, tmp_path):
         p = str(tmp_path / "t.xlsx")

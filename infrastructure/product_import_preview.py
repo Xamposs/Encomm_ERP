@@ -268,10 +268,17 @@ def preview_product_import_xlsx(
             # --- barcode ---
             if barcode is None:
                 barcode_str = ""
+            elif isinstance(barcode, bool):
+                row_errors.append("Μη έγκυρο barcode (boolean).")
+                barcode_str = ""
             elif isinstance(barcode, str):
                 barcode_str = barcode.strip()
             elif isinstance(barcode, (int, float)):
-                if isinstance(barcode, float) and barcode != int(barcode):
+                from math import isfinite as _isf
+                if not _isf(barcode):
+                    row_errors.append("Μη έγκυρο barcode (NaN/Inf).")
+                    barcode_str = ""
+                elif isinstance(barcode, float) and barcode != int(barcode):
                     row_errors.append(
                         "Μη έγκυρο barcode (δεκαδικός). "
                         "Μορφοποιήστε τη στήλη ως Κείμενο στο Excel.")
@@ -310,7 +317,10 @@ def preview_product_import_xlsx(
                 else:
                     stock = stock_raw
             elif isinstance(stock_raw, float):
-                if stock_raw != int(stock_raw):
+                from math import isfinite as _isf
+                if not _isf(stock_raw):
+                    row_errors.append("Μη έγκυρο απόθεμα (NaN/Inf).")
+                elif stock_raw != int(stock_raw):
                     row_errors.append(
                         f"Το απόθεμα δεν είναι ακέραιο ({stock_raw}).")
                 else:
