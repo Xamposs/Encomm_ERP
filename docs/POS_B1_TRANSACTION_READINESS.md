@@ -245,7 +245,7 @@ The following transaction must execute inside **one** `BEGIN IMMEDIATE` / `COMMI
 | 4 | **Customer selection** | LOW | The current POS has no customer picker. Sales can be anonymous (customer_id=NULL) for Phase B2. |
 | 5 | **Payment method** | N/A for B2 | No payment table exists. Deferred until payment integration (Phase C+). |
 | 6 | **Receipt numbering** | N/A for B2 | Invoice ID can serve as receipt number for now. |
-|| 7 | **AADE / ΗΔΙΚΑ integration** | N/A for B2 | Deferred from Phase B2; planned for a later dedicated integration phase. No integration contract is implemented or approved yet. |
+| 7 | **AADE / ΗΔΙΚΑ integration** | N/A for B2 | Deferred from Phase B2; planned for a later dedicated integration phase. No integration contract is implemented or approved yet. |
 | 8 | **Cancellation / returns** | N/A for B2 | No return/credit-note schema or logic exists. Deferred. |
 | 9 | **VAT rate configurability** | MEDIUM | `process_checkout_transaction` takes `vat_rate` as parameter. A Qt sale command must do the same — read from config or SystemConfig. The appropriate VAT rate must be decided outside this implementation task. |
 | 10 | **Price changes between preflight and checkout** | DESIGN | The preflight uses `_connect_ro()` and the checkout uses a write connection. There is a TOCTOU window. Must re-read stock/price **inside the write transaction** (the atomic-sale contract already accounts for this). |
