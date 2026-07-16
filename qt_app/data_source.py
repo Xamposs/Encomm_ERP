@@ -732,9 +732,12 @@ def load_customers_page(db_path, search_text="", page=1, page_size=50):
 
         has_inv = _has_table(cur, "invoices")
         has_cid = has_inv and _has_column(cur, "invoices", "customer_id")
-        amka_col = _optional_col(cur, "customers", "amka", "'' AS amka")
-        phone_col = _optional_col(cur, "customers", "phone", "'' AS phone")
-        has_phone = phone_col != "''"
+        has_amka = _has_column(cur, "customers", "amka")
+        has_phone = _has_column(cur, "customers", "phone")
+        amka_search = "c.amka" if has_amka else "''"
+        phone_search = "c.phone" if has_phone else "''"
+        amka_sel = "c.amka" if has_amka else "'' AS amka"
+        phone_sel = "c.phone" if has_phone else "'' AS phone"
 
         conditions, params = [], []
         if search_text:
@@ -742,10 +745,10 @@ def load_customers_page(db_path, search_text="", page=1, page_size=50):
             esc = _escape_like(norm)
             clauses = [f"search_normalize(c.name) LIKE ? ESCAPE '\\'"]
             params.append(f"%{esc}%")
-            clauses.append(f"search_normalize(COALESCE({amka_col},'')) LIKE ? ESCAPE '\\'")
+            clauses.append(f"search_normalize(COALESCE({amka_search},'')) LIKE ? ESCAPE '\\'")
             params.append(f"%{esc}%")
             if has_phone:
-                clauses.append(f"search_normalize(COALESCE({phone_col},'')) LIKE ? ESCAPE '\\'")
+                clauses.append(f"search_normalize(COALESCE({phone_search},'')) LIKE ? ESCAPE '\\'")
                 params.append(f"%{esc}%")
             conditions.append("(" + " OR ".join(clauses) + ")")
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
@@ -762,7 +765,7 @@ def load_customers_page(db_path, search_text="", page=1, page_size=50):
         offset = (page - 1) * page_size
 
         cur.execute(f"""
-            SELECT c.id, c.name, {amka_col}, {phone_col},
+            SELECT c.id, c.name, {amka_sel}, {phone_sel},
                    {inv_cnt} AS ic, {inv_sum} AS ts
             FROM customers c{where} ORDER BY c.name ASC LIMIT ? OFFSET ?
         """, params + [page_size, offset])
@@ -790,14 +793,16 @@ def load_customer_detail(db_path, customer_id):
 
         has_inv = _has_table(cur, "invoices")
         has_cid = has_inv and _has_column(cur, "invoices", "customer_id")
-        amka_col = _optional_col(cur, "customers", "amka", "'' AS amka")
-        phone_col = _optional_col(cur, "customers", "phone", "'' AS phone")
+        has_amka = _has_column(cur, "customers", "amka")
+        has_phone = _has_column(cur, "customers", "phone")
+        amka_sel = "c.amka" if has_amka else "'' AS amka"
+        phone_sel = "c.phone" if has_phone else "'' AS phone"
         inv_cnt = ("(SELECT COUNT(*) FROM invoices i WHERE i.customer_id=c.id)" if has_cid else "0")
         inv_sum = ("(SELECT COALESCE(SUM(grand_total),0) FROM invoices i WHERE i.customer_id=c.id)" if has_cid else "0")
         latest_date = ("(SELECT MAX(invoice_date) FROM invoices i WHERE i.customer_id=c.id)" if has_cid else "''")
 
         cur.execute(f"""
-            SELECT c.id, c.name, {amka_col}, {phone_col},
+            SELECT c.id, c.name, {amka_sel}, {phone_sel},
                    {inv_cnt}, {inv_sum}, {latest_date}
             FROM customers c WHERE c.id=?
         """, (customer_id,))

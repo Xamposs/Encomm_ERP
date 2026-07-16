@@ -162,3 +162,28 @@ class TestCustomers:
                      "ALTER ", "CREATE TABLE", "REPLACE "]
         for pat in patterns:
             assert pat not in src.upper(), f"Forbidden '{pat}' in customer source"
+
+    def test_id_name_only_schema_all_searches_work(self, tmp_path):
+        """customers(id, name) only — no amka, no phone. All searches succeed."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO customers (name) VALUES ('TestName')")
+        conn.commit()
+        conn.close()
+        # Empty search
+        r1 = load_customers_page(db)
+        assert r1.ok, r1.error_message
+        assert r1.total == 1
+        # Name search
+        r2 = load_customers_page(db, search_text="Test")
+        assert r2.ok, r2.error_message
+        assert r2.total == 1
+        # AMKA-like search → empty OK, no error
+        r3 = load_customers_page(db, search_text="010180")
+        assert r3.ok, r3.error_message
+        assert r3.total == 0
+        # Phone-like search → empty OK, no error
+        r4 = load_customers_page(db, search_text="6970000")
+        assert r4.ok, r4.error_message
+        assert r4.total == 0
