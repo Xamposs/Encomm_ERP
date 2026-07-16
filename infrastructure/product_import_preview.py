@@ -53,6 +53,7 @@ class ProductImportPreview:
     sample_rows: Tuple[Tuple[str, str, int, float, str], ...] = ()
     errors: Tuple[ImportRowError, ...] = ()
     error_message: str = ""
+    cancelled: bool = False
 
     @classmethod
     def success(cls, file_name, sheet_name, scanned, valid, invalid, dupes,
@@ -140,14 +141,41 @@ def suggest_mapping(file_path: str, sheet_name: str | None = None
     )
 
 
+def _partial_result(
+    ok, cancelled, msg, file_name, sheet_name, scanned, valid, invalid,
+    dupes, headers, mapping, samples, errors,
+) -> ProductImportPreview:
+    return ProductImportPreview(
+        ok=ok, cancelled=cancelled, error_message=msg,
+        file_name=file_name, sheet_name=sheet_name,
+        scanned_rows=scanned, valid_rows=valid,
+        invalid_rows=invalid, duplicate_barcodes=dupes,
+        headers=headers, detected_mapping=mapping,
+        sample_rows=tuple(samples), errors=tuple(errors),
+    )
+
+
 def preview_product_import_xlsx(
     file_path: str,
     mapping: ImportColumnMapping,
     sheet_name: str | None = None,
     cancel_event=None,
+    max_rows: int = 250_000,
 ) -> ProductImportPreview:
     MAX_ERRORS = 200
     MAX_SAMPLES = 20
+
+    # ── Mapping validation ──
+    map_cols = [
+        mapping.barcode_column, mapping.name_column,
+        mapping.stock_column, mapping.price_column,
+        mapping.expiry_date_column,
+    ]
+    if len(set(map_cols)) != 5:
+        return ProductImportPreview.failure(
+            file_path, sheet_name or "—",
+            "Κάθε στήλη αντιστοίχισης πρέπει να είναι μοναδική. "
+            "Δεν επιτρέπεται η ίδια στήλη για δύο διαφορετικά πεδία.")
 
     wb = None
     try:
@@ -173,6 +201,11 @@ def preview_product_import_xlsx(
         dupes = 0
         cancelled = False
 
+        def _add_error(ri, code, msg):
+            nonlocal errors
+            if len(errors) < MAX_ERRORS:
+                errors.append(ImportRowError(ri, "", code, msg))
+
         for row_idx, row in enumerate(
             ws.iter_rows(min_row=1, values_only=True), start=1
         ):
@@ -183,6 +216,13 @@ def preview_product_import_xlsx(
             if row_idx == 1:
                 headers = tuple(
                     str(c).strip() if c is not None else "" for c in row)
+                # Check for duplicate header names
+                if len(set(headers)) != len(headers):
+                    wb.close()
+                    return ProductImportPreview.failure(
+                        file_path, sheet_name,
+                        "Η κεφαλίδα περιέχει διπλότυπα ονόματα στηλών. "
+                        "Κάθε στήλη πρέπει να έχει μοναδικό όνομα.")
                 for key, col_name in [
                     ("barcode", mapping.barcode_column),
                     ("name", mapping.name_column),
@@ -200,12 +240,18 @@ def preview_product_import_xlsx(
                             f"Διαθέσιμες στήλες: {', '.join(headers)}")
                 continue
 
+            if scanned >= max_rows:
+                _add_error(row_idx, "ROWS",
+                           f"Υπέρβαση ορίου {max_rows:,} γραμμών.")
+                ok_result = _partial_result(
+                    False, False,
+                    f"Υπέρβαση ορίου {max_rows:,} γραμμών.",
+                    file_path, sheet_name, scanned, valid, invalid,
+                    dupes, headers, mapping, samples, errors)
+                wb.close()
+                return ok_result
+
             scanned += 1
-            if scanned > 100_000:
-                errors.append(ImportRowError(
-                    row_idx, "", "ROWS",
-                    "Υπέρβαση ορίου 100.000 γραμμών — η προεπισκόπηση διακόπηκε."))
-                break
 
             def _col(key):
                 idx = col_map[key]
@@ -222,14 +268,21 @@ def preview_product_import_xlsx(
             # --- barcode ---
             if barcode is None:
                 barcode_str = ""
+            elif isinstance(barcode, str):
+                barcode_str = barcode.strip()
             elif isinstance(barcode, (int, float)):
                 if isinstance(barcode, float) and barcode != int(barcode):
-                    row_errors.append("Μη έγκυρο barcode (δεκαδικός αριθμός).")
+                    row_errors.append(
+                        "Μη έγκυρο barcode (δεκαδικός). "
+                        "Μορφοποιήστε τη στήλη ως Κείμενο στο Excel.")
                     barcode_str = ""
                 else:
                     barcode_str = str(int(barcode))
-            elif isinstance(barcode, str):
-                barcode_str = barcode.strip()
+                    if len(barcode_str) > 15:
+                        row_errors.append(
+                            "Το barcode υπερβαίνει τα 15 ψηφία. "
+                            "Μορφοποιήστε τη στήλη ως Κείμενο στο Excel.")
+                        barcode_str = ""
             else:
                 row_errors.append("Μη έγκυρος τύπος barcode.")
                 barcode_str = ""
@@ -251,12 +304,21 @@ def preview_product_import_xlsx(
             stock: int | None = None
             if isinstance(stock_raw, bool) or stock_raw is None:
                 row_errors.append("Το απόθεμα είναι κενό ή μη έγκυρο.")
-            elif isinstance(stock_raw, (int, float)):
-                s = int(stock_raw)
-                if s < 0:
+            elif isinstance(stock_raw, int):
+                if stock_raw < 0:
                     row_errors.append("Το απόθεμα είναι αρνητικό.")
                 else:
-                    stock = s
+                    stock = stock_raw
+            elif isinstance(stock_raw, float):
+                if stock_raw != int(stock_raw):
+                    row_errors.append(
+                        f"Το απόθεμα δεν είναι ακέραιο ({stock_raw}).")
+                else:
+                    s = int(stock_raw)
+                    if s < 0:
+                        row_errors.append("Το απόθεμα είναι αρνητικό.")
+                    else:
+                        stock = s
             else:
                 row_errors.append("Μη έγκυρος τύπος αποθέματος.")
 
@@ -268,9 +330,10 @@ def preview_product_import_xlsx(
                 p = float(price_raw)
                 from math import isfinite
                 if p < 0 or not isfinite(p):
-                    row_errors.append("Η τιμή είναι αρνητική ή μη πεπερασμένη.")
+                    row_errors.append(
+                        "Η τιμή είναι αρνητική ή μη πεπερασμένη.")
                 else:
-                    price = round(p, 2)
+                    price = p  # preserve exact source value
             else:
                 row_errors.append("Μη έγκυρος τύπος τιμής.")
 
@@ -282,8 +345,6 @@ def preview_product_import_xlsx(
                 expiry_str = expiry_raw.strftime("%Y-%m-%d")
             elif isinstance(expiry_raw, str):
                 expiry_str = expiry_raw.strip()
-                if expiry_str != expiry_str:
-                    import re
                 if not _is_iso_date(expiry_str):
                     row_errors.append(
                         f"Μη έγκυρη ημερομηνία λήξης: '{expiry_str}'. "
@@ -315,6 +376,12 @@ def preview_product_import_xlsx(
             if len(samples) < MAX_SAMPLES:
                 samples.append(
                     (barcode_str, name_str, stock, price, expiry_str))  # type: ignore[arg-type]
+
+        if cancelled:
+            return _partial_result(
+                False, True, "Η προεπισκόπηση ακυρώθηκε.",
+                file_path, sheet_name, scanned, valid, invalid,
+                dupes, headers, mapping, samples, errors)
 
         return ProductImportPreview.success(
             file_path, sheet_name, scanned, valid, invalid, dupes,

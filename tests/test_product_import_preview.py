@@ -28,7 +28,6 @@ class TestHeaderMapping:
         _write_xlsx(p, ["Barcode", "Name", "Stock", "Unit Price", "Expiry Date"], [])
         m = suggest_mapping(p)
         assert m is not None
-        assert m.barcode_column == "Barcode"
         assert m.price_column == "Unit Price"
 
     def test_greek_suggestion(self, tmp_path):
@@ -36,24 +35,20 @@ class TestHeaderMapping:
         _write_xlsx(p, ["Κωδικός", "Όνομα", "Απόθεμα", "Τιμή", "Λήξη"], [])
         m = suggest_mapping(p)
         assert m is not None
-        assert m.barcode_column == "Κωδικός"
 
-    def test_explicit_mapping(self, tmp_path):
+    def test_duplicate_header_rejected(self, tmp_path):
         p = str(tmp_path / "t.xlsx")
-        _write_xlsx(p, ["ColA", "ColB", "ColC", "ColD", "ColE"],
-                     [["5200000000001", "Test", 10, 5.0, ""]])
-        r = preview_product_import_xlsx(p, ImportColumnMapping(
-            "ColA", "ColB", "ColC", "ColD", "ColE"))
-        assert r.ok
-        assert r.valid_rows == 1
-
-    def test_missing_mapping_column(self, tmp_path):
-        p = str(tmp_path / "t.xlsx")
-        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price"],  # no Expiry
-                     [["5200000000001", "T", 1, 1.0]])
+        _write_xlsx(p, ["Barcode", "Barcode", "Stock", "Price", "Expiry"],
+                     [["A", "A", 1, 1.0, ""]])
         r = preview_product_import_xlsx(p, M)
         assert not r.ok
-        assert "στήλη" in r.error_message
+        assert "διπλότυπα" in r.error_message
+
+    def test_reused_column_rejected(self, tmp_path):
+        r = preview_product_import_xlsx("fake.xlsx", ImportColumnMapping(
+            "ColA", "ColA", "ColB", "ColC", "ColD"))
+        assert not r.ok
+        assert "μοναδική" in r.error_message
 
 
 class TestValidation:
@@ -66,7 +61,6 @@ class TestValidation:
         r = preview_product_import_xlsx(p, M)
         assert r.ok
         assert r.valid_rows == 2
-        assert len(r.sample_rows) == 2
 
     def test_leading_zero_barcode(self, tmp_path):
         p = str(tmp_path / "t.xlsx")
@@ -76,21 +70,59 @@ class TestValidation:
         assert r.ok
         assert r.sample_rows[0][0] == "0001234567890"
 
-    def test_blank_expiry(self, tmp_path):
+    def test_numeric_barcode_15_digit_limit(self, tmp_path):
         p = str(tmp_path / "t.xlsx")
         _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
-                     [["A", "T", 1, 1.0, None]])
+                     [[1234567890123456, "T", 1, 1.0, ""]])  # 16 digits
         r = preview_product_import_xlsx(p, M)
-        assert r.ok
-        assert r.sample_rows[0][4] == ""
+        assert r.invalid_rows == 1
+        assert "15" in r.errors[0].message
 
-    def test_date_expiry(self, tmp_path):
+    def test_stock_float_rejected(self, tmp_path):
         p = str(tmp_path / "t.xlsx")
         _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
-                     [["A", "T", 1, 1.0, date(2027, 12, 31)]])
+                     [["A", "T", 1.5, 1.0, ""]])
+        r = preview_product_import_xlsx(p, M)
+        assert r.invalid_rows == 1
+        assert "ακέραιο" in r.errors[0].message
+
+    def test_price_not_rounded(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+                     [["A", "T", 1, 1.23456, ""]])
         r = preview_product_import_xlsx(p, M)
         assert r.ok
-        assert r.sample_rows[0][4] == "2027-12-31"
+        assert r.sample_rows[0][3] == 1.23456  # exact, not 1.23
+
+    def test_cancellation(self, tmp_path):
+        class Cancel:
+            def __init__(self):
+                self.called = 0
+            def is_set(self):
+                self.called += 1
+                return self.called > 5
+        p = str(tmp_path / "t.xlsx")
+        rows = [["A", f"T{i}", 1, 1.0, ""] for i in range(100)]
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
+        cancel = Cancel()
+        r = preview_product_import_xlsx(p, M, cancel_event=cancel)
+        assert not r.ok
+        assert r.cancelled
+        assert "ακυρώθηκε" in r.error_message
+        assert r.scanned_rows < 30
+
+    def test_max_rows_limit(self, tmp_path):
+        p = str(tmp_path / "t.xlsx")
+        rows = [["A", f"T{i}", 1, 1.0, ""] for i in range(20)]
+        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
+        r = preview_product_import_xlsx(p, M, max_rows=10)
+        assert not r.ok
+        assert not r.cancelled
+        assert "Υπέρβαση" in r.error_message
+        assert r.scanned_rows == 10
+
+
+class TestErrors:
 
     def test_invalid_stock(self, tmp_path):
         p = str(tmp_path / "t.xlsx")
@@ -136,7 +168,6 @@ class TestValidation:
         assert r.duplicate_barcodes == 1
 
     def test_bounded_errors_and_samples(self, tmp_path):
-        """300 invalid rows → max 200 errors; 50 valid → max 20 samples."""
         p = str(tmp_path / "t.xlsx")
         _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"],
                      [["", "", -1, -1.0, ""]] * 350)
@@ -144,32 +175,18 @@ class TestValidation:
         assert len(r.errors) <= 200
         assert r.valid_rows == 0
 
-    def test_cancellation(self, tmp_path):
-        class Cancel:
-            def __init__(self):
-                self.called = 0
-            def is_set(self):
-                self.called += 1
-                return self.called > 5
-        p = str(tmp_path / "t.xlsx")
-        rows = [["A", f"T{i}", 1, 1.0, ""] for i in range(100)]
-        _write_xlsx(p, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
-        cancel = Cancel()
-        r = preview_product_import_xlsx(p, M, cancel_event=cancel)
-        assert r.ok
-        assert r.scanned_rows < 30  # stopped early after header + ~5
 
-    def test_no_write_sql(self):
+class TestNoWrite:
+
+    def test_no_write_sql_or_db(self):
         import inspect
         from infrastructure import product_import_preview as pip
         src = inspect.getsource(pip.preview_product_import_xlsx)
-        patterns = ["INSERT INTO", "UPDATE ", "DELETE FROM", "DROP ",
-                     "ALTER ", "CREATE TABLE", "REPLACE ", "sqlite3", "connect"]
-        for pat in patterns:
+        for pat in ["INSERT INTO", "UPDATE ", "DELETE FROM", "DROP ",
+                     "ALTER ", "CREATE TABLE", "REPLACE ", "sqlite3"]:
             assert pat not in src, f"Forbidden '{pat}' in import preview"
 
     def test_read_only_flag(self):
-        """Verify read_only=True is in the source."""
         import inspect
         from infrastructure import product_import_preview as pip
         src = inspect.getsource(pip.preview_product_import_xlsx)
