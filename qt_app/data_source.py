@@ -659,3 +659,159 @@ def load_supplier_detail(db_path, supplier_id):
     finally:
         if conn:
             conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Customer data source (read-only)
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class CustomerSummary:
+    id: int
+    name: str
+    amka: str
+    phone: str
+    invoice_count: int
+    total_purchases: float
+
+
+@dataclass(frozen=True)
+class CustomerDetail:
+    id: int
+    name: str
+    amka: str
+    phone: str
+    invoice_count: int
+    total_purchases: float
+    latest_invoice_date: str
+
+
+@dataclass(frozen=True)
+class CustomerPageResult:
+    ok: bool
+    total: int = 0
+    page: int = 1
+    page_size: int = 50
+    items: Tuple[CustomerSummary, ...] = ()
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, total, page, page_size, items):
+        return cls(ok=True, total=total, page=page, page_size=page_size, items=items)
+
+    @classmethod
+    def failure(cls, msg):
+        return cls(ok=False, error_message=msg)
+
+
+@dataclass(frozen=True)
+class CustomerDetailResult:
+    ok: bool
+    customer: CustomerDetail | None = None
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, cus):
+        return cls(ok=True, customer=cus)
+
+    @classmethod
+    def failure(cls, msg):
+        return cls(ok=False, error_message=msg)
+
+
+def load_customers_page(db_path, search_text="", page=1, page_size=50):
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        conn.create_function("search_normalize", 1, _normalize_search, deterministic=True)
+        cur = conn.cursor()
+        if not _has_table(cur, "customers"):
+            return CustomerPageResult.failure("Ο πίνακας πελατών δεν υπάρχει.")
+
+        has_inv = _has_table(cur, "invoices")
+        has_cid = has_inv and _has_column(cur, "invoices", "customer_id")
+        amka_col = _optional_col(cur, "customers", "amka", "'' AS amka")
+        phone_col = _optional_col(cur, "customers", "phone", "'' AS phone")
+        has_phone = phone_col != "''"
+
+        conditions, params = [], []
+        if search_text:
+            norm = _normalize_search(search_text)
+            esc = _escape_like(norm)
+            clauses = [f"search_normalize(c.name) LIKE ? ESCAPE '\\'"]
+            params.append(f"%{esc}%")
+            clauses.append(f"search_normalize(COALESCE({amka_col},'')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{esc}%")
+            if has_phone:
+                clauses.append(f"search_normalize(COALESCE({phone_col},'')) LIKE ? ESCAPE '\\'")
+                params.append(f"%{esc}%")
+            conditions.append("(" + " OR ".join(clauses) + ")")
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        inv_cnt = "(SELECT COUNT(*) FROM invoices i WHERE i.customer_id=c.id)" if has_cid else "0"
+        inv_sum = ("(SELECT COALESCE(SUM(grand_total),0) FROM invoices i WHERE i.customer_id=c.id)" if has_cid else "0")
+
+        total = cur.execute(f"SELECT COUNT(*) FROM customers c{where}", params).fetchone()[0]
+        if total == 0:
+            page = 1
+        else:
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(page, total_pages))
+        offset = (page - 1) * page_size
+
+        cur.execute(f"""
+            SELECT c.id, c.name, {amka_col}, {phone_col},
+                   {inv_cnt} AS ic, {inv_sum} AS ts
+            FROM customers c{where} ORDER BY c.name ASC LIMIT ? OFFSET ?
+        """, params + [page_size, offset])
+        items = tuple(CustomerSummary(
+            id=r[0], name=r[1], amka=r[2] or "—", phone=r[3] or "—",
+            invoice_count=r[4] or 0, total_purchases=r[5] or 0.0)
+            for r in cur.fetchall())
+        return CustomerPageResult.success(total, page, page_size, items)
+    except (sqlite3.Error, FileNotFoundError) as e:
+        return CustomerPageResult.failure(f"Αδυναμία φόρτωσης πελατών: {e}")
+    except Exception as e:
+        return CustomerPageResult.failure(f"Αδυναμία φόρτωσης πελατών: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_customer_detail(db_path, customer_id):
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        cur = conn.cursor()
+        if not _has_table(cur, "customers"):
+            return CustomerDetailResult.failure("Ο πίνακας πελατών δεν υπάρχει.")
+
+        has_inv = _has_table(cur, "invoices")
+        has_cid = has_inv and _has_column(cur, "invoices", "customer_id")
+        amka_col = _optional_col(cur, "customers", "amka", "'' AS amka")
+        phone_col = _optional_col(cur, "customers", "phone", "'' AS phone")
+        inv_cnt = ("(SELECT COUNT(*) FROM invoices i WHERE i.customer_id=c.id)" if has_cid else "0")
+        inv_sum = ("(SELECT COALESCE(SUM(grand_total),0) FROM invoices i WHERE i.customer_id=c.id)" if has_cid else "0")
+        latest_date = ("(SELECT MAX(invoice_date) FROM invoices i WHERE i.customer_id=c.id)" if has_cid else "''")
+
+        cur.execute(f"""
+            SELECT c.id, c.name, {amka_col}, {phone_col},
+                   {inv_cnt}, {inv_sum}, {latest_date}
+            FROM customers c WHERE c.id=?
+        """, (customer_id,))
+        r = cur.fetchone()
+        if not r:
+            return CustomerDetailResult.failure(f"Ο πελάτης {customer_id} δεν βρέθηκε.")
+        return CustomerDetailResult.success(CustomerDetail(
+            id=r[0], name=r[1], amka=r[2] or "—", phone=r[3] or "—",
+            invoice_count=r[4] or 0, total_purchases=r[5] or 0.0,
+            latest_invoice_date=r[6] or "—"))
+    except (sqlite3.Error, FileNotFoundError) as e:
+        return CustomerDetailResult.failure(f"Αδυναμία φόρτωσης: {e}")
+    except Exception as e:
+        return CustomerDetailResult.failure(f"Αδυναμία φόρτωσης: {e}")
+    finally:
+        if conn:
+            conn.close()
