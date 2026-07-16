@@ -448,9 +448,13 @@ class InventoryPage(BasePage):
             QMessageBox.warning(self, "Σφάλμα", result.message)
 
     def _on_write_thread_done(self):
+        """Write worker finished.  Clear own state; defer shutdown signalling."""
         self._write_loading = False
         self._write_worker = None
         self._write_thread = None
+        if self._close_pending:
+            self._maybe_finish_shutdown()
+            return
         self._create_btn.setEnabled(True)
         self._refresh_btn.setEnabled(True)
 
@@ -539,14 +543,14 @@ class InventoryPage(BasePage):
         self._next_btn.setEnabled(snap.page < total_pages)
 
     def _on_thread_done(self):
+        """Read worker finished.  Clear own state; defer shutdown signalling."""
         self._loading = False
-        self._refresh_btn.setEnabled(True)
         self._worker = None
         self._thread = None
         if self._close_pending:
-            self._close_pending = False
-            self.shutdown_ready.emit()
+            self._maybe_finish_shutdown()
             return
+        self._refresh_btn.setEnabled(True)
         if self._pending_req:
             req = self._pending_req
             self._pending_req = None
@@ -556,6 +560,17 @@ class InventoryPage(BasePage):
             self._do_refresh()
 
     # ── Shutdown ─────────────────────────────────────────────────────
+    def _maybe_finish_shutdown(self):
+        """If close is pending and no worker is still running, emit
+        shutdown_ready exactly once."""
+        if not self._close_pending:
+            return
+        read_running = self._thread is not None and self._thread.isRunning()
+        write_running = self._write_thread is not None and self._write_thread.isRunning()
+        if not read_running and not write_running:
+            self._close_pending = False
+            self.shutdown_ready.emit()
+
     def _cleanup_worker(self):
         if self._thread and self._thread.isRunning():
             self._thread.quit()
@@ -571,8 +586,13 @@ class InventoryPage(BasePage):
         self._write_thread = None
 
     def shutdown(self) -> bool:
-        """Return True only when all active workers have stopped."""
+        """Return True only when ALL workers have stopped.
+
+        Preserves references on timeout — never clears a running QThread.
+        """
         all_stopped = True
+
+        # Attempt write worker shutdown
         if self._write_thread and self._write_thread.isRunning():
             try:
                 self._write_worker.finished.disconnect(self._on_write_done)
@@ -586,6 +606,8 @@ class InventoryPage(BasePage):
                 self._write_loading = False
             else:
                 all_stopped = False
+
+        # Attempt read worker shutdown
         if self._thread and self._thread.isRunning():
             try:
                 self._worker.finished.disconnect(self._on_data_ready)
@@ -599,6 +621,7 @@ class InventoryPage(BasePage):
                 self._loading = False
             else:
                 all_stopped = False
+
         if all_stopped:
             self._close_pending = False
         return all_stopped
