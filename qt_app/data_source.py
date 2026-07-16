@@ -445,3 +445,32 @@ def load_inventory_page(
     finally:
         if conn:
             conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Supplier choices (read-only)
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class SupplierChoice:
+    id: int
+    name: str
+
+
+def load_supplier_choices(db_path: str) -> Tuple[SupplierChoice, ...]:
+    """Return all suppliers (id, name) sorted alphabetically.
+
+    Graceful fallback to empty tuple when the suppliers table does not
+    exist or is unreadable.  Never writes.
+    """
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT id, name FROM suppliers ORDER BY name ASC")
+        return tuple(SupplierChoice(id=r[0], name=r[1]) for r in cur.fetchall())
+    except (sqlite3.Error, FileNotFoundError):
+        return ()
+    finally:
+        if conn:
+            conn.close()

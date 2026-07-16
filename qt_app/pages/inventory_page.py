@@ -1,27 +1,34 @@
-"""Inventory page — κατάλογος προϊόντων αποθήκης (read-only).
+"""Inventory page — κατάλογος προϊόντων αποθήκης (read + write).
 
-Uses the same QThread + typed-result pattern as DashboardPage.
+Uses QThread workers for both read (load_inventory_page) and write
+(create/update via inventory_command_service).
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer, QDate
 from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QFrame, QPushButton,
     QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QSizePolicy,
+    QHeaderView, QSizePolicy, QDialog, QFormLayout,
+    QSpinBox, QDoubleSpinBox, QDateEdit, QDialogButtonBox,
+    QMessageBox,
 )
 
 from qt_app.pages.base_page import BasePage
 from qt_app import styles
 from qt_app.data_source import (
-    load_inventory_page, InventoryResult,
+    load_inventory_page, InventoryResult, load_supplier_choices,
+    SupplierChoice,
+)
+from infrastructure.inventory_command_service import (
+    CreateProductRequest, UpdateProductRequest, ProductSnapshot,
+    CommandResult, create_product, update_product,
 )
 
 
 # ── Filters ────────────────────────────────────────────────────────────
-
 FILTERS = [
     ("all",         "Όλα"),
     ("low_stock",   "Χαμηλό Στοκ"),
@@ -33,22 +40,128 @@ FILTER_KEYS = [f[0] for f in FILTERS]
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# QThread worker
+# QThread workers
 # ═══════════════════════════════════════════════════════════════════════
 
 class _InventoryWorker(QObject):
     finished = Signal(InventoryResult)
-
-    def __init__(self, db_path: str, search_text: str, status_filter: str,
-                 threshold: int, alert_days: int,
-                 page: int, page_size: int, parent=None):
+    def __init__(self, db_path, search_text, status_filter,
+                 threshold, alert_days, page, page_size, parent=None):
         super().__init__(parent)
         self._args = (db_path, search_text, status_filter, threshold,
                        alert_days, page, page_size)
+    def run(self):
+        self.finished.emit(load_inventory_page(*self._args))
 
-    def run(self) -> None:
-        result = load_inventory_page(*self._args)
-        self.finished.emit(result)
+
+class _WriteWorker(QObject):
+    finished = Signal(CommandResult)
+    def __init__(self, db_path, fn, req, parent=None):
+        super().__init__(parent)
+        self._db_path = db_path
+        self._fn = fn
+        self._req = req
+    def run(self):
+        self.finished.emit(self._fn(self._db_path, self._req))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Product dialog (create / edit)
+# ═══════════════════════════════════════════════════════════════════════
+
+class ProductDialog(QDialog):
+    """Reusable Greek product form — no VAT fields."""
+
+    def __init__(self, db_path: str, parent=None,
+                 existing: dict | None = None):
+        super().__init__(parent)
+        self._db_path = db_path
+        self._existing = existing
+        self.setWindowTitle(
+            "Επεξεργασία Προϊόντος" if existing else "Νέο Προϊόν")
+        self.setMinimumWidth(450)
+
+        lay = QFormLayout(self)
+
+        # Barcode
+        self._barcode_edit = QLineEdit()
+        if existing:
+            self._barcode_edit.setText(existing["barcode"])
+            self._barcode_edit.setReadOnly(True)
+            self._barcode_edit.setStyleSheet(
+                f"color: {styles.TEXT_MUTED};")
+        self._barcode_edit.setPlaceholderText("π.χ. 5201234567890")
+        lay.addRow("Barcode:", self._barcode_edit)
+
+        # Name
+        self._name_edit = QLineEdit()
+        if existing:
+            self._name_edit.setText(existing["name"])
+        self._name_edit.setPlaceholderText("π.χ. DEPON 500mg")
+        lay.addRow("Όνομα Προϊόντος:", self._name_edit)
+
+        # Stock
+        self._stock_spin = QSpinBox()
+        self._stock_spin.setRange(0, 999999)
+        if existing:
+            self._stock_spin.setValue(existing["stock"])
+        lay.addRow("Απόθεμα:", self._stock_spin)
+
+        # Expiry date
+        self._expiry_edit = QDateEdit()
+        self._expiry_edit.setCalendarPopup(True)
+        self._expiry_edit.setDisplayFormat("yyyy-MM-dd")
+        if existing:
+            self._expiry_edit.setDate(
+                QDate.fromString(existing["expiry_date"], "yyyy-MM-dd"))
+        lay.addRow("Ημ. Λήξης:", self._expiry_edit)
+
+        # Price
+        self._price_spin = QDoubleSpinBox()
+        self._price_spin.setRange(0, 999999.99)
+        self._price_spin.setDecimals(2)
+        self._price_spin.setPrefix("€ ")
+        if existing:
+            self._price_spin.setValue(existing["price"])
+        lay.addRow("Τιμή (€):", self._price_spin)
+
+        # Supplier
+        self._supplier_combo = QComboBox()
+        self._supplier_combo.addItem("—", None)
+        for sc in load_supplier_choices(db_path):
+            self._supplier_combo.addItem(sc.name, sc.id)
+        if existing and existing.get("supplier_id"):
+            for i in range(self._supplier_combo.count()):
+                if self._supplier_combo.itemData(i) == existing["supplier_id"]:
+                    self._supplier_combo.setCurrentIndex(i)
+                    break
+        lay.addRow("Προμηθευτής:", self._supplier_combo)
+
+        # Buttons
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._validate_and_accept)
+        btns.rejected.connect(self.reject)
+        lay.addRow(btns)
+
+    def _validate_and_accept(self):
+        if not self._barcode_edit.text().strip():
+            QMessageBox.warning(self, "Σφάλμα", "Το barcode είναι υποχρεωτικό.")
+            return
+        if not self._name_edit.text().strip():
+            QMessageBox.warning(self, "Σφάλμα", "Το όνομα είναι υποχρεωτικό.")
+            return
+        self.accept()
+
+    def get_data(self) -> dict:
+        return {
+            "barcode": self._barcode_edit.text().strip(),
+            "name": self._name_edit.text().strip(),
+            "stock": self._stock_spin.value(),
+            "expiry_date": self._expiry_edit.date().toString("yyyy-MM-dd"),
+            "price": self._price_spin.value(),
+            "supplier_id": self._supplier_combo.currentData(),
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -71,15 +184,18 @@ class InventoryPage(BasePage):
         db_path = (config.get("db_path", "encomm_erp.db")
                    if config else "encomm_erp.db")
         self._db_path = db_path
-        self._worker: _InventoryWorker | None = None
-        self._thread: QThread | None = None
+        self._worker = None
+        self._thread = None
         self._loading = False
         self._close_pending = False
         self._page = 1
         self._page_size = 50
         self._search_text = ""
         self._status_filter = "all"
-        self._pending_req: dict | None = None
+        self._pending_req = None
+        self._write_worker = None
+        self._write_thread = None
+        self._write_loading = False
         super().__init__(db_service, config, parent)
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
@@ -93,8 +209,7 @@ class InventoryPage(BasePage):
         toolbar.setSpacing(8)
 
         self._search_entry = QLineEdit()
-        self._search_entry.setPlaceholderText(
-            "Αναζήτηση barcode ή ονόματος…")
+        self._search_entry.setPlaceholderText("Αναζήτηση barcode ή ονόματος…")
         self._search_entry.setMinimumHeight(36)
         self._search_entry.textChanged.connect(self._on_search_changed)
         toolbar.addWidget(self._search_entry, 2)
@@ -107,15 +222,27 @@ class InventoryPage(BasePage):
 
         self._refresh_btn = QPushButton("🔄  Ανανέωση")
         self._refresh_btn.setCursor(Qt.PointingHandCursor)
-        self._refresh_btn.setStyleSheet(
-            f"QPushButton {{ background: {styles.ACCENT}; color: white; "
-            f"border-radius: 6px; padding: 8px 16px; "
-            f"font-size: 13px; font-weight: bold; border: none; }}"
-            "QPushButton:hover { background: #2563EB; }"
-            "QPushButton:disabled { background: #3b3f48; color: #6b7280; }")
+        self._refresh_btn.setStyleSheet(self._accent_btn_qss())
         self._refresh_btn.clicked.connect(self.refresh)
         toolbar.addWidget(self._refresh_btn)
         self.root_layout.addLayout(toolbar)
+
+        # Action buttons row
+        act_row = QHBoxLayout()
+        act_row.setSpacing(8)
+        self._create_btn = QPushButton("＋  Νέο Προϊόν")
+        self._create_btn.setCursor(Qt.PointingHandCursor)
+        self._create_btn.setStyleSheet(self._accent_btn_qss())
+        self._create_btn.clicked.connect(self._on_create)
+        act_row.addWidget(self._create_btn)
+        self._edit_btn = QPushButton("✏️  Επεξεργασία Επιλεγμένου")
+        self._edit_btn.setCursor(Qt.PointingHandCursor)
+        self._edit_btn.setStyleSheet(self._accent_btn_qss())
+        self._edit_btn.setEnabled(False)
+        self._edit_btn.clicked.connect(self._on_edit_selected)
+        act_row.addWidget(self._edit_btn)
+        act_row.addStretch()
+        self.root_layout.addLayout(act_row)
 
         # Results summary
         self._summary_lbl = QLabel("")
@@ -145,6 +272,8 @@ class InventoryPage(BasePage):
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._table.cellDoubleClicked.connect(self._on_double_click)
         self.root_layout.addWidget(self._table, 1)
 
         # Pagination bar
@@ -166,36 +295,177 @@ class InventoryPage(BasePage):
 
         self._built = True
 
+    # ── Button styling ───────────────────────────────────────────────
+    @staticmethod
+    def _accent_btn_qss() -> str:
+        return (
+            f"QPushButton {{ background: {styles.ACCENT}; color: white; "
+            f"border-radius: 6px; padding: 8px 16px; "
+            f"font-size: 13px; font-weight: bold; border: none; }}"
+            "QPushButton:hover { background: #2563EB; }"
+            "QPushButton:disabled { background: #3b3f48; color: #6b7280; }")
+
     # ── User actions ─────────────────────────────────────────────────
-    def _on_search_changed(self, text: str) -> None:
+    def _on_search_changed(self, text):
         self._search_text = text
         self._page = 1
         self._debounce_timer.start(300)
 
-    def _on_filter_changed(self, idx: int) -> None:
+    def _on_filter_changed(self, idx):
         self._status_filter = FILTER_KEYS[idx] if 0 <= idx < len(FILTER_KEYS) else "all"
         self._page = 1
         self._debounce_timer.stop()
         self._do_refresh()
 
-    def _prev_page(self) -> None:
+    def _on_selection_changed(self):
+        self._edit_btn.setEnabled(len(self._table.selectedItems()) > 0)
+
+    def _on_double_click(self, row, col):
+        self._edit_row(row)
+
+    def _prev_page(self):
         if self._page > 1:
             self._page -= 1
             self._do_refresh()
 
-    def _next_page(self) -> None:
+    def _next_page(self):
         self._page += 1
         self._do_refresh()
 
+    # ── Create / Edit ────────────────────────────────────────────────
+    def _on_create(self):
+        dlg = ProductDialog(self._db_path, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        data = dlg.get_data()
+        req = CreateProductRequest(
+            barcode=data["barcode"], name=data["name"],
+            stock=data["stock"], expiry_date=data["expiry_date"],
+            price=data["price"], supplier_id=data["supplier_id"])
+        self._confirm_and_execute("create", req, data)
+
+    def _on_edit_selected(self):
+        rows = set()
+        for item in self._table.selectedItems():
+            rows.add(item.row())
+        if len(rows) != 1:
+            return
+        self._edit_row(list(rows)[0])
+
+    def _edit_row(self, row: int):
+        existing = {
+            "barcode": self._table.item(row, 0).text(),
+            "name": self._table.item(row, 1).text(),
+            "stock": int(self._table.item(row, 2).text()),
+            "expiry_date": self._table.item(row, 3).text(),
+            "price": float(self._table.item(row, 4).text().replace("€", "").strip()),
+            "supplier_id": None,  # resolved in dialog from combo
+        }
+        dlg = ProductDialog(self._db_path, parent=self, existing=existing)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        data = dlg.get_data()
+        original = ProductSnapshot(
+            barcode=existing["barcode"], name=existing["name"],
+            stock=existing["stock"], expiry_date=existing["expiry_date"],
+            price=existing["price"], supplier_id=None)
+        req = UpdateProductRequest(
+            barcode=data["barcode"], name=data["name"],
+            stock=data["stock"], expiry_date=data["expiry_date"],
+            price=data["price"], supplier_id=data["supplier_id"],
+            original=original)
+        self._confirm_and_execute("update", req, data)
+
+    def _confirm_and_execute(self, mode, req, data):
+        """Show confirmation, then dispatch write worker."""
+        if mode == "create":
+            summary = (
+                f"Barcode: {req.barcode}\n"
+                f"Όνομα: {req.name}\n"
+                f"Απόθεμα: {req.stock}\n"
+                f"Ημ. Λήξης: {req.expiry_date}\n"
+                f"Τιμή: €{req.price:.2f}")
+        else:
+            summary = (
+                f"Barcode: {req.barcode}\n"
+                f"Όνομα: {req.name}\n"
+                f"Απόθεμα: {req.stock}\n"
+                f"Ημ. Λήξης: {req.expiry_date}\n"
+                f"Τιμή: €{req.price:.2f}")
+
+        warn = ""
+        from datetime import date as dt_date
+        try:
+            if dt_date.fromisoformat(req.expiry_date) < dt_date.today():
+                warn = ("\n\n⚠️  Προειδοποίηση: Η ημερομηνία λήξης είναι "
+                        "στο παρελθόν.")
+        except ValueError:
+            pass
+
+        title = "Επιβεβαίωση Δημιουργίας" if mode == "create" else "Επιβεβαίωση Ενημέρωσης"
+        btn = QMessageBox.question(
+            self, title, summary + warn,
+            QMessageBox.Yes | QMessageBox.No)
+
+        if btn != QMessageBox.Yes:
+            return
+
+        self._run_write(mode, req)
+
+    def _run_write(self, mode, req):
+        if self._write_loading:
+            return
+        self._write_loading = True
+        self._create_btn.setEnabled(False)
+        self._edit_btn.setEnabled(False)
+        self._refresh_btn.setEnabled(False)
+
+        fn = create_product if mode == "create" else update_product
+        self._cleanup_write_worker()
+
+        self._write_thread = QThread(self)
+        self._write_worker = _WriteWorker(self._db_path, fn, req)
+        self._write_worker.moveToThread(self._write_thread)
+        self._write_thread.started.connect(self._write_worker.run)
+        self._write_worker.finished.connect(self._on_write_done)
+        self._write_worker.finished.connect(self._write_thread.quit)
+        self._write_thread.finished.connect(self._write_worker.deleteLater)
+        self._write_thread.finished.connect(self._write_thread.deleteLater)
+        self._write_thread.finished.connect(self._on_write_thread_done)
+        self._write_thread.start()
+
+    def _on_write_done(self, result: CommandResult):
+        if self._close_pending:
+            return
+        if result.ok:
+            QMessageBox.information(self, "Επιτυχία", result.message)
+            self.refresh()
+            self._refresh_dashboard()
+        else:
+            QMessageBox.warning(self, "Σφάλμα", result.message)
+
+    def _on_write_thread_done(self):
+        self._write_loading = False
+        self._write_worker = None
+        self._write_thread = None
+        self._create_btn.setEnabled(True)
+        self._refresh_btn.setEnabled(True)
+
+    def _refresh_dashboard(self):
+        """Refresh the Dashboard page if it has already been created."""
+        mw = self.window()
+        if mw and hasattr(mw, "_pages"):
+            dash = mw._pages.get("dashboard")
+            if dash and hasattr(dash, "refresh"):
+                dash.refresh()
+
     # ── Refresh ──────────────────────────────────────────────────────
-    def refresh(self) -> None:
-        """Debounced entry point (called by button too)."""
+    def refresh(self):
         self._debounce_timer.stop()
         self._do_refresh()
 
-    def _do_refresh(self) -> None:
+    def _do_refresh(self):
         if self._loading:
-            # Queue the latest request
             self._pending_req = {
                 "search": self._search_text,
                 "filter": self._status_filter,
@@ -206,17 +476,14 @@ class InventoryPage(BasePage):
         self._loading = True
         self._refresh_btn.setEnabled(False)
         self._set_state("🔄 Φόρτωση δεδομένων αποθήκης...", styles.TEXT_MUTED)
-
         threshold = int(self.config.get("low_stock_threshold", 10)) if self.config else 10
         alert_days = int(self.config.get("expiry_alert_days", 30)) if self.config else 30
-
         self._cleanup_worker()
         self._thread = QThread(self)
         self._worker = _InventoryWorker(
             self._db_path, self._search_text, self._status_filter,
             threshold, alert_days, self._page, self._page_size)
         self._worker.moveToThread(self._thread)
-
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_data_ready)
         self._worker.finished.connect(self._thread.quit)
@@ -225,7 +492,7 @@ class InventoryPage(BasePage):
         self._thread.finished.connect(self._on_thread_done)
         self._thread.start()
 
-    def _on_data_ready(self, result: InventoryResult) -> None:
+    def _on_data_ready(self, result):
         if self._close_pending:
             return
         if not result.ok:
@@ -233,19 +500,14 @@ class InventoryPage(BasePage):
             self._clear_table()
             self._summary_lbl.setText("")
             return
-
         snap = result.snapshot
         total = snap.total_matching
         first = (snap.page - 1) * snap.page_size + 1 if total else 0
         last = min(first + snap.page_size - 1, total)
-        self._summary_lbl.setText(
-            f"Εμφάνιση {first}–{last} από {total} προϊόντα")
-
+        self._summary_lbl.setText(f"Εμφάνιση {first}–{last} από {total} προϊόντα")
         prods = snap.products
         if not prods:
-            self._set_state(
-                "Δεν βρέθηκαν προϊόντα με τα επιλεγμένα φίλτρα.",
-                styles.TEXT_MUTED)
+            self._set_state("Δεν βρέθηκαν προϊόντα με τα επιλεγμένα φίλτρα.", styles.TEXT_MUTED)
             self._clear_table()
         else:
             self._state_lbl.hide()
@@ -260,24 +522,19 @@ class InventoryPage(BasePage):
                 status_text = " · ".join(p.status_labels)
                 self._table.setItem(r, 5, QTableWidgetItem(status_text))
                 self._table.setItem(r, 6, QTableWidgetItem(p.supplier_name))
-                # Colour: expired=red, low/near=amber
-                if any("Ληγμένο" in s for s in p.status_labels):
-                    fg = QColor(styles.RED)
-                elif any("Λήγει" in s or "Χαμηλό" in s for s in p.status_labels):
-                    fg = QColor(styles.AMBER)
-                else:
-                    fg = QColor(styles.TEXT_PRIMARY)
+                fg = QColor(styles.RED) if any("Ληγμένο" in s for s in p.status_labels) \
+                    else QColor(styles.AMBER) if any(
+                        "Λήγει" in s or "Χαμηλό" in s for s in p.status_labels) \
+                    else QColor(styles.TEXT_PRIMARY)
                 for c in range(len(self.COLUMNS)):
                     self._table.item(r, c).setForeground(fg)
-
-        # Pagination
         self._page = snap.page
         total_pages = max(1, (total + snap.page_size - 1) // snap.page_size)
         self._page_lbl.setText(f"Σελίδα {snap.page} από {total_pages}")
         self._prev_btn.setEnabled(snap.page > 1)
         self._next_btn.setEnabled(snap.page < total_pages)
 
-    def _on_thread_done(self) -> None:
+    def _on_thread_done(self):
         self._loading = False
         self._refresh_btn.setEnabled(True)
         self._worker = None
@@ -286,7 +543,6 @@ class InventoryPage(BasePage):
             self._close_pending = False
             self.shutdown_ready.emit()
             return
-        # Run queued request if any
         if self._pending_req:
             req = self._pending_req
             self._pending_req = None
@@ -295,38 +551,58 @@ class InventoryPage(BasePage):
             self._page = req["page"]
             self._do_refresh()
 
-    # ── Shutdown (mirrors DashboardPage contract) ────────────────────
-    def _cleanup_worker(self) -> None:
-        if self._thread is not None and self._thread.isRunning():
+    # ── Shutdown ─────────────────────────────────────────────────────
+    def _cleanup_worker(self):
+        if self._thread and self._thread.isRunning():
             self._thread.quit()
             self._thread.wait(2000)
         self._worker = None
         self._thread = None
 
-    def shutdown(self) -> bool:
-        if self._thread is None or not self._thread.isRunning():
-            return True
-        try:
-            self._worker.finished.disconnect(self._on_data_ready)
-        except (RuntimeError, TypeError):
-            pass
-        self._close_pending = True
-        self._thread.quit()
-        if self._thread.wait(2000):
-            self._loading = False
-            self._worker = None
-            self._thread = None
-            self._close_pending = False
-            return True
-        return False
+    def _cleanup_write_worker(self):
+        if self._write_thread and self._write_thread.isRunning():
+            self._write_thread.quit()
+            self._write_thread.wait(2000)
+        self._write_worker = None
+        self._write_thread = None
+
+    def shutdown(self):
+        if self._thread and self._thread.isRunning():
+            try:
+                self._worker.finished.disconnect(self._on_data_ready)
+            except (RuntimeError, TypeError):
+                pass
+            self._close_pending = True
+            self._thread.quit()
+            if self._thread.wait(2000):
+                self._worker = None
+                self._thread = None
+                self._close_pending = False
+                self._loading = False
+                return True
+            return False
+        if self._write_thread and self._write_thread.isRunning():
+            try:
+                self._write_worker.finished.disconnect(self._on_write_done)
+            except (RuntimeError, TypeError):
+                pass
+            self._close_pending = True
+            self._write_thread.quit()
+            if self._write_thread.wait(2000):
+                self._write_worker = None
+                self._write_thread = None
+                self._close_pending = False
+                self._write_loading = False
+                return True
+            return False
+        return True
 
     # ── Helpers ─────────────────────────────────────────────────────
-    def _set_state(self, text: str, color: str) -> None:
+    def _set_state(self, text, color):
         self._state_lbl.setText(text)
-        self._state_lbl.setStyleSheet(
-            f"color: {color}; font-size: 14px; padding: 20px;")
+        self._state_lbl.setStyleSheet(f"color: {color}; font-size: 14px; padding: 20px;")
         self._state_lbl.show()
         self._table.hide()
 
-    def _clear_table(self) -> None:
+    def _clear_table(self):
         self._table.setRowCount(0)
