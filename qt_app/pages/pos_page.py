@@ -205,8 +205,7 @@ class POSPage(BasePage):
         if self._loading:
             return
         self._loading = True
-        self._refresh_btn.setEnabled(False)
-        self._add_btn.setEnabled(False)
+        self._set_catalog_loading(True)
         self._set_state("🔄 Φόρτωση καταλόγου...", styles.TEXT_MUTED)
         self._cleanup_worker()
         self._thread = QThread(self)
@@ -222,17 +221,32 @@ class POSPage(BasePage):
         self._thread.finished.connect(self._on_done)
         self._thread.start()
 
+    def _set_catalog_loading(self, loading: bool):
+        """Enable/disable all catalog controls in one place."""
+        self._search.setReadOnly(loading)
+        self._refresh_btn.setEnabled(not loading)
+        self._add_btn.setEnabled(False)  # always clear — recheck on selection
+        self._prev_btn.setEnabled(False)
+        self._next_btn.setEnabled(False)
+        if loading:
+            self._page_lbl.setText("Φόρτωση…")
+
     def _on_ready(self, result: POSCatalogResult):
         if self._close_pending:
             return
         if not result.ok:
             self._set_state(result.error_message, styles.RED)
             self._cat_table.setRowCount(0)
+            self._page = 1
+            self._page_lbl.setText("Σελίδα 1")
             return
         prods = result.products
         if not prods:
             self._set_state("Δεν βρέθηκαν διαθέσιμα προϊόντα.", styles.TEXT_MUTED)
             self._cat_table.setRowCount(0)
+            self._page = result.page
+            tp = max(1, (result.total + result.page_size - 1) // result.page_size)
+            self._page_lbl.setText(f"Σελίδα {result.page} από {tp}")
         else:
             self._state_lbl.hide()
             self._cat_table.show()
@@ -252,6 +266,7 @@ class POSPage(BasePage):
 
     def _on_done(self):
         self._loading = False
+        self._search.setReadOnly(False)
         self._refresh_btn.setEnabled(True)
         self._worker = None
         self._thread = None
@@ -271,12 +286,12 @@ class POSPage(BasePage):
         stock = int(self._cat_table.item(r, 2).text())
 
         if barcode in self._cart:
-            current = self._cart[barcode]["qty"]
-            if current + 1 > stock:
+            entry = self._cart[barcode]
+            if entry["qty"] + 1 > entry["max_stock"]:
                 QMessageBox.warning(self, "Όριο αποθέματος",
-                    f"Το διαθέσιμο απόθεμα για το '{name}' είναι {stock}.")
+                    f"Το διαθέσιμο απόθεμα για το '{name}' είναι {entry['max_stock']}.")
                 return
-            self._cart[barcode]["qty"] += 1
+            entry["qty"] += 1
         else:
             if stock <= 0:
                 return

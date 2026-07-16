@@ -23,6 +23,7 @@ def _make_db(path):
         INSERT INTO ProductMaster VALUES ('C','Expired Item',5,'2020-01-01',2.0);
         INSERT INTO ProductMaster VALUES ('D','Zero Stock',0,'2027-12-31',1.0);
         INSERT INTO ProductMaster VALUES ('E','Percent%Item',10,'2027-12-31',1.0);
+        INSERT INTO ProductMaster VALUES ('F','Back\\slash Item',10,'2027-12-31',2.0);
     """)
     conn.commit()
     conn.close()
@@ -35,8 +36,8 @@ class TestCatalog:
         _make_db(db)
         r = load_pos_catalog_page(db)
         assert r.ok
-        # Only A, B, E are sellable (C expired, D zero stock)
-        assert r.total == 3
+        # Only A, B, E, F are sellable (C expired, D zero stock)
+        assert r.total == 4
 
     def test_greek_search(self, tmp_path):
         db = str(tmp_path / "t.db")
@@ -82,12 +83,30 @@ class TestCatalog:
         assert r.ok
         assert r.total == 0  # no product has literal underscore
 
+    def test_literal_backslash_search(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        _make_db(db)
+        r = load_pos_catalog_page(db, search_text="\\")
+        assert r.ok
+        assert r.total == 1
+        assert "Back\\slash" in r.products[0].name
+
     def test_pagination_clamp(self, tmp_path):
         db = str(tmp_path / "t.db")
         _make_db(db)
-        r = load_pos_catalog_page(db, page=999)
-        assert r.ok
-        assert r.page == 1
+        # 4 sellable products (A, B, E, F). page_size=2 → 2 pages.
+        r1 = load_pos_catalog_page(db, page_size=2, page=1)
+        assert r1.ok
+        assert r1.page == 1
+        assert len(r1.products) == 2
+        r2 = load_pos_catalog_page(db, page_size=2, page=2)
+        assert r2.ok
+        assert r2.page == 2
+        assert len(r2.products) == 2  # 4 total: A on pg1, F on pg2
+        # Clamp beyond last page
+        r3 = load_pos_catalog_page(db, page_size=2, page=999)
+        assert r3.ok
+        assert r3.page == 2
 
     def test_missing_required_column(self, tmp_path):
         db = str(tmp_path / "t.db")
