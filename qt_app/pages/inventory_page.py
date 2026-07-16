@@ -353,13 +353,16 @@ class InventoryPage(BasePage):
         self._edit_row(list(rows)[0])
 
     def _edit_row(self, row: int):
+        sid = (self._row_supplier_ids[row]
+               if hasattr(self, "_row_supplier_ids") and row < len(self._row_supplier_ids)
+               else None)
         existing = {
             "barcode": self._table.item(row, 0).text(),
             "name": self._table.item(row, 1).text(),
             "stock": int(self._table.item(row, 2).text()),
             "expiry_date": self._table.item(row, 3).text(),
             "price": float(self._table.item(row, 4).text().replace("€", "").strip()),
-            "supplier_id": None,  # resolved in dialog from combo
+            "supplier_id": sid,
         }
         dlg = ProductDialog(self._db_path, parent=self, existing=existing)
         if dlg.exec() != QDialog.Accepted:
@@ -368,7 +371,7 @@ class InventoryPage(BasePage):
         original = ProductSnapshot(
             barcode=existing["barcode"], name=existing["name"],
             stock=existing["stock"], expiry_date=existing["expiry_date"],
-            price=existing["price"], supplier_id=None)
+            price=existing["price"], supplier_id=sid)
         req = UpdateProductRequest(
             barcode=data["barcode"], name=data["name"],
             stock=data["stock"], expiry_date=data["expiry_date"],
@@ -506,6 +509,7 @@ class InventoryPage(BasePage):
         last = min(first + snap.page_size - 1, total)
         self._summary_lbl.setText(f"Εμφάνιση {first}–{last} από {total} προϊόντα")
         prods = snap.products
+        self._row_supplier_ids = [p.supplier_id for p in prods]
         if not prods:
             self._set_state("Δεν βρέθηκαν προϊόντα με τα επιλεγμένα φίλτρα.", styles.TEXT_MUTED)
             self._clear_table()
@@ -566,21 +570,9 @@ class InventoryPage(BasePage):
         self._write_worker = None
         self._write_thread = None
 
-    def shutdown(self):
-        if self._thread and self._thread.isRunning():
-            try:
-                self._worker.finished.disconnect(self._on_data_ready)
-            except (RuntimeError, TypeError):
-                pass
-            self._close_pending = True
-            self._thread.quit()
-            if self._thread.wait(2000):
-                self._worker = None
-                self._thread = None
-                self._close_pending = False
-                self._loading = False
-                return True
-            return False
+    def shutdown(self) -> bool:
+        """Return True only when all active workers have stopped."""
+        all_stopped = True
         if self._write_thread and self._write_thread.isRunning():
             try:
                 self._write_worker.finished.disconnect(self._on_write_done)
@@ -591,11 +583,25 @@ class InventoryPage(BasePage):
             if self._write_thread.wait(2000):
                 self._write_worker = None
                 self._write_thread = None
-                self._close_pending = False
                 self._write_loading = False
-                return True
-            return False
-        return True
+            else:
+                all_stopped = False
+        if self._thread and self._thread.isRunning():
+            try:
+                self._worker.finished.disconnect(self._on_data_ready)
+            except (RuntimeError, TypeError):
+                pass
+            self._close_pending = True
+            self._thread.quit()
+            if self._thread.wait(2000):
+                self._worker = None
+                self._thread = None
+                self._loading = False
+            else:
+                all_stopped = False
+        if all_stopped:
+            self._close_pending = False
+        return all_stopped
 
     # ── Helpers ─────────────────────────────────────────────────────
     def _set_state(self, text, color):
