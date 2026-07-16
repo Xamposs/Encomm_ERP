@@ -820,3 +820,135 @@ def load_customer_detail(db_path, customer_id):
     finally:
         if conn:
             conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Stock Movements data source (read-only)
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class StockMovement:
+    id: int
+    timestamp: str
+    barcode: str
+    product_name: str
+    old_stock: int
+    change_amount: int
+    new_stock: int
+    reason: str
+    source: str
+    operator: str
+
+
+@dataclass(frozen=True)
+class StockMovementsResult:
+    ok: bool
+    total: int = 0
+    page: int = 1
+    page_size: int = 50
+    items: Tuple[StockMovement, ...] = ()
+    reasons: Tuple[str, ...] = ()
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, total, page, page_size, items, reasons):
+        return cls(ok=True, total=total, page=page, page_size=page_size,
+                   items=items, reasons=reasons)
+
+    @classmethod
+    def failure(cls, msg):
+        return cls(ok=False, error_message=msg)
+
+
+def load_stock_movements(
+    db_path,
+    search_text="",
+    reason_filter="",
+    date_from="",
+    date_to="",
+    page=1,
+    page_size=50,
+):
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        conn.create_function("search_normalize", 1, _normalize_search, deterministic=True)
+        cur = conn.cursor()
+        if not _has_table(cur, "stock_movements"):
+            return StockMovementsResult.failure(
+                "Ο πίνακας κινήσεων αποθήκης δεν υπάρχει.")
+
+        has_ca = _has_column(cur, "stock_movements", "change_amount")
+        has_src = _has_column(cur, "stock_movements", "source")
+        has_op = _has_column(cur, "stock_movements", "operator")
+        has_diff = _has_column(cur, "stock_movements", "difference")
+        has_rid = _has_column(cur, "stock_movements", "reference_id")
+
+        if not has_ca and not has_diff:
+            return StockMovementsResult.failure(
+                "Δεν βρέθηκε στήλη μεταβολής (change_amount ή difference).")
+
+        change_expr = "COALESCE(change_amount, difference)" if (has_ca and has_diff) else (
+            "change_amount" if has_ca else "difference")
+        source_expr = "COALESCE(source, reference_id)" if (has_src and has_rid) else (
+            "source" if has_src else ("reference_id" if has_rid else "''"))
+        op_expr = "operator" if has_op else "''"
+
+        conditions, params = [], []
+        if search_text:
+            norm = _normalize_search(search_text)
+            esc = _escape_like(norm)
+            conditions.append(
+                "(search_normalize(sm.product_name) LIKE ? ESCAPE '\\' "
+                "OR search_normalize(sm.barcode) LIKE ? ESCAPE '\\')")
+            params.extend([f"%{esc}%", f"%{esc}%"])
+        if reason_filter:
+            conditions.append("sm.reason = ?")
+            params.append(reason_filter)
+        if date_from:
+            conditions.append("sm.timestamp >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("datetime(sm.timestamp) < datetime(?, '+1 day')")
+            params.append(date_to)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        total = cur.execute(
+            f"SELECT COUNT(*) FROM stock_movements sm{where}", params).fetchone()[0]
+        if total == 0:
+            page = 1
+        else:
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(page, total_pages))
+        offset = (page - 1) * page_size
+
+        cur.execute(f"""
+            SELECT sm.id, sm.timestamp, sm.barcode, sm.product_name,
+                   sm.old_stock, {change_expr}, sm.new_stock,
+                   sm.reason, {source_expr}, {op_expr}
+            FROM stock_movements sm{where}
+            ORDER BY sm.timestamp DESC, sm.id DESC
+            LIMIT ? OFFSET ?
+        """, params + [page_size, offset])
+        items = tuple(StockMovement(
+            id=r[0], timestamp=r[1], barcode=r[2], product_name=r[3],
+            old_stock=r[4], change_amount=r[5], new_stock=r[6],
+            reason=r[7], source=r[8] or "—", operator=r[9] or "—")
+            for r in cur.fetchall())
+
+        reasons = tuple(
+            r[0] for r in cur.execute(
+                "SELECT DISTINCT reason FROM stock_movements ORDER BY reason"))
+        return StockMovementsResult.success(total, page, page_size, items, reasons)
+
+    except (sqlite3.Error, FileNotFoundError) as e:
+        return StockMovementsResult.failure(
+            f"Αδυναμία φόρτωσης κινήσεων: {e}")
+    except Exception as e:
+        return StockMovementsResult.failure(
+            f"Αδυναμία φόρτωσης κινήσεων: {e}")
+    finally:
+        if conn:
+            conn.close()
