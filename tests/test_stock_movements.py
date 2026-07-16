@@ -171,3 +171,68 @@ class TestNoWrite:
                      "ALTER ", "CREATE TABLE", "REPLACE "]
         for pat in patterns:
             assert pat not in src.upper(), f"Forbidden '{pat}' in stock movements source"
+
+
+class TestDateValidation:
+
+    def test_invalid_date_from(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        _make_current(db)
+        r = load_stock_movements(db, date_from="not-a-date")
+        assert not r.ok
+        assert "ημερομηνία" in r.error_message
+
+    def test_invalid_date_to(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        _make_current(db)
+        r = load_stock_movements(db, date_to="2026-13-01")
+        assert not r.ok
+        assert "ημερομηνία" in r.error_message
+
+    def test_date_from_after_date_to(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        _make_current(db)
+        r = load_stock_movements(db, date_from="2026-12-31", date_to="2026-01-01")
+        assert not r.ok
+        assert "από" in r.error_message
+
+    def test_midnight_boundary_included(self, tmp_path):
+        """A movement at 2026-06-15 23:59:59 is included when date_to=2026-06-15."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE stock_movements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL, barcode TEXT NOT NULL,
+                product_name TEXT NOT NULL, old_stock INTEGER NOT NULL,
+                new_stock INTEGER NOT NULL, change_amount INTEGER NOT NULL,
+                reason TEXT NOT NULL, source TEXT, operator TEXT
+            );
+            INSERT INTO stock_movements VALUES
+                (1, '2026-06-15 23:59:59', 'A', 'Test', 0, 10, 10, 'Move', 'src', 'op');
+        """)
+        conn.commit()
+        conn.close()
+        r = load_stock_movements(db, date_to="2026-06-15")
+        assert r.ok
+        assert r.total == 1
+
+
+class TestRequiredColumns:
+
+    def test_missing_reason_column(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE stock_movements (
+                id INTEGER PRIMARY KEY, timestamp TEXT, barcode TEXT,
+                product_name TEXT, old_stock INTEGER, new_stock INTEGER,
+                change_amount INTEGER, source TEXT
+            );
+        """)
+        conn.commit()
+        conn.close()
+        r = load_stock_movements(db)
+        assert not r.ok
+        assert "reason" in r.error_message

@@ -871,6 +871,25 @@ def load_stock_movements(
 ):
     page = max(1, page)
     page_size = min(max(1, page_size), 100)
+
+    # ── Date validation ──
+    from datetime import date as dt_date
+    for label, val in [("date_from", date_from), ("date_to", date_to)]:
+        if val:
+            try:
+                dt_date.fromisoformat(val)
+            except ValueError:
+                return StockMovementsResult.failure(
+                    f"Μη έγκυρη ημερομηνία για {label}: '{val}'. "
+                    f"Απαιτείται μορφή YYYY-MM-DD.")
+    if date_from and date_to:
+        try:
+            if dt_date.fromisoformat(date_from) > dt_date.fromisoformat(date_to):
+                return StockMovementsResult.failure(
+                    "Η ημερομηνία 'από' δεν μπορεί να είναι μετά την ημερομηνία 'έως'.")
+        except ValueError:
+            pass  # already caught above
+
     conn = None
     try:
         conn = _connect_ro(db_path)
@@ -890,8 +909,18 @@ def load_stock_movements(
             return StockMovementsResult.failure(
                 "Δεν βρέθηκε στήλη μεταβολής (change_amount ή difference).")
 
-        change_expr = "COALESCE(change_amount, difference)" if (has_ca and has_diff) else (
-            "change_amount" if has_ca else "difference")
+        # Required columns
+        required = ["timestamp", "barcode", "product_name",
+                    "old_stock", "new_stock", "reason"]
+        for col in required:
+            if not _has_column(cur, "stock_movements", col):
+                conn.close()
+                return StockMovementsResult.failure(
+                    f"Λείπει η υποχρεωτική στήλη '{col}' στον πίνακα stock_movements.")
+
+        change_expr = (
+            "COALESCE(change_amount, difference)" if (has_ca and has_diff)
+            else "change_amount" if has_ca else "difference")
         source_expr = "COALESCE(source, reference_id)" if (has_src and has_rid) else (
             "source" if has_src else ("reference_id" if has_rid else "''"))
         op_expr = "operator" if has_op else "''"
