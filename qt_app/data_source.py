@@ -1219,3 +1219,93 @@ def load_invoice_detail(db_path, invoice_id):
     finally:
         if conn:
             conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# POS catalog (read-only)
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class POSProduct:
+    barcode: str
+    name: str
+    stock: int
+    price: float
+    expiry_date: str
+
+
+@dataclass(frozen=True)
+class POSCatalogResult:
+    ok: bool
+    total: int = 0
+    page: int = 1
+    page_size: int = 50
+    products: Tuple[POSProduct, ...] = ()
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, total, page, page_size, products):
+        return cls(ok=True, total=total, page=page, page_size=page_size, products=products)
+
+    @classmethod
+    def failure(cls, msg):
+        return cls(ok=False, error_message=msg)
+
+
+def load_pos_catalog_page(db_path, search_text="", page=1, page_size=50):
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        conn.create_function("search_normalize", 1, _normalize_search, deterministic=True)
+        cur = conn.cursor()
+        if not _has_table(cur, "ProductMaster"):
+            return POSCatalogResult.failure("Ο πίνακας προϊόντων δεν υπάρχει.")
+        for col in ["Barcode", "Name", "Stock", "Price", "ExpiryDate"]:
+            if not _has_column(cur, "ProductMaster", col):
+                return POSCatalogResult.failure(
+                    f"Λείπει η υποχρεωτική στήλη '{col}' στον πίνακα ProductMaster.")
+
+        conditions = [
+            "p.Stock > 0",
+            "(p.ExpiryDate = '' OR p.ExpiryDate IS NULL OR date(p.ExpiryDate) >= date('now'))",
+        ]
+        params: list = []
+        if search_text:
+            norm = _normalize_search(search_text)
+            esc = _escape_like(norm)
+            conditions.append(
+                "(search_normalize(p.Barcode) LIKE ? ESCAPE '\\' "
+                "OR search_normalize(p.Name) LIKE ? ESCAPE '\\')")
+            params.extend([f"%{esc}%", f"%{esc}%"])
+        where = " WHERE " + " AND ".join(conditions)
+
+        total = cur.execute(
+            f"SELECT COUNT(*) FROM ProductMaster p{where}", params).fetchone()[0]
+        if total == 0:
+            page = 1
+        else:
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(page, total_pages))
+        offset = (page - 1) * page_size
+
+        cur.execute(f"""
+            SELECT p.Barcode, p.Name, p.Stock, p.Price, p.ExpiryDate
+            FROM ProductMaster p{where}
+            ORDER BY p.Name ASC, p.Barcode ASC
+            LIMIT ? OFFSET ?
+        """, params + [page_size, offset])
+        products = tuple(POSProduct(
+            barcode=r[0], name=r[1], stock=r[2], price=r[3],
+            expiry_date=r[4] or "—")
+            for r in cur.fetchall())
+        return POSCatalogResult.success(total, page, page_size, products)
+
+    except (sqlite3.Error, FileNotFoundError) as e:
+        return POSCatalogResult.failure(f"Αδυναμία φόρτωσης καταλόγου: {e}")
+    except Exception as e:
+        return POSCatalogResult.failure(f"Αδυναμία φόρτωσης καταλόγου: {e}")
+    finally:
+        if conn:
+            conn.close()
