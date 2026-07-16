@@ -12,11 +12,12 @@ from qt_app.pages.base_page import BasePage
 from qt_app import styles
 from qt_app.data_source import (
     load_pos_catalog_page, POSCatalogResult, POSProduct,
+    preflight_pos_sale, POSPreflightResult,
 )
 
 
 class _POSCatalogWorker(QObject):
-    finished = Signal(POSCatalogResult)
+    finished = Signal(object)  # POSCatalogResult
 
     def __init__(self, db_path, search_text, page, page_size, parent=None):
         super().__init__(parent)
@@ -24,6 +25,18 @@ class _POSCatalogWorker(QObject):
 
     def run(self):
         self.finished.emit(load_pos_catalog_page(*self._args))
+
+
+class _POSPreflightWorker(QObject):
+    finished = Signal(object)  # POSPreflightResult
+
+    def __init__(self, db_path, cart_lines, parent=None):
+        super().__init__(parent)
+        self._db = db_path
+        self._lines = cart_lines
+
+    def run(self):
+        self.finished.emit(preflight_pos_sale(self._db, self._lines))
 
 
 class POSPage(BasePage):
@@ -46,6 +59,8 @@ class POSPage(BasePage):
         self._page = 1
         self._page_size = 50
         self._cart: dict[str, dict] = {}  # barcode → {name, price, qty, max_stock}
+        self._mode = "catalog"  # "catalog" | "preflight"
+        self._preflight_status = ""
         super().__init__(db_service, config, parent)
 
     def build_ui(self):
@@ -158,6 +173,20 @@ class POSPage(BasePage):
         ctl.addStretch()
         right.addLayout(ctl)
 
+        # Preflight check
+        self._preflight_btn = QPushButton("🔍  Έλεγχος καλαθιού")
+        self._preflight_btn.setCursor(Qt.PointingHandCursor)
+        self._preflight_btn.setStyleSheet(self._btn_qss())
+        self._preflight_btn.setEnabled(False)
+        self._preflight_btn.clicked.connect(self._on_preflight)
+        right.addWidget(self._preflight_btn)
+
+        self._preflight_lbl = QLabel("")
+        self._preflight_lbl.setWordWrap(True)
+        self._preflight_lbl.setStyleSheet(
+            f"color: {styles.TEXT_MUTED}; font-size: 12px; padding: 4px 0;")
+        right.addWidget(self._preflight_lbl)
+
         # Totals
         self._total_items = QLabel("Είδη: 0")
         self._total_items.setStyleSheet(f"color: {styles.TEXT_PRIMARY}; font-size: 14px;")
@@ -204,8 +233,9 @@ class POSPage(BasePage):
     def _do_refresh(self):
         if self._loading:
             return
+        self._mode = "catalog"
         self._loading = True
-        self._set_catalog_loading(True)
+        self._set_controls_loading(True)
         self._set_state("🔄 Φόρτωση καταλόγου...", styles.TEXT_MUTED)
         self._cleanup_worker()
         self._thread = QThread(self)
@@ -221,53 +251,72 @@ class POSPage(BasePage):
         self._thread.finished.connect(self._on_done)
         self._thread.start()
 
-    def _set_catalog_loading(self, loading: bool):
-        """Enable/disable all catalog controls in one place."""
+    def _set_controls_loading(self, loading: bool):
+        """Enable/disable all catalog + cart controls in one place."""
         self._search.setEnabled(not loading)
         self._refresh_btn.setEnabled(not loading)
-        self._add_btn.setEnabled(False)  # always clear — recheck on selection
+        self._add_btn.setEnabled(False)
         self._prev_btn.setEnabled(False)
         self._next_btn.setEnabled(False)
         if loading:
             self._page_lbl.setText("Φόρτωση…")
+        self._preflight_btn.setEnabled(
+            not loading and len(self._cart) > 0)
+        # Disable cart mutation during preflight
+        if self._mode == "preflight":
+            for w in [self._cart_plus, self._cart_minus,
+                      self._cart_remove, self._cart_clear]:
+                w.setEnabled(not loading)
 
-    def _on_ready(self, result: POSCatalogResult):
+    def _on_ready(self, result):
         if self._close_pending:
             return
-        if not result.ok:
-            self._set_state(result.error_message, styles.RED)
+        if self._mode == "preflight":
+            self._on_preflight_ready(result)
+            return
+        # Catalog result
+        r = result
+        if not isinstance(r, POSCatalogResult):
+            return
+        if not r.ok:
+            self._set_state(r.error_message, styles.RED)
             self._cat_table.setRowCount(0)
             self._page = 1
             self._page_lbl.setText("Σελίδα 1")
             return
-        prods = result.products
+        prods = r.products
         if not prods:
             self._set_state("Δεν βρέθηκαν διαθέσιμα προϊόντα.", styles.TEXT_MUTED)
             self._cat_table.setRowCount(0)
-            self._page = result.page
-            tp = max(1, (result.total + result.page_size - 1) // result.page_size)
-            self._page_lbl.setText(f"Σελίδα {result.page} από {tp}")
+            self._page = r.page
+            tp = max(1, (r.total + r.page_size - 1) // r.page_size)
+            self._page_lbl.setText(f"Σελίδα {r.page} από {tp}")
         else:
             self._state_lbl.hide()
             self._cat_table.show()
             self._cat_table.setRowCount(len(prods))
-            for r, p in enumerate(prods):
+            for ri, p in enumerate(prods):
                 b_item = QTableWidgetItem(p.barcode)
                 b_item.setData(Qt.UserRole, p.barcode)
-                self._cat_table.setItem(r, 0, b_item)
-                self._cat_table.setItem(r, 1, QTableWidgetItem(p.name))
-                self._cat_table.setItem(r, 2, QTableWidgetItem(str(p.stock)))
-                self._cat_table.setItem(r, 3, QTableWidgetItem(f"€{p.price:.2f}"))
-        self._page = result.page
-        tp = max(1, (result.total + result.page_size - 1) // result.page_size)
-        self._page_lbl.setText(f"Σελίδα {result.page} από {tp}")
-        self._prev_btn.setEnabled(result.page > 1)
-        self._next_btn.setEnabled(result.page < tp)
+                self._cat_table.setItem(ri, 0, b_item)
+                self._cat_table.setItem(ri, 1, QTableWidgetItem(p.name))
+                self._cat_table.setItem(ri, 2, QTableWidgetItem(str(p.stock)))
+                self._cat_table.setItem(ri, 3, QTableWidgetItem(f"€{p.price:.2f}"))
+        self._page = r.page
+        tp = max(1, (r.total + r.page_size - 1) // r.page_size)
+        self._page_lbl.setText(f"Σελίδα {r.page} από {tp}")
+        self._prev_btn.setEnabled(r.page > 1)
+        self._next_btn.setEnabled(r.page < tp)
 
     def _on_done(self):
         self._loading = False
+        self._mode = "catalog"
         self._search.setEnabled(True)
         self._refresh_btn.setEnabled(True)
+        for w in [self._cart_plus, self._cart_minus,
+                  self._cart_remove, self._cart_clear]:
+            w.setEnabled(True)
+        self._preflight_btn.setEnabled(len(self._cart) > 0)
         self._worker = None
         self._thread = None
         if self._close_pending:
@@ -323,6 +372,57 @@ class POSPage(BasePage):
         self._cart.clear()
         self._rebuild_cart()
 
+    # ── Preflight ──
+    def _on_preflight(self):
+        if self._loading or not self._cart:
+            return
+        lines = [(bc, e["qty"]) for bc, e in self._cart.items()]
+        self._mode = "preflight"
+        self._loading = True
+        self._set_controls_loading(True)
+        self._preflight_lbl.setText("🔄 Έλεγχος καλαθιού…")
+        self._preflight_lbl.setStyleSheet(
+            f"color: {styles.TEXT_MUTED}; font-size: 12px; padding: 4px 0;")
+        self._cleanup_worker()
+        self._thread = QThread(self)
+        self._worker = _POSPreflightWorker(self._db_path, lines)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_ready)
+        self._worker.finished.connect(self._thread.quit)
+        self._thread.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._on_done)
+        self._thread.start()
+
+    def _on_preflight_ready(self, result: POSPreflightResult):
+        if not isinstance(result, POSPreflightResult):
+            return
+        if result.ok and result.lines:
+            msgs = ["✅ Ο προέλεγχος ολοκληρώθηκε — δεν πραγματοποιήθηκε πώληση."]
+            # Price warnings
+            for line in result.lines:
+                cart_entry = self._cart.get(line.barcode)
+                if cart_entry and line.valid and line.current_price != cart_entry["price"]:
+                    msgs.append(
+                        f"⚠ Το προϊόν '{line.name}' έχει νέα τιμή: "
+                        f"€{line.current_price:.2f} (ήταν €{cart_entry['price']:.2f}).")
+            msgs.append(f"Σύνολο καλαθιού (εξουσιοδοτημένη τιμή): €{result.gross_total:.2f}")
+            self._preflight_lbl.setText("\n".join(msgs))
+            self._preflight_lbl.setStyleSheet(
+                f"color: {styles.ACCENT}; font-size: 12px; padding: 4px 0;")
+        else:
+            if result.error_message and not result.lines:
+                msgs = [f"❌ {result.error_message}"]
+            else:
+                msgs = ["❌ Προβλήματα προελέγχου:"]
+                for line in result.lines:
+                    if not line.valid:
+                        msgs.append(f"  · {line.barcode}: {line.error_message}")
+            self._preflight_lbl.setText("\n".join(msgs))
+            self._preflight_lbl.setStyleSheet(
+                f"color: {styles.RED}; font-size: 12px; padding: 4px 0;")
+
     def _selected_cart_barcode(self):
         rows = {it.row() for it in self._cart_table.selectedItems()}
         if len(rows) == 1:
@@ -346,6 +446,9 @@ class POSPage(BasePage):
             total_price += line
         self._total_items.setText(f"Είδη: {total_items}")
         self._total_price.setText(f"Σύνολο: €{total_price:.2f}")
+        self._preflight_btn.setEnabled(total_items > 0 and not self._loading)
+        self._preflight_status = ""
+        self._preflight_lbl.setText("")
 
     # ── Shutdown ──
     def _cleanup_worker(self):

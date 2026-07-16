@@ -1309,3 +1309,145 @@ def load_pos_catalog_page(db_path, search_text="", page=1, page_size=50):
     finally:
         if conn:
             conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# POS preflight (read-only)
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class POSPreflightLine:
+    barcode: str
+    name: str
+    requested_qty: int
+    available_stock: int
+    current_price: float
+    expiry_date: str
+    valid: bool
+    error_message: str
+
+
+@dataclass(frozen=True)
+class POSPreflightResult:
+    ok: bool
+    lines: Tuple[POSPreflightLine, ...] = ()
+    gross_total: float = 0.0
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, lines, gross_total):
+        return cls(ok=True, lines=lines, gross_total=gross_total)
+
+    @classmethod
+    def failure(cls, msg):
+        return cls(ok=False, error_message=msg)
+
+
+def preflight_pos_sale(db_path, cart_lines):
+    """Validate cart against current ProductMaster data (read-only).
+
+    cart_lines: iterable of (barcode: str, qty: int)
+    Returns POSPreflightResult with per-line validation.
+    """
+    # Input validation
+    if not cart_lines:
+        return POSPreflightResult.failure("Το καλάθι είναι άδειο.")
+
+    aggregated: dict[str, int] = {}
+    for bc, qty in cart_lines:
+        if not bc or not isinstance(bc, str) or not bc.strip():
+            return POSPreflightResult.failure(
+                f"Μη έγκυρο barcode: '{bc}'.")
+        if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
+            return POSPreflightResult.failure(
+                f"Μη έγκυρη ποσότητα για το '{bc}': {qty}. Απαιτείται θετικός ακέραιος.")
+        aggregated[bc.strip()] = aggregated.get(bc.strip(), 0) + qty
+
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        cur = conn.cursor()
+        if not _has_table(cur, "ProductMaster"):
+            return POSPreflightResult.failure("Ο πίνακας προϊόντων δεν υπάρχει.")
+        for col in ["Barcode", "Name", "Stock", "Price", "ExpiryDate"]:
+            if not _has_column(cur, "ProductMaster", col):
+                return POSPreflightResult.failure(
+                    f"Λείπει η υποχρεωτική στήλη '{col}' στον πίνακα ProductMaster.")
+
+        lines: list[POSPreflightLine] = []
+        gross_total = 0.0
+
+        for barcode, qty in aggregated.items():
+            cur.execute("""
+                SELECT Name, Stock, Price, ExpiryDate
+                FROM ProductMaster WHERE Barcode=?
+            """, (barcode,))
+            row = cur.fetchone()
+            if not row:
+                lines.append(POSPreflightLine(
+                    barcode=barcode, name="", requested_qty=qty,
+                    available_stock=0, current_price=0.0, expiry_date="",
+                    valid=False,
+                    error_message=f"Το προϊόν με barcode '{barcode}' δεν βρέθηκε."))
+                continue
+
+            name, stock, price, expiry = row[0], row[1], row[2], row[3] or ""
+            errors = []
+
+            # Price validation
+            if not isinstance(price, (int, float)) or price < 0 or not _isfinite(price):
+                errors.append("Μη έγκυρη τιμή προϊόντος.")
+            else:
+                price = float(price)
+
+            # Stock validation
+            if stock < qty:
+                errors.append(
+                    f"Ανεπαρκές απόθεμα: ζητήθηκαν {qty}, διαθέσιμα {stock}.")
+
+            # Expiry validation
+            if expiry:
+                try:
+                    from datetime import date as dt_date
+                    exp_d = dt_date.fromisoformat(expiry)
+                    if exp_d < dt_date.today():
+                        errors.append(f"Το προϊόν έχει λήξει ({expiry}).")
+                except ValueError:
+                    errors.append(f"Μη έγκυρη ημερομηνία λήξης: '{expiry}'.")
+
+            valid = len(errors) == 0
+            lines.append(POSPreflightLine(
+                barcode=barcode, name=name, requested_qty=qty,
+                available_stock=stock,
+                current_price=price if isinstance(price, float) else 0.0,
+                expiry_date=expiry or "—",
+                valid=valid,
+                error_message=" · ".join(errors) if errors else ""))
+
+            if valid and isinstance(price, float):
+                gross_total += round(price * qty, 2)
+
+        all_valid = all(line.valid for line in lines)
+        return POSPreflightResult(
+            ok=all_valid,
+            lines=tuple(lines),
+            gross_total=gross_total if all_valid else 0.0,
+        )
+
+    except (sqlite3.Error, FileNotFoundError) as e:
+        return POSPreflightResult.failure(
+            f"Αδυναμία εκτέλεσης προελέγχου: {e}")
+    except Exception as e:
+        return POSPreflightResult.failure(
+            f"Αδυναμία εκτέλεσης προελέγχου: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def _isfinite(val) -> bool:
+    from math import isfinite
+    try:
+        return isfinite(float(val))
+    except (TypeError, ValueError):
+        return False
