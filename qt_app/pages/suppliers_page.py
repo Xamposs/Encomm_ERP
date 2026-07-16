@@ -204,10 +204,7 @@ class SuppliersPage(BasePage):
         if len(rows) != 1:
             return
         r = list(rows)[0]
-        sid_text = self._table.item(r, 0).text()
-        # We need the supplier id — stored as item data or a parallel list
-        # For simplicity, re-query by name (names are unique in this schema)
-        # Actually, store ids in the table as UserRole data
+        # Supplier id stored as UserRole data on the name item
         sid = self._table.item(r, 0).data(Qt.UserRole)
         if sid is None:
             QMessageBox.warning(self, "Σφάλμα", "Αδυναμία εύρεσης ID προμηθευτή.")

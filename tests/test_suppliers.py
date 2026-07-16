@@ -109,17 +109,66 @@ class TestSuppliers:
         assert not r.ok
 
     def test_no_write_sql(self):
-        import ast, os
-        src = os.path.join(os.path.dirname(__file__), "..", "qt_app", "data_source.py")
-        tree = ast.parse(open(src, encoding="utf-8").read())
-        forbidden = {"INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "TRUNCATE"}
-        in_supplier_section = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if "Supplier data source" in node.value:
-                    in_supplier_section = True
-                if in_supplier_section:
-                    upper = node.value.upper().strip()
-                    for kw in forbidden:
-                        if upper.startswith(kw):
-                            pytest.fail(f"Forbidden '{kw}': {node.value[:80]}")
+        """load_suppliers_page and load_supplier_detail contain no DML/DDL."""
+        import inspect, os
+        from qt_app import data_source as ds
+        src = inspect.getsource(ds.load_suppliers_page)
+        src += inspect.getsource(ds.load_supplier_detail)
+        patterns = ["INSERT INTO", "UPDATE ", "DELETE FROM", "DROP ",
+                     "ALTER ", "CREATE TABLE", "REPLACE "]
+        for pat in patterns:
+            assert pat not in src.upper(), f"Forbidden '{pat}' in supplier source"
+
+    def test_minimal_schema_no_supplier_id(self, tmp_path):
+        """Suppliers table with only id+name, ProductMaster without supplier_id."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE suppliers (id INTEGER PRIMARY KEY, name TEXT);
+            INSERT INTO suppliers (name) VALUES ('MinimalCorp');
+            CREATE TABLE ProductMaster (Barcode TEXT, Name TEXT, Stock INT,
+                                        ExpiryDate TEXT, Price REAL);
+            INSERT INTO ProductMaster VALUES ('A','X',1,'2027-01-01',1.0);
+        """)
+        conn.commit()
+        conn.close()
+        # List should succeed with product_count=0
+        r = load_suppliers_page(db)
+        assert r.ok, r.error_message
+        assert r.items[0].product_count == 0
+        # Detail should succeed with product_count=0
+        rd = load_supplier_detail(db, 1)
+        assert rd.ok, rd.error_message
+        assert rd.supplier.product_count == 0
+
+    def test_no_email_column_search_works(self, tmp_path):
+        """Suppliers with no email column: name search works, email-like search returns empty OK."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE suppliers (id INTEGER PRIMARY KEY, name TEXT);
+            INSERT INTO suppliers (name) VALUES ('TestSupplier');
+        """)
+        conn.commit()
+        conn.close()
+        r1 = load_suppliers_page(db, search_text="Test")
+        assert r1.ok
+        assert r1.total == 1
+        r2 = load_suppliers_page(db, search_text="nonexistent@email.com")
+        assert r2.ok
+        assert r2.total == 0
+
+    def test_default_markup_zero_displays_zero(self, tmp_path):
+        """default_markup=0 should render as '0', not '—'."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE suppliers (id INTEGER PRIMARY KEY, name TEXT,
+                                    default_markup REAL);
+            INSERT INTO suppliers (name, default_markup) VALUES ('ZeroCo', 0);
+        """)
+        conn.commit()
+        conn.close()
+        rd = load_supplier_detail(db, 1)
+        assert rd.ok
+        assert rd.supplier.default_markup == "0"

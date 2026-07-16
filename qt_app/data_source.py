@@ -556,16 +556,35 @@ def load_suppliers_page(db_path, search_text="", page=1, page_size=50):
         cur = conn.cursor()
         if not _has_table(cur, "suppliers"):
             return SupplierPageResult.failure("Ο πίνακας προμηθευτών δεν υπάρχει.")
+
+        # Schema detection
+        has_pm = _has_table(cur, "ProductMaster")
+        has_sid = has_pm and _optional_col(cur, "ProductMaster", "supplier_id", None) != "'' AS supplier_id"
+        # ^ _optional_col returns the column name when it exists, else the SQL fallback.
+        # Better: use _has_column-style approach.
+        has_sid = has_pm and _has_column(cur, "ProductMaster", "supplier_id")
+        pc_expr = (
+            "(SELECT COUNT(*) FROM ProductMaster p WHERE p.supplier_id=s.id) AS pc"
+            if has_sid else "0 AS pc")
+
+        email_col = _optional_col(cur, "suppliers", "email", "''")
+        has_email = email_col != "''"
+
         conditions, params = [], []
         if search_text:
             norm = _normalize_search(search_text)
             esc = _escape_like(norm)
             tax_col = _optional_col(cur, "suppliers", "tax_id", "''")
-            conditions.append(
-                "(search_normalize(s.name) LIKE ? ESCAPE '\\' "
-                "OR search_normalize(COALESCE(s.email,'')) LIKE ? ESCAPE '\\' "
-                f"OR search_normalize(COALESCE({tax_col},'')) LIKE ? ESCAPE '\\')")
-            params.extend([f"%{esc}%"] * 3)
+            clauses = [f"search_normalize(s.name) LIKE ? ESCAPE '\\'"]
+            params.append(f"%{esc}%")
+            if has_email:
+                clauses.append(
+                    f"search_normalize(COALESCE(s.email,'')) LIKE ? ESCAPE '\\'")
+                params.append(f"%{esc}%")
+            clauses.append(
+                f"search_normalize(COALESCE({tax_col},'')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{esc}%")
+            conditions.append("(" + " OR ".join(clauses) + ")")
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
         total = cur.execute(f"SELECT COUNT(*) FROM suppliers s{where}", params).fetchone()[0]
         if total == 0:
@@ -580,7 +599,7 @@ def load_suppliers_page(db_path, search_text="", page=1, page_size=50):
         em = _optional_col(cur, "suppliers", "email", "'' AS email")
         cur.execute(f"""
             SELECT s.id, s.name, {tax}, {cp}, {ph}, {em},
-                   (SELECT COUNT(*) FROM ProductMaster p WHERE p.supplier_id=s.id) AS pc
+                   {pc_expr}
             FROM suppliers s{where} ORDER BY s.name ASC LIMIT ? OFFSET ?
         """, params + [page_size, offset])
         items = tuple(SupplierSummary(
@@ -606,13 +625,20 @@ def load_supplier_detail(db_path, supplier_id):
             return SupplierDetailResult.failure("Ο πίνακας προμηθευτών δεν υπάρχει.")
         def _c(c, fb):
             return _optional_col(cur, "suppliers", c, fb)
+
+        has_pm = _has_table(cur, "ProductMaster")
+        has_sid = has_pm and _has_column(cur, "ProductMaster", "supplier_id")
+        pc_expr = (
+            "(SELECT COUNT(*) FROM ProductMaster p WHERE p.supplier_id=s.id) AS pc"
+            if has_sid else "0 AS pc")
+
         cur.execute(f"""
             SELECT s.id, s.name, {_c('phone',"''")}, {_c('email',"''")},
                    {_c('address',"''")}, {_c('tax_id',"''")},
                    {_c('contact_person',"''")}, {_c('allowed_sender_emails',"''")},
                    {_c('catalogue_format',"''")}, {_c('default_markup',"''")},
                    {_c('pricing_notes',"''")}, {_c('created_at',"''")},
-                   (SELECT COUNT(*) FROM ProductMaster p WHERE p.supplier_id=s.id) AS pc
+                   {pc_expr}
             FROM suppliers s WHERE s.id=?
         """, (supplier_id,))
         r = cur.fetchone()
@@ -622,7 +648,9 @@ def load_supplier_detail(db_path, supplier_id):
             id=r[0], name=r[1], phone=r[2] or "—", email=r[3] or "—",
             address=r[4] or "—", tax_id=r[5] or "—", contact_person=r[6] or "—",
             allowed_sender_emails=r[7] or "—", catalogue_format=r[8] or "—",
-            default_markup=str(r[9]) if r[9] else "—",
+            default_markup=(
+                str(int(r[9])) if isinstance(r[9], float) and r[9] == int(r[9])
+                else str(r[9])) if r[9] is not None else "—",
             pricing_notes=r[10] or "—", created_at=r[11] or "—", product_count=r[12] or 0))
     except (sqlite3.Error, FileNotFoundError) as e:
         return SupplierDetailResult.failure(f"Αδυναμία φόρτωσης: {e}")
