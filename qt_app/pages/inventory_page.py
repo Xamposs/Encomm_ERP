@@ -196,6 +196,7 @@ class InventoryPage(BasePage):
         self._write_worker = None
         self._write_thread = None
         self._write_loading = False
+        self._preview_dlg = None
         super().__init__(db_service, config, parent)
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
@@ -353,7 +354,9 @@ class InventoryPage(BasePage):
         from qt_app.dialogs.product_import_preview_dialog import (
             ProductImportPreviewDialog)
         dlg = ProductImportPreviewDialog(self)
+        self._preview_dlg = dlg
         dlg.exec()
+        self._preview_dlg = None
 
     def _on_edit_selected(self):
         rows = set()
@@ -598,9 +601,16 @@ class InventoryPage(BasePage):
 
     def shutdown(self) -> bool:
         """Return True only when ALL workers have stopped.
+        Preserves references on timeout — never clears a running QThread."""
+        # Cancel active preview dialog
+        if self._preview_dlg is not None:
+            if self._preview_dlg._cancel_event:
+                self._preview_dlg._cancel_event.set()
+            if self._preview_dlg._thread and self._preview_dlg._thread.isRunning():
+                self._preview_dlg._thread.quit()
+                self._preview_dlg._thread.wait(2000)
+            return False  # defer — MainWindow will retry
 
-        Preserves references on timeout — never clears a running QThread.
-        """
         all_stopped = True
 
         # Attempt write worker shutdown
