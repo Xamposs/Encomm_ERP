@@ -1349,12 +1349,22 @@ def preflight_pos_sale(db_path, cart_lines):
     cart_lines: iterable of (barcode: str, qty: int)
     Returns POSPreflightResult with per-line validation.
     """
-    # Input validation
-    if not cart_lines:
+    # Materialize and validate input
+    try:
+        lines_in = list(cart_lines)
+    except TypeError:
+        return POSPreflightResult.failure(
+            "Μη έγκυρη είσοδος: το cart_lines δεν είναι επαναλήψιμο.")
+
+    if not lines_in:
         return POSPreflightResult.failure("Το καλάθι είναι άδειο.")
 
     aggregated: dict[str, int] = {}
-    for bc, qty in cart_lines:
+    for item in lines_in:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return POSPreflightResult.failure(
+                f"Μη έγκυρη γραμμή καλαθιού: αναμένεται (barcode, ποσότητα).")
+        bc, qty = item
         if not bc or not isinstance(bc, str) or not bc.strip():
             return POSPreflightResult.failure(
                 f"Μη έγκυρο barcode: '{bc}'.")
@@ -1401,7 +1411,11 @@ def preflight_pos_sale(db_path, cart_lines):
                 price = float(price)
 
             # Stock validation
-            if stock < qty:
+            if isinstance(stock, bool) or not isinstance(stock, int) or stock < 0:
+                errors.append(
+                    f"Μη έγκυρο απόθεμα: {stock}.")
+                stock = 0
+            elif stock < qty:
                 errors.append(
                     f"Ανεπαρκές απόθεμα: ζητήθηκαν {qty}, διαθέσιμα {stock}.")
 
@@ -1428,6 +1442,7 @@ def preflight_pos_sale(db_path, cart_lines):
                 gross_total += round(price * qty, 2)
 
         all_valid = all(line.valid for line in lines)
+        gross_total = round(gross_total, 2) if all_valid else 0.0
         return POSPreflightResult(
             ok=all_valid,
             lines=tuple(lines),

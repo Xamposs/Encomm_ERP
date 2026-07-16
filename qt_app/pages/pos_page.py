@@ -262,8 +262,9 @@ class POSPage(BasePage):
             self._page_lbl.setText("Φόρτωση…")
         self._preflight_btn.setEnabled(
             not loading and len(self._cart) > 0)
-        # Disable cart mutation during preflight
+        self._cat_table.setEnabled(not loading)
         if self._mode == "preflight":
+            self._cart_table.setEnabled(not loading)
             for w in [self._cart_plus, self._cart_minus,
                       self._cart_remove, self._cart_clear]:
                 w.setEnabled(not loading)
@@ -316,6 +317,8 @@ class POSPage(BasePage):
         for w in [self._cart_plus, self._cart_minus,
                   self._cart_remove, self._cart_clear]:
             w.setEnabled(True)
+        self._cat_table.setEnabled(True)
+        self._cart_table.setEnabled(True)
         self._preflight_btn.setEnabled(len(self._cart) > 0)
         self._worker = None
         self._thread = None
@@ -325,6 +328,8 @@ class POSPage(BasePage):
 
     # ── Cart ──
     def _on_add_to_cart(self):
+        if self._loading:
+            return
         rows = {it.row() for it in self._cat_table.selectedItems()}
         if len(rows) != 1:
             return
@@ -348,6 +353,8 @@ class POSPage(BasePage):
         self._rebuild_cart()
 
     def _modify_cart(self, delta):
+        if self._loading:
+            return
         barcode = self._selected_cart_barcode()
         if not barcode or barcode not in self._cart:
             return
@@ -363,12 +370,16 @@ class POSPage(BasePage):
         self._rebuild_cart()
 
     def _remove_cart_line(self):
+        if self._loading:
+            return
         barcode = self._selected_cart_barcode()
         if barcode and barcode in self._cart:
             del self._cart[barcode]
         self._rebuild_cart()
 
     def _clear_cart(self):
+        if self._loading:
+            return
         self._cart.clear()
         self._rebuild_cart()
 

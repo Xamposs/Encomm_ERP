@@ -118,3 +118,53 @@ class TestPreflight:
                      "ALTER ", "CREATE TABLE", "REPLACE "]
         for pat in patterns:
             assert pat not in src.upper(), f"Forbidden '{pat}' in preflight"
+
+    def test_empty_generator(self):
+        r = preflight_pos_sale(":memory:", (x for x in []))
+        assert not r.ok
+        assert "άδειο" in r.error_message
+
+    def test_non_iterable(self):
+        r = preflight_pos_sale(":memory:", 42)
+        assert not r.ok
+        assert "επαναλήψιμο" in r.error_message
+
+    def test_malformed_line(self):
+        r = preflight_pos_sale(":memory:", [("A",)])
+        assert not r.ok
+        assert "γραμμή" in r.error_message
+
+    def test_malformed_stock_per_line(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE ProductMaster (Barcode TEXT PRIMARY KEY, Name TEXT,
+                Stock INT, ExpiryDate TEXT, Price REAL);
+            INSERT INTO ProductMaster VALUES ('A','OK',10,'2027-12-31',5.0);
+            INSERT INTO ProductMaster VALUES ('B','Bad Stock','bad','2027-12-31',3.0);
+        """)
+        conn.commit()
+        conn.close()
+        r = preflight_pos_sale(db, [("A", 1), ("B", 1)])
+        assert not r.ok
+        ok_line = next(l for l in r.lines if l.barcode == "A")
+        assert ok_line.valid
+        bad_line = next(l for l in r.lines if l.barcode == "B")
+        assert not bad_line.valid
+        assert "απόθεμα" in bad_line.error_message
+        assert bad_line.available_stock == 0
+
+    def test_gross_total_rounding(self, tmp_path):
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE ProductMaster (Barcode TEXT PRIMARY KEY, Name TEXT,
+                Stock INT, ExpiryDate TEXT, Price REAL);
+            INSERT INTO ProductMaster VALUES ('A','Item A',10,'2027-12-31',0.10);
+            INSERT INTO ProductMaster VALUES ('B','Item B',10,'2027-12-31',0.20);
+        """)
+        conn.commit()
+        conn.close()
+        r = preflight_pos_sale(db, [("A", 1), ("B", 1)])
+        assert r.ok
+        assert r.gross_total == 0.30
