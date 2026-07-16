@@ -38,7 +38,7 @@
   - Re-reads ProductMaster row-per-item
   - Decrements stock, writes audit, creates invoice header + line items
   - Full rollback on any failure
-  - **Not callable from Qt code** (creates DatabaseService dependency)
+  - **Not currently wired into the Qt application**; using it there would introduce a DatabaseService coupling that the Qt layer intentionally avoids
   - **Requires a VAT rate** (see §3 Financial Facts)
 
 ---
@@ -56,7 +56,7 @@ supplier_id   INTEGER  (optional — migration-added)
 ```
 
 - CTk-schema code (database_service.py:54-61) also has `CHECK (Stock >= 0)`, `CHECK (Price >= 0)`, and migration columns: `supplier_code TEXT`, `barcode_type TEXT DEFAULT 'EAN13'`, `vat_category INTEGER DEFAULT 6`, `eof_code TEXT`
-- **Qt POS uses only the 4 required columns** (Barcode, Name, Stock, Price, ExpiryDate) — validates them at load time
+- **Qt POS validates the 5 required columns** (Barcode, Name, Stock, Price, ExpiryDate) at load time
 
 ### invoices
 ```
@@ -95,14 +95,15 @@ barcode         TEXT NOT NULL
 product_name    TEXT NOT NULL
 old_stock       INTEGER NOT NULL
 new_stock       INTEGER NOT NULL
-difference      INTEGER NOT NULL        ← legacy (always present)
-reference_id    TEXT                    ← legacy
-change_amount   INTEGER                 ← current (may coexist)
-source          TEXT                    ← current
-operator        TEXT DEFAULT "Σύστημα"  ← current
+difference      INTEGER NOT NULL        ← legacy schema variant
+reference_id    TEXT                    ← legacy schema variant
+change_amount   INTEGER                 ← current schema variant
+source          TEXT                    ← current schema variant
+operator        TEXT DEFAULT "Σύστημα"  ← current schema variant
 ```
 
-- **Hybrid schema**: both `difference` and `change_amount` coexist in the real database
+- The repository contains compatibility code for **both** legacy (`difference`, `reference_id`) and current (`change_amount`, `source`, `operator`) schema variants
+- This audit did **not** inspect a deployed production database; the active production variant is unknown
 - The `_insert_stock_movement()` helper (inventory_command_service.py:80-160) detects columns via PRAGMA and inserts the correct set
 - CTk's `_log_stock_movement_on_conn` (database_service.py:1664-1698) tries `change_amount` first, falls back to `difference`
 - **Source identifiers seen**: `"Qt Αποθήκη"`, `"POS"`, `"Φόρμα Προϊόντος"`, `"Εισαγωγή"`, `"Τιμολόγιο"`
@@ -136,9 +137,9 @@ phone   TEXT
 
 ### VAT price semantics — **UNKNOWN**
 - The schema has `vat_category INTEGER DEFAULT 6` (a migration-added column on ProductMaster)
-- `process_checkout_transaction` takes an explicit `vat_rate: float` parameter (e.g. 0.15 = 15%)
-- Tests pass `vat_rate=0.15` which matches Greek pharmacy VAT (ΦΠΑ 15%)
-- **It is NOT established whether ProductMaster.Price is VAT-inclusive or VAT-exclusive**
+- `process_checkout_transaction` takes an explicit `vat_rate: float` parameter
+- **Existing tests pass `vat_rate=0.15`**; the repository does **not** establish this as a valid business, pharmacy, or tax policy
+- **It is NOT established whether ProductMaster.Price is VAT-inclusive or VAT-exclusive** — this remains blocking and must be decided outside this implementation task
 - The invoices table stores `subtotal`, `vat_amount`, and `grand_total` separately
 - The existing CTk checkout computes: `vat = round(subtotal * vat_rate, 2)`
 - **VAT behavior is explicitly frozen in the current Qt application** — POS Phase A/B0 show no VAT
@@ -244,9 +245,9 @@ The following transaction must execute inside **one** `BEGIN IMMEDIATE` / `COMMI
 | 4 | **Customer selection** | LOW | The current POS has no customer picker. Sales can be anonymous (customer_id=NULL) for Phase B2. |
 | 5 | **Payment method** | N/A for B2 | No payment table exists. Deferred until payment integration (Phase C+). |
 | 6 | **Receipt numbering** | N/A for B2 | Invoice ID can serve as receipt number for now. |
-| 7 | **AADE / ΗΔΙΚΑ integration** | N/A for B2 | Greek tax-authority integration is out of scope for Phase B. Deferred indefinitely. |
+|| 7 | **AADE / ΗΔΙΚΑ integration** | N/A for B2 | Deferred from Phase B2; planned for a later dedicated integration phase. No integration contract is implemented or approved yet. |
 | 8 | **Cancellation / returns** | N/A for B2 | No return/credit-note schema or logic exists. Deferred. |
-| 9 | **VAT rate configurability** | MEDIUM | `process_checkout_transaction` takes `vat_rate` as parameter. A Qt sale command must do the same — read from config or SystemConfig. Greek pharmacy default is 0.15 (15%). |
+| 9 | **VAT rate configurability** | MEDIUM | `process_checkout_transaction` takes `vat_rate` as parameter. A Qt sale command must do the same — read from config or SystemConfig. The appropriate VAT rate must be decided outside this implementation task. |
 | 10 | **Price changes between preflight and checkout** | DESIGN | The preflight uses `_connect_ro()` and the checkout uses a write connection. There is a TOCTOU window. Must re-read stock/price **inside the write transaction** (the atomic-sale contract already accounts for this). |
 
 ---
