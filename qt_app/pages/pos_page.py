@@ -223,7 +223,7 @@ class POSPage(BasePage):
 
     def _set_catalog_loading(self, loading: bool):
         """Enable/disable all catalog controls in one place."""
-        self._search.setReadOnly(loading)
+        self._search.setEnabled(not loading)
         self._refresh_btn.setEnabled(not loading)
         self._add_btn.setEnabled(False)  # always clear — recheck on selection
         self._prev_btn.setEnabled(False)
@@ -266,7 +266,7 @@ class POSPage(BasePage):
 
     def _on_done(self):
         self._loading = False
-        self._search.setReadOnly(False)
+        self._search.setEnabled(True)
         self._refresh_btn.setEnabled(True)
         self._worker = None
         self._thread = None
