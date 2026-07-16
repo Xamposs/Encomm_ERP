@@ -241,6 +241,11 @@ class InventoryPage(BasePage):
         self._edit_btn.setEnabled(False)
         self._edit_btn.clicked.connect(self._on_edit_selected)
         act_row.addWidget(self._edit_btn)
+        self._preview_btn = QPushButton("📥  Προεπισκόπηση Excel")
+        self._preview_btn.setCursor(Qt.PointingHandCursor)
+        self._preview_btn.setStyleSheet(self._accent_btn_qss())
+        self._preview_btn.clicked.connect(self._on_preview_xlsx)
+        act_row.addWidget(self._preview_btn)
         act_row.addStretch()
         self.root_layout.addLayout(act_row)
 
@@ -343,6 +348,12 @@ class InventoryPage(BasePage):
             stock=data["stock"], expiry_date=data["expiry_date"],
             price=data["price"], supplier_id=data["supplier_id"])
         self._confirm_and_execute("create", req, data)
+
+    def _on_preview_xlsx(self):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        dlg = ProductImportPreviewDialog(self)
+        dlg.exec()
 
     def _on_edit_selected(self):
         rows = set()
