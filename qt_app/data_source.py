@@ -981,3 +981,238 @@ def load_stock_movements(
     finally:
         if conn:
             conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Invoice data source (read-only)
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class InvoiceSummary:
+    id: str
+    invoice_date: str
+    customer_name: str
+    subtotal: float
+    vat_amount: float
+    grand_total: float
+
+
+@dataclass(frozen=True)
+class InvoiceItem:
+    barcode: str
+    name: str
+    quantity: int
+    price: float
+    line_total: float
+
+
+@dataclass(frozen=True)
+class InvoiceDetail:
+    id: str
+    invoice_date: str
+    customer_name: str
+    subtotal: float
+    vat_amount: float
+    grand_total: float
+    items: Tuple[InvoiceItem, ...]
+
+
+@dataclass(frozen=True)
+class InvoicePageResult:
+    ok: bool
+    total: int = 0
+    page: int = 1
+    page_size: int = 50
+    items: Tuple[InvoiceSummary, ...] = ()
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, total, page, page_size, items):
+        return cls(ok=True, total=total, page=page, page_size=page_size, items=items)
+
+    @classmethod
+    def failure(cls, msg):
+        return cls(ok=False, error_message=msg)
+
+
+@dataclass(frozen=True)
+class InvoiceDetailResult:
+    ok: bool
+    invoice: InvoiceDetail | None = None
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, inv):
+        return cls(ok=True, invoice=inv)
+
+    @classmethod
+    def failure(cls, msg):
+        return cls(ok=False, error_message=msg)
+
+
+def _validate_date(label, val):
+    from datetime import date as dt_date
+    try:
+        dt_date.fromisoformat(val)
+    except ValueError:
+        raise ValueError(
+            f"Μη έγκυρη ημερομηνία για {label}: '{val}'. Απαιτείται YYYY-MM-DD.")
+
+
+def load_invoices_page(
+    db_path, search_text="", date_from="", date_to="", page=1, page_size=50,
+):
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+
+    # Date validation
+    from datetime import date as dt_date
+    for label, val in [("date_from", date_from), ("date_to", date_to)]:
+        if val:
+            try:
+                dt_date.fromisoformat(val)
+            except ValueError:
+                return InvoicePageResult.failure(
+                    f"Μη έγκυρη ημερομηνία για {label}: '{val}'. Απαιτείται YYYY-MM-DD.")
+    if date_from and date_to:
+        try:
+            if dt_date.fromisoformat(date_from) > dt_date.fromisoformat(date_to):
+                return InvoicePageResult.failure(
+                    "Η ημερομηνία 'από' δεν μπορεί να είναι μετά την 'έως'.")
+        except ValueError:
+            pass
+
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        conn.create_function("search_normalize", 1, _normalize_search, deterministic=True)
+        cur = conn.cursor()
+        if not _has_table(cur, "invoices"):
+            return InvoicePageResult.failure("Ο πίνακας παραστατικών δεν υπάρχει.")
+
+        # Required columns
+        for col in ["id", "invoice_date", "subtotal", "vat_amount", "grand_total"]:
+            if not _has_column(cur, "invoices", col):
+                return InvoicePageResult.failure(
+                    f"Λείπει η υποχρεωτική στήλη '{col}' στον πίνακα invoices.")
+
+        has_customers = _has_table(cur, "customers")
+        has_cid = has_customers and _has_column(cur, "invoices", "customer_id")
+        cust_join = (" LEFT JOIN customers cu ON i.customer_id=cu.id" if has_cid else "")
+        cust_col = "cu.name" if has_cid else "''"
+
+        conditions, params = [], []
+        if search_text:
+            norm = _normalize_search(search_text)
+            esc = _escape_like(norm)
+            clauses = [f"i.id LIKE ? ESCAPE '\\'"]
+            params.append(f"%{esc}%")
+            if has_cid:
+                clauses.append(
+                    f"search_normalize(cu.name) LIKE ? ESCAPE '\\'")
+                params.append(f"%{esc}%")
+            conditions.append("(" + " OR ".join(clauses) + ")")
+        if date_from:
+            conditions.append("i.invoice_date >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("date(i.invoice_date) <= date(?)")
+            params.append(date_to)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        total = cur.execute(
+            f"SELECT COUNT(*) FROM invoices i{cust_join}{where}", params).fetchone()[0]
+        if total == 0:
+            page = 1
+        else:
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(page, total_pages))
+        offset = (page - 1) * page_size
+
+        cur.execute(f"""
+            SELECT i.id, i.invoice_date, {cust_col},
+                   i.subtotal, i.vat_amount, i.grand_total
+            FROM invoices i{cust_join}{where}
+            ORDER BY i.invoice_date DESC, i.id DESC
+            LIMIT ? OFFSET ?
+        """, params + [page_size, offset])
+        items = tuple(InvoiceSummary(
+            id=r[0], invoice_date=r[1], customer_name=r[2] or "—",
+            subtotal=r[3], vat_amount=r[4], grand_total=r[5])
+            for r in cur.fetchall())
+        return InvoicePageResult.success(total, page, page_size, items)
+
+    except (sqlite3.Error, FileNotFoundError) as e:
+        return InvoicePageResult.failure(f"Αδυναμία φόρτωσης παραστατικών: {e}")
+    except Exception as e:
+        return InvoicePageResult.failure(f"Αδυναμία φόρτωσης παραστατικών: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_invoice_detail(db_path, invoice_id):
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        cur = conn.cursor()
+        for tbl in ["invoices"]:
+            if not _has_table(cur, tbl):
+                return InvoiceDetailResult.failure(
+                    f"Ο πίνακας {tbl} δεν υπάρχει.")
+
+        # Required header columns
+        for col in ["id", "invoice_date", "subtotal", "vat_amount", "grand_total"]:
+            if not _has_column(cur, "invoices", col):
+                return InvoiceDetailResult.failure(
+                    f"Λείπει η υποχρεωτική στήλη '{col}' στον πίνακα invoices.")
+
+        has_customers = _has_table(cur, "customers")
+        has_cid = has_customers and _has_column(cur, "invoices", "customer_id")
+        cust_name = "''"
+
+        cur.execute(f"""
+            SELECT i.invoice_date, i.subtotal, i.vat_amount, i.grand_total,
+                   {cust_name if has_cid else "''"}
+            FROM invoices i {"LEFT JOIN customers cu ON i.customer_id=cu.id" if has_cid else ""}
+            WHERE i.id=?
+        """, (invoice_id,))
+        row = cur.fetchone()
+        if not row:
+            return InvoiceDetailResult.failure(
+                f"Το παραστατικό '{invoice_id}' δεν βρέθηκε.")
+        inv_date, subtotal, vat_amount, grand_total, cname = (
+            row[0], row[1], row[2], row[3], row[4] or "—")
+
+        # Items
+        items: list[InvoiceItem] = []
+        has_items = _has_table(cur, "invoice_items")
+        has_item_cols = False
+        if has_items:
+            item_cols = ["barcode", "name", "quantity", "price"]
+            has_item_cols = all(
+                _has_column(cur, "invoice_items", c) for c in item_cols)
+        if has_items and has_item_cols:
+            cur.execute("""
+                SELECT barcode, name, quantity, price
+                FROM invoice_items WHERE invoice_id=?
+            """, (invoice_id,))
+            items = [
+                InvoiceItem(
+                    barcode=ir[0], name=ir[1], quantity=ir[2],
+                    price=ir[3], line_total=round(ir[2] * ir[3], 2))
+                for ir in cur.fetchall()
+            ]
+
+        return InvoiceDetailResult.success(InvoiceDetail(
+            id=invoice_id, invoice_date=inv_date, customer_name=cname,
+            subtotal=subtotal, vat_amount=vat_amount, grand_total=grand_total,
+            items=tuple(items)))
+
+    except (sqlite3.Error, FileNotFoundError) as e:
+        return InvoiceDetailResult.failure(f"Αδυναμία φόρτωσης: {e}")
+    except Exception as e:
+        return InvoiceDetailResult.failure(f"Αδυναμία φόρτωσης: {e}")
+    finally:
+        if conn:
+            conn.close()
