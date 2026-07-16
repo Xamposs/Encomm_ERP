@@ -474,3 +474,160 @@ def load_supplier_choices(db_path: str) -> Tuple[SupplierChoice, ...]:
     finally:
         if conn:
             conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Supplier data source (read-only)
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class SupplierSummary:
+    id: int
+    name: str
+    tax_id: str
+    contact_person: str
+    phone: str
+    email: str
+    product_count: int
+
+
+@dataclass(frozen=True)
+class SupplierDetail:
+    id: int
+    name: str
+    phone: str
+    email: str
+    address: str
+    tax_id: str
+    contact_person: str
+    allowed_sender_emails: str
+    catalogue_format: str
+    default_markup: str
+    pricing_notes: str
+    created_at: str
+    product_count: int
+
+
+@dataclass(frozen=True)
+class SupplierPageResult:
+    ok: bool
+    total: int = 0
+    page: int = 1
+    page_size: int = 50
+    items: Tuple[SupplierSummary, ...] = ()
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, total, page, page_size, items):
+        return cls(ok=True, total=total, page=page, page_size=page_size, items=items)
+
+    @classmethod
+    def failure(cls, msg):
+        return cls(ok=False, error_message=msg)
+
+
+@dataclass(frozen=True)
+class SupplierDetailResult:
+    ok: bool
+    supplier: SupplierDetail | None = None
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, sup):
+        return cls(ok=True, supplier=sup)
+
+    @classmethod
+    def failure(cls, msg):
+        return cls(ok=False, error_message=msg)
+
+
+def _optional_col(cur, table, column, fallback):
+    rows = cur.execute(f"PRAGMA table_info('{table}')").fetchall()
+    return column if any(r[1] == column for r in rows) else fallback
+
+
+def load_suppliers_page(db_path, search_text="", page=1, page_size=50):
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        conn.create_function("search_normalize", 1, _normalize_search, deterministic=True)
+        cur = conn.cursor()
+        if not _has_table(cur, "suppliers"):
+            return SupplierPageResult.failure("Ο πίνακας προμηθευτών δεν υπάρχει.")
+        conditions, params = [], []
+        if search_text:
+            norm = _normalize_search(search_text)
+            esc = _escape_like(norm)
+            tax_col = _optional_col(cur, "suppliers", "tax_id", "''")
+            conditions.append(
+                "(search_normalize(s.name) LIKE ? ESCAPE '\\' "
+                "OR search_normalize(COALESCE(s.email,'')) LIKE ? ESCAPE '\\' "
+                f"OR search_normalize(COALESCE({tax_col},'')) LIKE ? ESCAPE '\\')")
+            params.extend([f"%{esc}%"] * 3)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        total = cur.execute(f"SELECT COUNT(*) FROM suppliers s{where}", params).fetchone()[0]
+        if total == 0:
+            page = 1
+        else:
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(page, total_pages))
+        offset = (page - 1) * page_size
+        tax = _optional_col(cur, "suppliers", "tax_id", "'' AS tax_id")
+        cp = _optional_col(cur, "suppliers", "contact_person", "'' AS contact_person")
+        ph = _optional_col(cur, "suppliers", "phone", "'' AS phone")
+        em = _optional_col(cur, "suppliers", "email", "'' AS email")
+        cur.execute(f"""
+            SELECT s.id, s.name, {tax}, {cp}, {ph}, {em},
+                   (SELECT COUNT(*) FROM ProductMaster p WHERE p.supplier_id=s.id) AS pc
+            FROM suppliers s{where} ORDER BY s.name ASC LIMIT ? OFFSET ?
+        """, params + [page_size, offset])
+        items = tuple(SupplierSummary(
+            id=r[0], name=r[1], tax_id=r[2] or "—", contact_person=r[3] or "—",
+            phone=r[4] or "—", email=r[5] or "—", product_count=r[6] or 0)
+            for r in cur.fetchall())
+        return SupplierPageResult.success(total, page, page_size, items)
+    except (sqlite3.Error, FileNotFoundError) as e:
+        return SupplierPageResult.failure(f"Αδυναμία φόρτωσης προμηθευτών: {e}")
+    except Exception as e:
+        return SupplierPageResult.failure(f"Αδυναμία φόρτωσης προμηθευτών: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_supplier_detail(db_path, supplier_id):
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        cur = conn.cursor()
+        if not _has_table(cur, "suppliers"):
+            return SupplierDetailResult.failure("Ο πίνακας προμηθευτών δεν υπάρχει.")
+        def _c(c, fb):
+            return _optional_col(cur, "suppliers", c, fb)
+        cur.execute(f"""
+            SELECT s.id, s.name, {_c('phone',"''")}, {_c('email',"''")},
+                   {_c('address',"''")}, {_c('tax_id',"''")},
+                   {_c('contact_person',"''")}, {_c('allowed_sender_emails',"''")},
+                   {_c('catalogue_format',"''")}, {_c('default_markup',"''")},
+                   {_c('pricing_notes',"''")}, {_c('created_at',"''")},
+                   (SELECT COUNT(*) FROM ProductMaster p WHERE p.supplier_id=s.id) AS pc
+            FROM suppliers s WHERE s.id=?
+        """, (supplier_id,))
+        r = cur.fetchone()
+        if not r:
+            return SupplierDetailResult.failure(f"Ο προμηθευτής {supplier_id} δεν βρέθηκε.")
+        return SupplierDetailResult.success(SupplierDetail(
+            id=r[0], name=r[1], phone=r[2] or "—", email=r[3] or "—",
+            address=r[4] or "—", tax_id=r[5] or "—", contact_person=r[6] or "—",
+            allowed_sender_emails=r[7] or "—", catalogue_format=r[8] or "—",
+            default_markup=str(r[9]) if r[9] else "—",
+            pricing_notes=r[10] or "—", created_at=r[11] or "—", product_count=r[12] or 0))
+    except (sqlite3.Error, FileNotFoundError) as e:
+        return SupplierDetailResult.failure(f"Αδυναμία φόρτωσης: {e}")
+    except Exception as e:
+        return SupplierDetailResult.failure(f"Αδυναμία φόρτωσης: {e}")
+    finally:
+        if conn:
+            conn.close()

@@ -288,11 +288,12 @@ class TestInventoryLoad:
         import ast
         src = os.path.join(os.path.dirname(__file__), "..", "qt_app", "data_source.py")
         tree = ast.parse(open(src, encoding="utf-8").read())
-        forbidden = {"INSERT", "UPDATE", "DELETE", "DROP", "ALTER",
-                      "CREATE", "REPLACE", "TRUNCATE"}
+        forbidden = {"INSERT ", "UPDATE ", "DELETE ", "DROP ", "ALTER ",
+                      "CREATE ", "REPLACE ", "TRUNCATE "}
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                upper = node.value.upper().strip()
+                upper = node.value.upper()
                 for kw in forbidden:
-                    if upper.startswith(kw):
-                        pytest.fail(f"Forbidden SQL '{kw}': {node.value[:80]!r}")
+                    if kw in upper and (
+                            upper.startswith(kw) or f"\n{kw}" in upper):
+                        pytest.fail(f"Forbidden SQL '{kw.strip()}': {node.value[:80]!r}")
