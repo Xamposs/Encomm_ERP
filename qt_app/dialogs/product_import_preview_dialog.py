@@ -578,37 +578,43 @@ class ProductImportPreviewDialog(QDialog):
                     r, 1, QTableWidgetItem(greek_fields))
             self._conflict_table.show()
 
-        # C2: detail rows with current/incoming values
-        details = getattr(result, 'conflict_details', ())
-        FIELD_GREEK_REV = {
-            "Name": "Όνομα", "Stock": "Απόθεμα",
-            "Price": "Τιμή", "ExpiryDate": "Ημ. Λήξης"}
-        if details:
-            self._detail_notice_lbl.show()
-            self._detail_table.setRowCount(len(details))
-            for r, d in enumerate(details):
-                self._detail_table.setItem(
-                    r, 0, QTableWidgetItem(d.barcode))
-                self._detail_table.setItem(
-                    r, 1, QTableWidgetItem(
-                        FIELD_GREEK_REV.get(d.field, d.field)))
-                self._detail_table.setItem(
-                    r, 2, QTableWidgetItem(d.current_value))
-                self._detail_table.setItem(
-                    r, 3, QTableWidgetItem(d.incoming_value))
-            self._detail_table.show()
-            # Show truncation notice if detail buffer is full
-            _MAX_DETAILS = 200
-            if len(details) >= _MAX_DETAILS:
-                self._detail_truncated_lbl.setText(
-                    f"⚠ Εμφανίζονται οι πρώτες {len(details)} διαφορές "
-                    f"(όριο {_MAX_DETAILS}). "
-                    f"Συνολικά υπάρχουν {result.changed_existing} προϊόντα "
-                    f"με αλλαγές. Τα υπάρχοντα ΔΕΝ θα τροποποιηθούν.")
-                self._detail_truncated_lbl.show()
+        # C2: detail rows with current/incoming values — success only
+        if result.ok and not result.cancelled:
+            details = getattr(result, 'conflict_details', ())
+            FIELD_GREEK_REV = {
+                "Name": "Όνομα", "Stock": "Απόθεμα",
+                "Price": "Τιμή", "ExpiryDate": "Ημ. Λήξης"}
+            if details:
+                self._detail_notice_lbl.show()
+                self._detail_table.setRowCount(len(details))
+                for r, d in enumerate(details):
+                    self._detail_table.setItem(
+                        r, 0, QTableWidgetItem(d.barcode))
+                    self._detail_table.setItem(
+                        r, 1, QTableWidgetItem(
+                            FIELD_GREEK_REV.get(d.field, d.field)))
+                    self._detail_table.setItem(
+                        r, 2, QTableWidgetItem(d.current_value))
+                    self._detail_table.setItem(
+                        r, 3, QTableWidgetItem(d.incoming_value))
+                self._detail_table.show()
+                # Use exact truncation flag from result
+                if getattr(result, 'conflict_details_truncated', False):
+                    self._detail_truncated_lbl.setText(
+                        f"⚠ Εμφανίζονται οι πρώτες {len(details)} "
+                        f"σειρές διαφορών. Οι υπόλοιπες διαφορές "
+                        f"παραλείφθηκαν λόγω ορίου. "
+                        f"Τα υπάρχοντα προϊόντα ΔΕΝ θα τροποποιηθούν.")
+                    self._detail_truncated_lbl.show()
+            else:
+                self._detail_notice_lbl.hide()
+                self._detail_table.hide()
+                self._detail_truncated_lbl.hide()
         else:
+            # Cancelled/failed: hide detail widgets, clear rows
             self._detail_notice_lbl.hide()
             self._detail_table.hide()
+            self._detail_table.setRowCount(0)
             self._detail_truncated_lbl.hide()
 
         # Also show preview errors/samples from the underlying scan

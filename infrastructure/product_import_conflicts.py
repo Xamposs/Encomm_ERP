@@ -83,15 +83,18 @@ class ImportConflictResult:
     unchanged_existing: int = 0
     changed_existing: int = 0
     conflict_samples: Tuple[ConflictRecord, ...] = ()
-    conflict_details: Tuple[ConflictDetail, ...] = ()
     errors: Tuple[ImportRowErr, ...] = ()
     sample_rows: Tuple[Tuple[str, str, int, float, str], ...] = ()
     source_signature: ImportSourceSignature | None = None
+    # ── C2 fields (appended; never inserted between legacy fields) ───
+    conflict_details: Tuple[ConflictDetail, ...] = ()
+    conflict_details_truncated: bool = False
 
     @classmethod
     def _make(cls, ok, cancelled, msg, fn, sn, scanned, valid, invalid,
               dupes, classified, new, unchanged, changed,
-              conflicts, details, errors, samples, signature=None):
+              conflicts, errors, samples, signature=None,
+              details=(), truncated=False):
         return cls(
             ok=ok, cancelled=cancelled, error_message=msg,
             file_name=fn, sheet_name=sn,
@@ -101,40 +104,46 @@ class ImportConflictResult:
             new_barcodes=new, unchanged_existing=unchanged,
             changed_existing=changed,
             conflict_samples=tuple(conflicts),
-            conflict_details=tuple(details),
             errors=tuple(errors),
             sample_rows=tuple(samples),
             source_signature=signature,
+            conflict_details=tuple(details),
+            conflict_details_truncated=truncated,
         )
 
     @classmethod
     def success(cls, fn, sn, scanned, valid, invalid, dupes, classified,
-                new, unchanged, changed, conflicts, details, errors, samples,
-                signature=None):
+                new, unchanged, changed, conflicts, errors, samples,
+                signature=None, *, details=(), truncated=False):
         return cls._make(True, False, "", fn, sn, scanned, valid, invalid,
                          dupes, classified, new, unchanged, changed,
-                         conflicts, details, errors, samples, signature=signature)
+                         conflicts, errors, samples, signature=signature,
+                         details=details, truncated=truncated)
 
     @classmethod
     def cancelled(cls, fn, sn, scanned, valid, invalid, dupes, classified,
-                  new, unchanged, changed, conflicts, details, errors, samples):
+                  new, unchanged, changed, conflicts, errors, samples,
+                  *, details=(), truncated=False):
         return cls._make(False, True, "Η ανάλυση ακυρώθηκε.",
                          fn, sn, scanned, valid, invalid, dupes,
                          classified, new, unchanged, changed,
-                         conflicts, details, errors, samples)
+                         conflicts, errors, samples,
+                         details=details, truncated=truncated)
 
     @classmethod
     def partial(cls, msg, fn, sn, scanned, valid, invalid, dupes,
                 classified, new, unchanged, changed,
-                conflicts, details, errors, samples):
+                conflicts, errors, samples,
+                *, details=(), truncated=False):
         return cls._make(False, False, msg, fn, sn, scanned, valid, invalid,
                          dupes, classified, new, unchanged, changed,
-                         conflicts, details, errors, samples)
+                         conflicts, errors, samples,
+                         details=details, truncated=truncated)
 
     @classmethod
     def failure(cls, fn, sn, msg):
         return cls._make(False, False, msg, fn, sn, 0, 0, 0, 0, 0, 0, 0, 0,
-                         (), (), (), ())
+                         (), (), ())
 
 
 # ── Internal helpers ──────────────────────────────────────────────────
@@ -213,13 +222,10 @@ def _normalize_expiry(raw) -> str | None:
 
 
 def _fmt_val(val) -> str:
-    """Format a DB/incoming value for display.  Blank → '—'."""
+    """Format a DB/incoming value for display.  None/blank → '—'."""
     if val is None:
         return "—"
     s = str(val).strip()
-    if s == "" or s == "0.0":
-        if isinstance(val, float):
-            return "—"
     return s if s else "—"
 
 
@@ -227,10 +233,11 @@ def _classify_batch(batch: List[IncomingProduct], conn: sqlite3.Connection,
                     cancel_event, new_count: int, unchanged_count: int,
                     changed_count: int, conflicts: List[ConflictRecord],
                     details: List[ConflictDetail],
+                    total_attempted: int,
                     MAX_CONFLICT_SAMPLES: int,
                     MAX_CONFLICT_DETAILS: int,
-                    ) -> Tuple[int, bool, int, int, int]:
-    """Classify a batch. Returns (processed, cancelled, new, unchanged, changed)."""
+                    ) -> Tuple[int, bool, int, int, int, int]:
+    """Classify a batch. Returns (processed, cancelled, new, unchanged, changed, attempted_details)."""
     barcodes = [p.barcode for p in batch]
     placeholders = ",".join("?" for _ in barcodes)
     rows = conn.execute(
@@ -246,9 +253,10 @@ def _classify_batch(batch: List[IncomingProduct], conn: sqlite3.Connection,
             expiry_date=r["ExpiryDate"] or "")
 
     processed = 0
+    attempted = total_attempted
     for prod in batch:
         if cancel_event and cancel_event.is_set():
-            return processed, True, new_count, unchanged_count, changed_count
+            return processed, True, new_count, unchanged_count, changed_count, attempted
         existing = db_data.get(prod.barcode)
         if existing is None:
             new_count += 1
@@ -257,24 +265,28 @@ def _classify_batch(batch: List[IncomingProduct], conn: sqlite3.Connection,
             # Check each field and build detail records
             if prod.name != existing.name:
                 changed_fields.append("Name")
+                attempted += 1
                 if len(details) < MAX_CONFLICT_DETAILS:
                     details.append(ConflictDetail(
                         prod.barcode, "Name",
                         _fmt_val(existing.name), _fmt_val(prod.name)))
             if prod.stock != existing.stock:
                 changed_fields.append("Stock")
+                attempted += 1
                 if len(details) < MAX_CONFLICT_DETAILS:
                     details.append(ConflictDetail(
                         prod.barcode, "Stock",
                         _fmt_val(existing.stock), _fmt_val(prod.stock)))
             if Decimal(str(prod.price)) != Decimal(str(existing.price)):
                 changed_fields.append("Price")
+                attempted += 1
                 if len(details) < MAX_CONFLICT_DETAILS:
                     details.append(ConflictDetail(
                         prod.barcode, "Price",
                         _fmt_val(existing.price), _fmt_val(prod.price)))
             if prod.expiry_date != existing.expiry_date:
                 changed_fields.append("ExpiryDate")
+                attempted += 1
                 if len(details) < MAX_CONFLICT_DETAILS:
                     details.append(ConflictDetail(
                         prod.barcode, "ExpiryDate",
@@ -288,7 +300,7 @@ def _classify_batch(batch: List[IncomingProduct], conn: sqlite3.Connection,
             else:
                 unchanged_count += 1
         processed += 1
-    return processed, False, new_count, unchanged_count, changed_count
+    return processed, False, new_count, unchanged_count, changed_count, attempted
 
 
 # ── Public API ───────────────────────────────────────────────────────
@@ -360,6 +372,7 @@ def analyze_import_conflicts(
     samples: List[Tuple[str, str, int, float, str]] = []
     conflicts: List[ConflictRecord] = []
     details: List[ConflictDetail] = []
+    total_details_attempted: int = 0
     seen_barcodes: Set[str] = set()
     dupe_barcodes: Set[str] = set()
     batch: List[IncomingProduct] = []
@@ -473,10 +486,10 @@ def analyze_import_conflicts(
 
             # Flush when batch is full
             if len(batch) >= BATCH_SIZE:
-                processed, batch_cancelled, new_count, unchanged_count, changed_count = (
+                processed, batch_cancelled, new_count, unchanged_count, changed_count, total_details_attempted = (
                     _classify_batch(batch, conn, cancel_event, new_count,
                                     unchanged_count, changed_count, conflicts,
-                                    details,
+                                    details, total_details_attempted,
                                     MAX_CONFLICT_SAMPLES, MAX_CONFLICT_DETAILS))
                 classified += processed
                 batch.clear()
@@ -486,10 +499,10 @@ def analyze_import_conflicts(
 
         # Flush remaining
         if batch and not cancelled:
-            processed, batch_cancelled, new_count, unchanged_count, changed_count = (
+            processed, batch_cancelled, new_count, unchanged_count, changed_count, total_details_attempted = (
                 _classify_batch(batch, conn, cancel_event, new_count,
                                 unchanged_count, changed_count, conflicts,
-                                details,
+                                details, total_details_attempted,
                                 MAX_CONFLICT_SAMPLES, MAX_CONFLICT_DETAILS))
             classified += processed
             batch.clear()
@@ -509,19 +522,22 @@ def analyze_import_conflicts(
     conn.close()
     conn = None
     dupes = len(dupe_barcodes)
+    details_truncated = total_details_attempted > MAX_CONFLICT_DETAILS
 
     if cancelled:
         return ImportConflictResult.cancelled(
             file_path, active_sheet, scanned, valid, invalid, dupes,
             classified, new_count, unchanged_count, changed_count,
-            conflicts, details, errors, samples)
+            conflicts, errors, samples,
+            details=details, truncated=details_truncated)
 
     if limit_reached:
         return ImportConflictResult.partial(
             f"Υπέρβαση ορίου {max_rows:,} γραμμών.",
             file_path, active_sheet, scanned, valid, invalid, dupes,
             classified, new_count, unchanged_count, changed_count,
-            conflicts, details, errors, samples)
+            conflicts, errors, samples,
+            details=details, truncated=details_truncated)
 
     # Verify source signature hasn't changed during analysis
     try:
@@ -538,4 +554,5 @@ def analyze_import_conflicts(
     return ImportConflictResult.success(
         file_path, active_sheet, scanned, valid, invalid, dupes,
         classified, new_count, unchanged_count, changed_count,
-        conflicts, details, errors, samples, signature=sig_before)
+        conflicts, errors, samples, signature=sig_before,
+        details=details, truncated=details_truncated)

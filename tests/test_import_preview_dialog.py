@@ -198,7 +198,7 @@ class TestConflictUI:
             "f.xlsx", "S1", 10, 10, 0, 0, 10, 5, 3, 2,
             [ConflictRecord("A", ("Name", "Price")),
              ConflictRecord("B", ("Stock",))],
-            [], (), [], signature=_fake_sig())
+            [], [], signature=_fake_sig())
         d._on_conflict_done(result)
         assert "Νέα προϊόντα: 5" in d._conflict_summary_lbl.text()
         assert "Όνομα, Τιμή" in d._conflict_table.item(0, 1).text()
@@ -212,7 +212,7 @@ class TestConflictUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.cancelled(
-            "f.xlsx", "S1", 500, 500, 0, 0, 300, 200, 70, 30, [], (), [], [])
+            "f.xlsx", "S1", 500, 500, 0, 0, 300, 200, 70, 30, [], [], [])
         d._on_conflict_done(result)
         assert "μερική" in d._status_lbl.text()
         assert "Ταξινομήθηκαν: 300" in d._conflict_summary_lbl.text().replace("\n", " ")
@@ -254,7 +254,7 @@ class TestConflictUI:
         samples = tuple(
             ConflictRecord(f"B{i}", ("Name",)) for i in range(80))
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 0, 0, 10, samples, [], (), [],
+            "f", "S1", 10, 10, 0, 0, 10, 0, 0, 10, samples, [], [],
             signature=_fake_sig())
         d._on_conflict_done(result)
         assert d._conflict_table.rowCount() == 50
@@ -275,7 +275,7 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], (), [], [],
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
             signature=_fake_sig())
         d._on_conflict_done(result)
         assert d._plan_btn.isEnabled()
@@ -288,7 +288,7 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.cancelled(
-            "f", "S1", 10, 10, 0, 0, 5, 2, 2, 1, [], (), [], [])
+            "f", "S1", 10, 10, 0, 0, 5, 2, 2, 1, [], [], [])
         d._on_conflict_done(result)
         assert not d._plan_btn.isEnabled()
 
@@ -300,7 +300,7 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], (), [], [],
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
             signature=_fake_sig())
         d._on_conflict_done(result)
         d._on_build_plan()
@@ -318,7 +318,7 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], (), [], [],
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
             signature=_fake_sig())
         d._on_conflict_done(result)
         d._plan_policy.setCurrentIndex(1)
@@ -335,7 +335,7 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], (), [], [],
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
             signature=_fake_sig())
         d._on_conflict_done(result)
         d._on_build_plan()
@@ -359,7 +359,7 @@ class TestCommitUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], (), [], [],
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
             signature=_fake_sig())
         d._on_conflict_done(result)
         d._on_build_plan()
@@ -373,7 +373,7 @@ class TestCommitUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], (), [], [],
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
             signature=_fake_sig())
         d._on_conflict_done(result)
         d._on_build_plan()
@@ -395,7 +395,7 @@ class TestCommitUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], (), [], [],
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
             signature=_fake_sig())
         d._on_conflict_done(result)
         d._on_build_plan()

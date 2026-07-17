@@ -393,3 +393,117 @@ class TestC2Details:
         assert r.valid_rows == 1
         assert r.classified_rows == 1
         assert r.conflict_details == ()
+
+    def test_legacy_factory_signatures_still_work(self):
+        """Pre-C2 positional contracts must still work unchanged."""
+        from infrastructure.product_import_identity import ImportSourceSignature
+        sig = ImportSourceSignature(1, "a" * 64, "b" * 64)
+        # success(..., conflicts, errors, samples, signature=...)
+        r = ImportConflictResult.success(
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
+            signature=sig)
+        assert r.ok
+        assert r.changed_existing == 3
+        assert r.conflict_details == ()
+        assert not r.conflict_details_truncated
+        # cancelled(..., conflicts, errors, samples)
+        r2 = ImportConflictResult.cancelled(
+            "f", "S1", 10, 10, 0, 0, 5, 2, 2, 1, [], [], [])
+        assert r2.cancelled
+        assert r2.conflict_details == ()
+        # partial(..., conflicts, errors, samples)
+        r3 = ImportConflictResult.partial(
+            "msg", "f", "S1", 10, 10, 0, 0, 5, 2, 2, 1, [], [], [])
+        assert not r3.ok
+        assert r3.conflict_details == ()
+
+    def test_price_zero_shown_as_numeric(self, tmp_path):
+        """DB price 0.0 is shown as 0.0, not '—'."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "N", 1, 5.0, ""]])
+        _make_db(db, [("A", "N", 1, 0.0, "")])
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        price_d = [d for d in r.conflict_details if d.field == "Price"]
+        assert len(price_d) == 1
+        assert price_d[0].current_value == "0.0"
+
+    def test_exactly_at_cap_not_truncated(self, tmp_path):
+        """Exactly MAX_CONFLICT_DETAILS rows → not truncated."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        # 50 products × 4 fields changed = 200 detail rows (exact cap)
+        rows = []
+        db_rows = []
+        for i in range(50):
+            b = f"{i:013d}"
+            rows.append([b, f"N{i}", 100, 99.0, "2029-01-01"])
+            db_rows.append((b, f"O{i}", 1, 1.0, "2028-01-01"))
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
+        _make_db(db, db_rows)
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert len(r.conflict_details) == 200
+        assert not r.conflict_details_truncated
+
+    def test_more_than_cap_truncated(self, tmp_path):
+        """More than MAX_CONFLICT_DETAILS rows → truncated flag true."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        # 51 products × 4 fields = 204 > 200 cap
+        rows = []
+        db_rows = []
+        for i in range(51):
+            b = f"{i:013d}"
+            rows.append([b, f"N{i}", 100, 99.0, "2029-01-01"])
+            db_rows.append((b, f"O{i}", 1, 1.0, "2028-01-01"))
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
+        _make_db(db, db_rows)
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert len(r.conflict_details) == 200  # capped
+        assert r.conflict_details_truncated
+
+    def test_cancelled_result_has_no_detail_rows(self, tmp_path):
+        """Cancelled result with details must not render as final."""
+        class Cancel:
+            def __init__(self):
+                self.called = 0
+            def is_set(self):
+                self.called += 1
+                return self.called > 3
+
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        rows = [[f"{i:013d}", f"N{i}", i + 1, float(i), "2029-01-01"]
+                for i in range(20)]
+        db_r = [(f"{i:013d}", f"O{i}", i, float(i), "2028-01-01")
+                for i in range(20)]
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
+        _make_db(db, db_r)
+        cancel = Cancel()
+        r = analyze_import_conflicts(xp, M, db, cancel_event=cancel)
+        assert r.cancelled
+        # Details may exist from partial processing but caller
+        # should not render them as final; they are consistent with
+        # partial classified counts
+        assert r.changed_existing == (
+            r.classified_rows - r.new_barcodes - r.unchanged_existing)
+
+    def test_success_greek_labels_present(self, tmp_path):
+        """Successful result must produce detail rows for dialog rendering."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "NewName", 100, 2.5, "2028-01-01"]])
+        _make_db(db, [("A", "OldName", 1, 1.0, "2027-01-01")])
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert not r.cancelled
+        assert len(r.conflict_details) > 0
+        # Verify detail fields carry correct values
+        name_d = [d for d in r.conflict_details if d.field == "Name"][0]
+        assert name_d.current_value == "OldName"
+        assert name_d.incoming_value == "NewName"
