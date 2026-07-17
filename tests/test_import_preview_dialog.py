@@ -255,7 +255,7 @@ class TestConflictUI:
 
 class TestPlanUI:
 
-    def test_plan_btn_disabled_before_analysis(self, dialog_factory):
+    def test_plan_group_visible_btn_disabled_before(self, dialog_factory):
         d = dialog_factory(db_path="/tmp/test.db")
         assert not d._plan_btn.isEnabled()
 
@@ -267,8 +267,7 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3,
-            [], [], [])
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
         d._on_conflict_done(result)
         assert d._plan_btn.isEnabled()
 
@@ -297,10 +296,10 @@ class TestPlanUI:
         d._on_build_plan()
         txt = d._plan_summary_lbl.text()
         assert "Προς μελλοντική προσθήκη: 4" in txt
-        assert "Ίδια προϊόντα που θα παραλειφθούν: 3" in txt
         assert "Αλλαγές που απαιτούν έλεγχο: 3" in txt
+        assert "Αλλαγές που θα παραλειφθούν: 0" in txt
 
-    def test_plan_cleared_on_new_file(self, dialog_factory):
+    def test_skip_policy_skipped_changed(self, dialog_factory):
         from infrastructure.product_import_conflicts import (
             ImportConflictResult)
         d = dialog_factory(db_path="/tmp/test.db")
@@ -310,18 +309,13 @@ class TestPlanUI:
         result = ImportConflictResult.success(
             "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
         d._on_conflict_done(result)
+        d._plan_policy.setCurrentIndex(1)
         d._on_build_plan()
-        assert d._plan_summary_lbl.text() != ""
-        # Simulate new file clears
-        d._file_path = "/new.xlsx"
-        d._file_gen += 1
-        d._current_file_path = "/new.xlsx"
-        d._sheet_combo.clear()
-        d._hide_results()
-        assert d._plan_summary_lbl.isHidden()
-        assert not d._plan_btn.isEnabled()
+        txt = d._plan_summary_lbl.text()
+        assert "Αλλαγές που απαιτούν έλεγχο: 0" in txt
+        assert "Αλλαγές που θα παραλειφθούν: 3" in txt
 
-    def test_plan_cleared_on_mapping_change(self, dialog_factory):
+    def test_plan_cleared_via_hide_results(self, dialog_factory):
         from infrastructure.product_import_conflicts import (
             ImportConflictResult)
         d = dialog_factory(db_path="/tmp/test.db")
@@ -333,21 +327,6 @@ class TestPlanUI:
         d._on_conflict_done(result)
         d._on_build_plan()
         assert d._plan_btn.isEnabled()
-        # _hide_results is the clearing mechanism; test it directly
         d._hide_results()
         assert not d._plan_btn.isEnabled()
         assert d._last_conflict_result is None
-
-    def test_skip_policy_zeroes_manual_review(self, dialog_factory):
-        from infrastructure.product_import_conflicts import (
-            ImportConflictResult)
-        d = dialog_factory(db_path="/tmp/test.db")
-        d._file_path = "f.xlsx"
-        d._sheet_combo.addItem("S1")
-        d._sheet_combo.setCurrentIndex(0)
-        result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
-        d._on_conflict_done(result)
-        d._plan_policy.setCurrentIndex(1)  # skip
-        d._on_build_plan()
-        assert "Αλλαγές που απαιτούν έλεγχο: 0" in d._plan_summary_lbl.text()

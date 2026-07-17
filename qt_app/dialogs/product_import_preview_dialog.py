@@ -287,6 +287,7 @@ class ProductImportPreviewDialog(QDialog):
         self._plan_summary_lbl.hide()
         pl.addWidget(self._plan_summary_lbl)
         self._plan_grp.setLayout(pl)
+        self._plan_grp.show()
         rs.addWidget(self._plan_grp)
         lay.addLayout(rs)
 
@@ -551,6 +552,7 @@ class ProductImportPreviewDialog(QDialog):
             f"Προς μελλοντική προσθήκη: {plan.planned_new}\n"
             f"Ίδια προϊόντα που θα παραλειφθούν: {plan.skipped_identical}\n"
             f"Αλλαγές που απαιτούν έλεγχο: {plan.manual_review}\n"
+            f"Αλλαγές που θα παραλειφθούν: {plan.skipped_changed}\n"
             f"Άκυρες γραμμές που απορρίπτονται: {plan.rejected_invalid}\n"
             f"Διπλότυπα που παραλείπονται: {plan.skipped_duplicates}")
         self._plan_summary_lbl.setText(summary)
@@ -643,7 +645,7 @@ class ProductImportPreviewDialog(QDialog):
         for w in [self._sample_lbl, self._sample_table,
                   self._error_lbl, self._error_table, self._no_write_lbl,
                   self._conflict_summary_lbl, self._conflict_table,
-                  self._plan_summary_lbl, self._plan_grp]:
+                  self._plan_summary_lbl]:
             w.hide()
         self._sample_table.setRowCount(0)
         self._error_table.setRowCount(0)

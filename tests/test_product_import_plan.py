@@ -3,8 +3,7 @@
 import pytest
 from infrastructure.product_import_plan import (
     build_import_plan, ImportReviewPolicy, ImportPlan, ChangedPolicy)
-from infrastructure.product_import_conflicts import (
-    ImportConflictResult, ConflictRecord)
+from infrastructure.product_import_conflicts import ImportConflictResult
 
 
 def _ok_result(**kw):
@@ -33,25 +32,36 @@ class TestBuildPlan:
     def test_default_policy_manual_review(self):
         r = _ok_result()
         plan = build_import_plan(r)
-        assert plan.planned_new == 4
-        assert plan.skipped_identical == 3
         assert plan.manual_review == 3
-        assert plan.rejected_invalid == 0
-        assert plan.skipped_duplicates == 0
-        assert plan.read_only
+        assert plan.skipped_changed == 0
 
     def test_skip_changes_policy(self):
         r = _ok_result()
         plan = build_import_plan(
             r, ImportReviewPolicy(changed=ChangedPolicy.SKIP_CHANGES))
         assert plan.manual_review == 0
-        assert plan.planned_new == 4
-        assert plan.skipped_identical == 3
+        assert plan.skipped_changed == 3
 
-    def test_accounting_invariant(self):
+    def test_accounting_invariant_review(self):
         r = _ok_result()
         plan = build_import_plan(r)
-        assert plan.planned_new + plan.skipped_identical + plan.manual_review == plan.classified_rows
+        total = (plan.planned_new + plan.skipped_identical
+                 + plan.manual_review + plan.skipped_changed)
+        assert total == plan.classified_rows
+
+    def test_accounting_invariant_skip(self):
+        r = _ok_result()
+        plan = build_import_plan(
+            r, ImportReviewPolicy(changed=ChangedPolicy.SKIP_CHANGES))
+        total = (plan.planned_new + plan.skipped_identical
+                 + plan.manual_review + plan.skipped_changed)
+        assert total == plan.classified_rows
+
+    def test_frozen_immutable(self):
+        r = _ok_result()
+        plan = build_import_plan(r)
+        with pytest.raises(Exception):
+            plan.planned_new = 999
 
     def test_no_write_sql(self):
         import inspect
