@@ -869,69 +869,263 @@ class TestTransactionGuarantees:
 # Regression tests — D1.1 fixes
 # ═══════════════════════════════════════════════════════════════════════
 
-class TestD11QColorFix:
-    """Fix 1: QColor instead of Qt.GlobalColor for status hex colors."""
+class TestD12Behavioral:
+    """D1.2: Behavioral tests replacing source-inspection-only D1.1 checks."""
 
-    def test_page_uses_qcolor_not_globalcolor(self):
-        import inspect
+    # ── QColor fix — exercise real _on_list_result ─────────────────
+
+    def test_on_list_result_renders_status_with_qcolor(self, db):
+        """_on_list_result sets correct QColor foreground on the status cell."""
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtGui import QColor, QBrush
         from qt_app.pages.goods_receipt_page import GoodsReceiptPage
-        src = inspect.getsource(GoodsReceiptPage._on_list_result)
-        assert "QColor(" in src
-        assert "Qt.GlobalColor" not in src
-
-    def test_list_rendering_no_crash_offscreen(self):
-        import tempfile, os
-        from PySide6.QtWidgets import QApplication, QTableWidget, QTableWidgetItem
-        from PySide6.QtGui import QColor
-        from infrastructure.database_service import DatabaseService
-        from infrastructure.goods_receipt_service import ensure_goods_receipt_schema
 
         app = QApplication.instance() or QApplication(["offscreen"])
-        db_path = tempfile.mktemp(suffix=".db")
-        try:
-            db = DatabaseService(db_path=db_path)
-            conn = _rw_connect(db_path)
-            ensure_goods_receipt_schema(conn)
-            conn.execute("INSERT INTO suppliers (id, name) VALUES (1, 'Test AE')")
-            conn.execute("INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price) "
-                         "VALUES ('TEST001', 'Test', 100, '2099-01-01', 5.0)")
-            conn.execute(
-                "INSERT INTO goods_receipts (id, supplier_id, document_number, "
-                "document_type, status, received_at, created_at) "
-                "VALUES ('GR-T1',1,'DOC','delivery_note','draft','2026-07-17','2026-07-17')")
-            conn.commit()
-            conn.close()
 
-            from qt_app.pages.goods_receipt_page import GoodsReceiptPage
-            config = {"db_path": db_path, "theme": "Dark"}
-            page = GoodsReceiptPage(None, config)
-            table = QTableWidget()
-            table.setRowCount(1)
-            item = QTableWidgetItem("draft")
-            item.setForeground(QColor("#F59E0B"))
-            table.setItem(0, 0, item)
-            page.deleteLater()
-        finally:
-            if os.path.exists(db_path):
-                os.unlink(db_path)
+        # Seed DB
+        sid = _seed_supplier(db, "Test AE")
+        _seed_product(db, "5200000000017", "P1")
+        create_receipt_draft(db.db_path, supplier_id=sid,
+                             document_number="DOC-QC",
+                             document_type="delivery_note",
+                             lines=[{"barcode": "5200000000017",
+                                      "product_name": "P1",
+                                      "received_qty": 1, "unit_cost": 1.0}])
 
+        config = {"db_path": db.db_path, "theme": "Dark"}
+        page = GoodsReceiptPage(None, config)
 
-class TestD11DeferredRefresh:
-    """Fix 2: Deferred list refresh after create/approve/cancel success."""
+        # Build a real ReceiptListResult with draft status
+        from infrastructure.goods_receipt_service import ReceiptListResult
+        result = ReceiptListResult(
+            True, total=1, page=1, page_size=50,
+            items=(("GR-TEST", "Test AE", "DOC-QC", "delivery_note",
+                    "2026-07-17", "draft"),))
 
-    def test_back_to_list_sets_flag_not_refreshes(self):
-        import inspect
+        # Call the real handler
+        page._on_list_result(result)
+
+        # Verify row count
+        assert page._list_table.rowCount() == 1
+
+        # Verify status cell has correct QColor
+        from PySide6.QtCore import Qt
+        status_item = page._list_table.item(0, 4)
+        assert status_item is not None
+        assert status_item.text() == "Πρόχειρο"
+        got_color = status_item.foreground().color()
+        expected = QColor("#F59E0B")
+        assert got_color.red() == expected.red()
+        assert got_color.green() == expected.green()
+        assert got_color.blue() == expected.blue()
+
+        page.deleteLater()
+
+    def test_on_list_result_honors_status_colors(self, db):
+        """Approved/cancelled cells get correct colors too."""
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtGui import QColor
         from qt_app.pages.goods_receipt_page import GoodsReceiptPage
-        src = inspect.getsource(GoodsReceiptPage._back_to_list)
-        assert "_pending_list_refresh = True" in src
-        assert "_do_list_refresh()" not in src
 
-    def test_on_worker_done_has_deferred_refresh(self):
-        import inspect
+        app = QApplication.instance() or QApplication(["offscreen"])
+        sid = _seed_supplier(db, "Test AE")
+        _seed_product(db, "5200000000017", "P1")
+
+        config = {"db_path": db.db_path, "theme": "Dark"}
+        page = GoodsReceiptPage(None, config)
+
+        from infrastructure.goods_receipt_service import ReceiptListResult
+        result = ReceiptListResult(
+            True, total=3, page=1, page_size=50,
+            items=(
+                ("GR-A", "Test AE", "A", "delivery_note", "2026-07-17", "draft"),
+                ("GR-B", "Test AE", "B", "delivery_note", "2026-07-17", "approved"),
+                ("GR-C", "Test AE", "C", "delivery_note", "2026-07-17", "cancelled"),
+            ))
+
+        page._on_list_result(result)
+        assert page._list_table.rowCount() == 3
+
+        colors = {"draft": QColor("#F59E0B"), "approved": QColor("#10B981"),
+                  "cancelled": QColor("#EF4444")}
+        for row, status in enumerate(["draft", "approved", "cancelled"]):
+            item = page._list_table.item(row, 4)
+            expected = colors[status]
+            got = item.foreground().color()
+            assert got.red() == expected.red(), f"row {row} {status}"
+            assert got.green() == expected.green()
+            assert got.blue() == expected.blue()
+
+        page.deleteLater()
+
+    # ── Deferred-refresh behavioral tests ───────────────────────────
+
+    def test_back_to_list_does_not_set_refresh_flag(self):
+        """Ordinary Back/Cancel-edit navigation leaves no pending refresh."""
+        from PySide6.QtWidgets import QApplication
         from qt_app.pages.goods_receipt_page import GoodsReceiptPage
-        src = inspect.getsource(GoodsReceiptPage._on_worker_done)
-        assert "_pending_list_refresh" in src
-        assert "_do_list_refresh()" in src
+
+        app = QApplication.instance() or QApplication(["offscreen"])
+        config = {"db_path": ":memory:", "theme": "Dark"}
+        page = GoodsReceiptPage(None, config)
+
+        # Before: no pending refresh
+        assert page._pending_list_refresh is False
+
+        # Call _back_to_list (simulates Back button click)
+        page._back_to_list()
+
+        # After: still no pending refresh
+        assert page._pending_list_refresh is False
+        page.deleteLater()
+
+    def test_request_list_refresh_when_loading_defers(self):
+        """When a worker is active, _request_list_refresh sets the flag."""
+        from PySide6.QtWidgets import QApplication
+        from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+
+        app = QApplication.instance() or QApplication(["offscreen"])
+        config = {"db_path": ":memory:", "theme": "Dark"}
+        page = GoodsReceiptPage(None, config)
+
+        page._loading = True
+        page._pending_list_refresh = False
+        page._request_list_refresh()
+        assert page._pending_list_refresh is True
+        page.deleteLater()
+
+    def test_request_list_refresh_when_idle_refreshes_immediately(self):
+        """When no worker is active, _request_list_refresh refreshes directly.
+        We verify _do_list_refresh was called by checking _loading is now True
+        and _mode is 'list'."""
+        from PySide6.QtWidgets import QApplication
+        from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+
+        app = QApplication.instance() or QApplication(["offscreen"])
+        config = {"db_path": ":memory:", "theme": "Dark"}
+        page = GoodsReceiptPage(None, config)
+
+        page._loading = False
+        page._pending_list_refresh = False
+        page._do_list_refresh = lambda: setattr(page, '_test_called', True)  # type: ignore[assignment]
+        page._test_called = False
+
+        page._request_list_refresh()
+        assert page._test_called is True
+        assert page._pending_list_refresh is False
+        page.deleteLater()
+
+    def test_success_handlers_call_request_list_refresh(self, db, monkeypatch):
+        """Create/approve/cancel success -> _back_to_list() + _request_list_refresh().
+        Mock QMessageBox to avoid dialogs and monkeypatch worker launch."""
+        from PySide6.QtWidgets import QApplication
+        from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+        from infrastructure.goods_receipt_service import (
+            CreateDraftResult, ApproveReceiptResult, CancelReceiptResult)
+
+        app = QApplication.instance() or QApplication(["offscreen"])
+
+        sid = _seed_supplier(db, "Test AE")
+        _seed_product(db, "5200000000017", "P1", stock=100)
+
+        config = {"db_path": db.db_path, "theme": "Dark"}
+        page = GoodsReceiptPage(None, config)
+
+        # Mock QMessageBox so no real dialog pops
+        from PySide6.QtWidgets import QMessageBox
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **kw: None)
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **kw: None)
+
+        # Simulate "loading" state (as if worker just emitted result)
+        calls = []
+
+        def _tracking_refresh():
+            calls.append("refresh_requested")
+
+        page._loading = True
+        page._pending_list_refresh = False
+        page._do_list_refresh = lambda: _tracking_refresh()  # type: ignore[assignment]
+
+        # ── Create success ──
+        page._on_create_result(CreateDraftResult(True, receipt_id="GR-T1"))
+        assert page._pending_list_refresh is True
+        assert len(calls) == 0  # not called yet — deferred
+
+        # ── Approve success ──
+        page._pending_list_refresh = False
+        page._loading = True
+        page._on_approve_result(ApproveReceiptResult(
+            True, receipt_id="GR-T1", lines_applied=2, total_units=10))
+        assert page._pending_list_refresh is True
+
+        # ── Cancel success ──
+        page._pending_list_refresh = False
+        page._loading = True
+        page._on_cancel_result(CancelReceiptResult(True, receipt_id="GR-T1"))
+        assert page._pending_list_refresh is True
+
+        page.deleteLater()
+
+    def test_back_to_list_after_success_without_worker_does_not_set_flag(self, db, monkeypatch):
+        """If somehow called when _loading is False (e.g., directly from button),
+        _back_to_list() leaves _pending_list_refresh alone."""
+        from PySide6.QtWidgets import QApplication
+        from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+
+        app = QApplication.instance() or QApplication(["offscreen"])
+
+        sid = _seed_supplier(db, "Test AE")
+        _seed_product(db, "5200000000017", "P1")
+        config = {"db_path": db.db_path, "theme": "Dark"}
+        page = GoodsReceiptPage(None, config)
+
+        page._loading = False
+        page._pending_list_refresh = False
+        page._back_to_list()
+        assert page._pending_list_refresh is False  # was the bug
+
+        page.deleteLater()
+
+    def test_new_draft_after_back_does_not_trigger_stale_refresh(self, db, monkeypatch):
+        """User: Back → New Draft. The supplier worker must not trigger a list refresh
+        because _pending_list_refresh is clean."""
+        from PySide6.QtWidgets import QApplication
+        from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+        from PySide6.QtWidgets import QMessageBox
+
+        app = QApplication.instance() or QApplication(["offscreen"])
+
+        sid = _seed_supplier(db, "Test AE")
+        _seed_product(db, "5200000000017", "P1")
+        config = {"db_path": db.db_path, "theme": "Dark"}
+        page = GoodsReceiptPage(None, config)
+
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **kw: None)
+
+        # Step 1: User is reviewing a receipt
+        page._selected_receipt_id = "GR-X"
+        page._loading = False
+
+        # Step 2: User clicks Back
+        page._back_to_list()
+        assert page._pending_list_refresh is False
+        assert page._selected_receipt_id is None
+
+        # Step 3: User clicks New Draft → triggers supplier loader
+        # Simulate the supplier worker completing
+        page._loading = True
+        page._mode = "suppliers"
+        page._pending_list_refresh = False  # ensure clean
+
+        # Simulate _on_worker_done
+        refresh_triggered = []
+        page._do_list_refresh = lambda: refresh_triggered.append(1)
+        page._on_worker_done()
+
+        # Must NOT have triggered a list refresh
+        assert len(refresh_triggered) == 0
+
+        page.deleteLater()
 
 
 class TestD11Search:

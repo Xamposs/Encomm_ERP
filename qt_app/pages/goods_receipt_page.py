@@ -633,7 +633,14 @@ class GoodsReceiptPage(BasePage):
         self._selected_receipt_id = None
         self._confirm_cb.setChecked(False)
         self._draft_lines = []
-        self._pending_list_refresh = True   # deferred — worker must finish first
+
+    def _request_list_refresh(self) -> None:
+        """Schedule a list refresh.  If a worker is active, defer until it finishes.
+        Otherwise refresh immediately.  Only used by success handlers."""
+        if self._loading:
+            self._pending_list_refresh = True
+        else:
+            self._do_list_refresh()
 
     # ── Worker lifecycle ─────────────────────────────────────────────
 
@@ -754,6 +761,7 @@ class GoodsReceiptPage(BasePage):
         QMessageBox.information(self, "Επιτυχία",
                                 f"Η πρόχειρη παραλαβή δημιουργήθηκε.\nID: {result.receipt_id}")
         self._back_to_list()
+        self._request_list_refresh()
 
     def _on_approve_result(self, result: ApproveReceiptResult) -> None:
         if not result.ok:
@@ -771,6 +779,7 @@ class GoodsReceiptPage(BasePage):
         # Refresh related views
         self._refresh_related_pages()
         self._back_to_list()
+        self._request_list_refresh()
 
     def _on_cancel_result(self, result: CancelReceiptResult) -> None:
         if not result.ok:
@@ -779,6 +788,7 @@ class GoodsReceiptPage(BasePage):
             return
         QMessageBox.information(self, "Ακύρωση", "Η παραλαβή ακυρώθηκε.")
         self._back_to_list()
+        self._request_list_refresh()
 
     # ── Cross-page refresh ───────────────────────────────────────────
 
