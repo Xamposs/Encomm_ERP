@@ -483,7 +483,8 @@ class ProductImportPreviewDialog(QDialog):
         else:
             self._status_lbl.setText("✅ Ανάλυση συγκρούσεων ολοκληρώθηκε.")
             self._last_conflict_result = result
-            self._plan_btn.setEnabled(True)
+            self._plan_btn.setEnabled(
+                result.source_signature is not None)
 
         summary = (
             f"Νέα προϊόντα: {result.new_barcodes}  ·  "
@@ -554,7 +555,11 @@ class ProductImportPreviewDialog(QDialog):
             f"Αλλαγές που απαιτούν έλεγχο: {plan.manual_review}\n"
             f"Αλλαγές που θα παραλειφθούν: {plan.skipped_changed}\n"
             f"Άκυρες γραμμές που απορρίπτονται: {plan.rejected_invalid}\n"
-            f"Διπλότυπα που παραλείπονται: {plan.skipped_duplicates}")
+            f"Διπλότυπα που παραλείπονται: {plan.skipped_duplicates}\n"
+            f"\nΤαυτότητα αρχείου (SHA-256): "
+            f"{plan.source_signature.file_sha256[:12]}…\n"
+            f"Το σχέδιο ισχύει μόνο για αυτό το αρχείο και αυτή "
+            f"την αντιστοίχιση στηλών.")
         self._plan_summary_lbl.setText(summary)
         self._plan_summary_lbl.show()
 

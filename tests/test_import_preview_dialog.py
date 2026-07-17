@@ -4,6 +4,12 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 
+def _fake_sig():
+    from infrastructure.product_import_identity import ImportSourceSignature
+    return ImportSourceSignature(
+        file_size_bytes=100, file_sha256="a" * 64, mapping_sha256="b" * 64)
+
+
 @pytest.fixture(scope="session")
 def qapp():
     app = QApplication.instance() or QApplication([])
@@ -192,7 +198,7 @@ class TestConflictUI:
             "f.xlsx", "S1", 10, 10, 0, 0, 10, 5, 3, 2,
             [ConflictRecord("A", ("Name", "Price")),
              ConflictRecord("B", ("Stock",))],
-            [], [])
+            [], [], signature=_fake_sig())
         d._on_conflict_done(result)
         assert "Νέα προϊόντα: 5" in d._conflict_summary_lbl.text()
         assert "Όνομα, Τιμή" in d._conflict_table.item(0, 1).text()
@@ -248,7 +254,8 @@ class TestConflictUI:
         samples = tuple(
             ConflictRecord(f"B{i}", ("Name",)) for i in range(80))
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 0, 0, 10, samples, [], [])
+            "f", "S1", 10, 10, 0, 0, 10, 0, 0, 10, samples, [], [],
+            signature=_fake_sig())
         d._on_conflict_done(result)
         assert d._conflict_table.rowCount() == 50
 
@@ -258,6 +265,7 @@ class TestPlanUI:
     def test_plan_group_visible_btn_disabled_before(self, dialog_factory):
         d = dialog_factory(db_path="/tmp/test.db")
         assert not d._plan_btn.isEnabled()
+        assert not d._plan_grp.isHidden()
 
     def test_plan_btn_enabled_after_success(self, dialog_factory):
         from infrastructure.product_import_conflicts import (
@@ -267,7 +275,8 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
+            signature=_fake_sig())
         d._on_conflict_done(result)
         assert d._plan_btn.isEnabled()
 
@@ -291,13 +300,15 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
+            signature=_fake_sig())
         d._on_conflict_done(result)
         d._on_build_plan()
         txt = d._plan_summary_lbl.text()
         assert "Προς μελλοντική προσθήκη: 4" in txt
         assert "Αλλαγές που απαιτούν έλεγχο: 3" in txt
         assert "Αλλαγές που θα παραλειφθούν: 0" in txt
+        assert "Ταυτότητα αρχείου (SHA-256):" in txt
 
     def test_skip_policy_skipped_changed(self, dialog_factory):
         from infrastructure.product_import_conflicts import (
@@ -307,7 +318,8 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
+            signature=_fake_sig())
         d._on_conflict_done(result)
         d._plan_policy.setCurrentIndex(1)
         d._on_build_plan()
@@ -323,7 +335,8 @@ class TestPlanUI:
         d._sheet_combo.addItem("S1")
         d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
-            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [],
+            signature=_fake_sig())
         d._on_conflict_done(result)
         d._on_build_plan()
         assert d._plan_btn.isEnabled()

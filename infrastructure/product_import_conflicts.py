@@ -72,11 +72,12 @@ class ImportConflictResult:
     conflict_samples: Tuple[ConflictRecord, ...] = ()
     errors: Tuple[ImportRowErr, ...] = ()
     sample_rows: Tuple[Tuple[str, str, int, float, str], ...] = ()
+    source_signature: object | None = None  # ImportSourceSignature
 
     @classmethod
     def _make(cls, ok, cancelled, msg, fn, sn, scanned, valid, invalid,
               dupes, classified, new, unchanged, changed,
-              conflicts, errors, samples):
+              conflicts, errors, samples, signature=None):
         return cls(
             ok=ok, cancelled=cancelled, error_message=msg,
             file_name=fn, sheet_name=sn,
@@ -88,14 +89,16 @@ class ImportConflictResult:
             conflict_samples=tuple(conflicts),
             errors=tuple(errors),
             sample_rows=tuple(samples),
+            source_signature=signature,
         )
 
     @classmethod
     def success(cls, fn, sn, scanned, valid, invalid, dupes, classified,
-                new, unchanged, changed, conflicts, errors, samples):
+                new, unchanged, changed, conflicts, errors, samples,
+                signature=None):
         return cls._make(True, False, "", fn, sn, scanned, valid, invalid,
                          dupes, classified, new, unchanged, changed,
-                         conflicts, errors, samples)
+                         conflicts, errors, samples, signature=signature)
 
     @classmethod
     def cancelled(cls, fn, sn, scanned, valid, invalid, dupes, classified,
@@ -287,6 +290,18 @@ def analyze_import_conflicts(
             file_path, sheet_name or "—",
             f"Σφάλμα βάσης δεδομένων: {e}")
 
+    # Create source signature before analysis
+    try:
+        from infrastructure.product_import_identity import (
+            fingerprint_import_source)
+        sig_before = fingerprint_import_source(file_path, mapping)
+    except Exception as e:
+        if conn:
+            conn.close()
+        return ImportConflictResult.failure(
+            file_path, sheet_name or "—",
+            f"Αδυναμία ταυτοποίησης αρχείου: {e}")
+
     # State
     scanned = 0
     valid = 0
@@ -459,7 +474,21 @@ def analyze_import_conflicts(
             classified, new_count, unchanged_count, changed_count,
             conflicts, errors, samples)
 
+    # Verify source signature hasn't changed during analysis
+    try:
+        from infrastructure.product_import_identity import (
+            fingerprint_import_source, verify_import_source)
+        if not verify_import_source(sig_before, file_path, mapping):
+            return ImportConflictResult.failure(
+                file_path, active_sheet,
+                "Το αρχείο Excel άλλαξε κατά την ανάλυση. "
+                "Επιλέξτε το ξανά.")
+    except Exception:
+        return ImportConflictResult.failure(
+            file_path, active_sheet,
+            "Αδυναμία επαλήθευσης ταυτότητας αρχείου.")
+
     return ImportConflictResult.success(
         file_path, active_sheet, scanned, valid, invalid, dupes,
         classified, new_count, unchanged_count, changed_count,
-        conflicts, errors, samples)
+        conflicts, errors, samples, signature=sig_before)

@@ -38,6 +38,7 @@ class ImportPlan:
     skipped_changed: int = 0
     rejected_invalid: int = 0
     skipped_duplicates: int = 0
+    source_signature: object | None = None  # ImportSourceSignature
 
 
 def build_import_plan(
@@ -51,6 +52,9 @@ def build_import_plan(
         raise ValueError(
             f"Αδυναμία δημιουργίας σχεδίου: "
             f"{result.error_message or 'Η ανάλυση απέτυχε.'}")
+    if result.source_signature is None:
+        raise ValueError(
+            "Απαιτείται επαληθευμένη ταυτότητα αρχείου για το σχέδιο.")
 
     if policy.changed == ChangedPolicy.REQUIRE_MANUAL_REVIEW:
         manual_review = result.changed_existing
@@ -73,6 +77,7 @@ def build_import_plan(
         skipped_changed=skipped_changed,
         rejected_invalid=result.invalid_rows,
         skipped_duplicates=result.duplicate_barcodes,
+        source_signature=result.source_signature,
     )
 
     total = (plan.planned_new + plan.skipped_identical

@@ -61,6 +61,8 @@ class TestClassification:
         r = analyze_import_conflicts(xp, M, db)
         assert r.ok
         assert r.new_barcodes == 1
+        assert r.source_signature is not None
+        assert len(r.source_signature.file_sha256) == 64
         assert r.classified_rows == r.valid_rows == 1
 
     def test_identical_existing(self, tmp_path):
@@ -226,6 +228,8 @@ class TestRobustness:
         r = analyze_import_conflicts(xp, M, db)
         assert r.ok
         assert r.new_barcodes == 1
+        assert r.source_signature is not None
+        assert len(r.source_signature.file_sha256) == 64
 
     def test_db_unchanged_after_analysis(self, tmp_path):
         xp = str(tmp_path / "t.xlsx")
