@@ -16,3 +16,9 @@ graphify-out/
 
 # Tooling plans
 .zcode/
+
+# SQLite WAL / SHM artifacts
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm

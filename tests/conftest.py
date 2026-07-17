@@ -9,6 +9,9 @@ import tempfile
 
 import pytest
 
+# Qt offscreen — must be set before any PySide6 import
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 # Ensure the project root is importable when running `pytest` from anywhere.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
