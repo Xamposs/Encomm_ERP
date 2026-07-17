@@ -34,6 +34,9 @@ FIELD_LABELS = {
 @dataclass
 class _InspectResult:
     ok: bool
+    token: int = 0
+    file_path: str = ""
+    sheet_name: str = ""
     error: str = ""
     sheets: Tuple[str, ...] = ()
     headers: Tuple[str, ...] = ()
@@ -43,8 +46,9 @@ class _InspectResult:
 class _InspectWorker(QObject):
     finished = Signal(_InspectResult)
 
-    def __init__(self, file_path, sheet_name=None, parent=None):
+    def __init__(self, token, file_path, sheet_name=None, parent=None):
         super().__init__(parent)
+        self._token = token
         self._fp = file_path
         self._sn = sheet_name
 
@@ -57,11 +61,13 @@ class _InspectWorker(QObject):
             headers = inspect_xlsx_headers(self._fp, sn) if sn else ()
             suggested = suggest_mapping(self._fp, sn) if sn else None
             self.finished.emit(_InspectResult(
-                ok=True, sheets=sheets, headers=headers,
+                ok=True, token=self._token,
+                file_path=self._fp, sheet_name=sn or "",
+                sheets=sheets, headers=headers,
                 suggested_mapping=suggested))
         except Exception as e:
             self.finished.emit(_InspectResult(
-                ok=False, error=str(e)))
+                ok=False, token=self._token, error=str(e)))
 
 
 class _PreviewWorker(QObject):
@@ -80,7 +86,7 @@ class _PreviewWorker(QObject):
 
 
 class ProductImportPreviewDialog(QDialog):
-    """Modal dialog: choose file → map columns → preview → review results."""
+    shutdown_ready = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -93,8 +99,25 @@ class ProductImportPreviewDialog(QDialog):
         self._thread: QThread | None = None
         self._loading = False
         self._closing = False
+        self._inspect_token = 0  # monotonically increasing
         self._build_ui()
         self._reset_state()
+
+    # ── Public shutdown contract ──────────────────────────────────────
+    def is_busy(self) -> bool:
+        return (self._thread is not None and self._thread.isRunning())
+
+    def request_shutdown(self) -> None:
+        if not self.is_busy():
+            super().reject()
+            return
+        if self._cancel_event:
+            self._cancel_event.set()
+        self._closing = True
+        self._status_lbl.setText("Ακύρωση προεπισκόπησης…")
+        self._status_lbl.setStyleSheet(f"color: {styles.AMBER}; font-size: 12px;")
+        self._cancel_btn.setEnabled(False)
+        self._preview_btn.setEnabled(False)
 
     # ── UI ────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -215,8 +238,21 @@ class ProductImportPreviewDialog(QDialog):
             "QPushButton:hover { background: #2563EB; }"
             "QPushButton:disabled { background: #3b3f48; color: #6b7280; }")
 
+    # ── Controls gating ───────────────────────────────────────────────
+    def _set_controls_enabled(self, enabled: bool):
+        self._sheet_combo.setEnabled(enabled)
+        for cb in self._map_combos.values():
+            cb.setEnabled(enabled)
+        if enabled:
+            self._preview_btn.setEnabled(
+                bool(self._file_path) and len(self._sheet_combo.currentText()) > 0)
+        else:
+            self._preview_btn.setEnabled(False)
+
     # ── File / sheet ──────────────────────────────────────────────────
     def _on_choose_file(self):
+        if self._loading:
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Επιλογή αρχείου Excel", "",
             "Excel Files (*.xlsx)")
@@ -232,31 +268,44 @@ class ProductImportPreviewDialog(QDialog):
             return
         self._file_path = path
         self._file_lbl.setText(os.path.basename(path))
-        self._inspect_file()
+        self._inspect_file()  # sheet_name=None → auto-pick first
 
     def _inspect_file(self, sheet_name=None):
         if self._loading:
             return
-        self._set_loading(True)
+        self._loading = True
+        self._inspect_token += 1
+        self._set_controls_enabled(False)
         self._status_lbl.setText("🔄 Ανάγνωση δομής αρχείου…")
-        self._status_lbl.setStyleSheet(f"color: {styles.TEXT_MUTED}; font-size: 12px;")
-        self._start_worker(_InspectWorker(self._file_path, sheet_name),
-                           self._on_inspect_done)
+        self._start_worker(
+            _InspectWorker(self._inspect_token, self._file_path, sheet_name),
+            self._on_inspect_done)
 
     def _on_inspect_done(self, result: _InspectResult):
-        self._set_loading(False)
+        if result.token != self._inspect_token:
+            return  # stale
         if not result.ok:
             QMessageBox.warning(self, "Σφάλμα",
                                 f"Αδυναμία ανάγνωσης: {result.error}")
+            self._on_worker_done()
             return
-        self._sheet_combo.blockSignals(True)
-        self._sheet_combo.clear()
-        self._sheet_combo.addItems(result.sheets)
-        self._sheet_combo.blockSignals(False)
-        if result.sheets:
-            self._sheet_combo.setCurrentIndex(0)
+        # Populate sheets only on first load (from file selection, token 1)
+        if result.token == 1:
+            self._sheet_combo.blockSignals(True)
+            self._sheet_combo.clear()
+            self._sheet_combo.addItems(result.sheets)
+            self._sheet_combo.blockSignals(False)
+        # Set the sheet explicitly
+        if result.sheet_name:
+            self._sheet_name = result.sheet_name
+            idx = self._sheet_combo.findText(result.sheet_name)
+            if idx >= 0:
+                self._sheet_combo.blockSignals(True)
+                self._sheet_combo.setCurrentIndex(idx)
+                self._sheet_combo.blockSignals(False)
         self._apply_headers(result.headers, result.suggested_mapping)
         self._reset_state()
+        self._on_worker_done()
 
     def _on_sheet_changed(self, name):
         if not name or not self._file_path or self._loading:
@@ -285,13 +334,12 @@ class ProductImportPreviewDialog(QDialog):
                 "Επιλέξτε μοναδικές στήλες για κάθε πεδίο. "
                 "Δεν επιτρέπονται διπλότυπες αντιστοιχίσεις.")
             return
-        self._set_loading(True)
+        self._loading = True
+        self._set_controls_enabled(False)
         self._preview_btn.hide()
         self._cancel_btn.show()
         self._progress.show()
         self._status_lbl.setText("🔄 Εκτέλεση προεπισκόπησης…")
-        self._status_lbl.setStyleSheet(f"color: {styles.TEXT_MUTED}; font-size: 12px;")
-        self._hide_results()
         self._cancel_event = threading.Event()
         self._start_worker(
             _PreviewWorker(self._file_path, mapping, self._sheet_name,
@@ -303,7 +351,6 @@ class ProductImportPreviewDialog(QDialog):
             self._cancel_event.set()
         self._cancel_btn.setEnabled(False)
         self._status_lbl.setText("Ακύρωση προεπισκόπησης…")
-        self._status_lbl.setStyleSheet(f"color: {styles.AMBER}; font-size: 12px;")
 
     def _get_mapping(self) -> ImportColumnMapping | None:
         cols = {}
@@ -315,57 +362,41 @@ class ProductImportPreviewDialog(QDialog):
         if len(set(cols.values())) != 5:
             return None
         return ImportColumnMapping(
-            barcode_column=cols["barcode"],
-            name_column=cols["name"],
-            stock_column=cols["stock"],
-            price_column=cols["price"],
+            barcode_column=cols["barcode"], name_column=cols["name"],
+            stock_column=cols["stock"], price_column=cols["price"],
             expiry_date_column=cols["expiry"])
 
     # ── Render results ────────────────────────────────────────────────
     def _on_preview_done(self, result: ProductImportPreview):
         self._render_result(result)
+        self._on_worker_done()
 
     def _render_result(self, result: ProductImportPreview):
         self._progress.hide()
-        self._set_loading(False)
         self._no_write_lbl.show()
-
-        # Status message
         if result.cancelled:
             self._status_lbl.setText(
                 f"⚠ Η προεπισκόπηση ακυρώθηκε. "
-                f"Ελέγχθηκαν {result.scanned_rows} γραμμές, "
-                f"{result.valid_rows} έγκυρα, {result.invalid_rows} άκυρα.")
-            self._status_lbl.setStyleSheet(f"color: {styles.AMBER}; font-size: 12px;")
+                f"{result.scanned_rows} γραμμές, {result.valid_rows} έγκυρα, "
+                f"{result.invalid_rows} άκυρα.")
         elif not result.ok:
-            prefix = f"❌ {result.error_message}" if result.error_message else "❌ Προεπισκόπηση απέτυχε."
+            prefix = result.error_message or "Προεπισκόπηση απέτυχε."
             self._status_lbl.setText(
-                f"{prefix} "
-                f"({result.scanned_rows} σαρώθηκαν, {result.valid_rows} έγκυρα, "
-                f"{result.invalid_rows} άκυρα).")
-            self._status_lbl.setStyleSheet(f"color: {styles.RED}; font-size: 12px;")
+                f"❌ {prefix} ({result.scanned_rows}/{result.valid_rows}/"
+                f"{result.invalid_rows})")
         else:
             self._status_lbl.setText(
-                f"✅ Προεπισκόπηση ολοκληρώθηκε: "
-                f"{result.scanned_rows} σαρώθηκαν, {result.valid_rows} έγκυρα, "
+                f"✅ {result.scanned_rows} σαρώθηκαν, {result.valid_rows} έγκυρα, "
                 f"{result.invalid_rows} άκυρα, {result.duplicate_barcodes} διπλότυπα.")
-            self._status_lbl.setStyleSheet(f"color: {styles.ACCENT}; font-size: 12px;")
-
-        # Samples (show if any, regardless of ok/fail/cancel)
         if result.sample_rows:
             self._sample_lbl.setText(
                 f"Δείγμα ({len(result.sample_rows)} από {result.valid_rows}):")
             self._sample_lbl.show()
             self._sample_table.setRowCount(len(result.sample_rows))
             for r, row in enumerate(result.sample_rows):
-                self._sample_table.setItem(r, 0, QTableWidgetItem(str(row[0])))
-                self._sample_table.setItem(r, 1, QTableWidgetItem(str(row[1])))
-                self._sample_table.setItem(r, 2, QTableWidgetItem(str(row[2])))
-                self._sample_table.setItem(r, 3, QTableWidgetItem(str(row[3])))
-                self._sample_table.setItem(r, 4, QTableWidgetItem(str(row[4])))
+                for c, val in enumerate(row):
+                    self._sample_table.setItem(r, c, QTableWidgetItem(str(val)))
             self._sample_table.show()
-
-        # Errors (show if any)
         if result.errors:
             self._error_lbl.setText(f"Σφάλματα ({len(result.errors)}):")
             self._error_lbl.show()
@@ -379,7 +410,7 @@ class ProductImportPreviewDialog(QDialog):
 
     # ── Worker lifecycle ──────────────────────────────────────────────
     def _start_worker(self, worker, slot):
-        self._cleanup_thread()
+        # Never overwrite refs while previous thread runs
         self._worker = worker
         self._thread = QThread(self)
         worker.moveToThread(self._thread)
@@ -391,34 +422,24 @@ class ProductImportPreviewDialog(QDialog):
         self._thread.finished.connect(self._on_thread_done)
         self._thread.start()
 
+    def _on_worker_done(self):
+        """Called from result handler to re-enable UI."""
+        self._loading = False
+        if not self._closing:
+            self._set_controls_enabled(True)
+
     def _on_thread_done(self):
         self._worker = None
         self._thread = None
         self._cancel_event = None
+        self._loading = False
         if self._closing:
             self._closing = False
-            self._set_loading(False)
+            self._set_controls_enabled(True)
+            self.shutdown_ready.emit()
             super().reject()
 
-    def _cleanup_thread(self):
-        if self._thread and self._thread.isRunning():
-            if self._cancel_event:
-                self._cancel_event.set()
-            self._thread.quit()
-        # Never clear refs here — _on_thread_done does it
-
-    def _set_loading(self, loading: bool):
-        self._loading = loading
-        if loading:
-            self._preview_btn.setEnabled(False)
-            self._preview_btn.hide()
-        else:
-            self._preview_btn.show()
-            self._preview_btn.setEnabled(
-                bool(self._file_path) and len(self._sheet_combo.currentText()) > 0)
-            self._cancel_btn.hide()
-            self._cancel_btn.setEnabled(True)
-
+    # ── Reset / hide ──────────────────────────────────────────────────
     def _hide_results(self):
         for w in [self._sample_lbl, self._sample_table,
                   self._error_lbl, self._error_table, self._no_write_lbl]:
@@ -429,31 +450,25 @@ class ProductImportPreviewDialog(QDialog):
         self._progress.hide()
         self._status_lbl.setText("")
         self._cancel_btn.hide()
-        self._preview_btn.show()
-        self._preview_btn.setEnabled(
-            bool(self._file_path) and len(self._sheet_combo.currentText()) > 0)
 
     # ── Close / shutdown ──────────────────────────────────────────────
     def reject(self):
-        if self._thread and self._thread.isRunning():
+        if self.is_busy():
             if self._cancel_event:
                 self._cancel_event.set()
             self._closing = True
             self._status_lbl.setText("Ακύρωση προεπισκόπησης…")
-            self._status_lbl.setStyleSheet(f"color: {styles.AMBER}; font-size: 12px;")
             self._cancel_btn.setEnabled(False)
             self._preview_btn.setEnabled(False)
-            # Defer close until _on_thread_done
             return
         super().reject()
 
     def closeEvent(self, event):
-        if self._thread and self._thread.isRunning():
+        if self.is_busy():
             if self._cancel_event:
                 self._cancel_event.set()
             self._closing = True
             self._status_lbl.setText("Ακύρωση προεπισκόπησης…")
-            self._status_lbl.setStyleSheet(f"color: {styles.AMBER}; font-size: 12px;")
             self._cancel_btn.setEnabled(False)
             self._preview_btn.setEnabled(False)
             event.ignore()

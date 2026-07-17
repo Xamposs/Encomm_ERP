@@ -355,8 +355,17 @@ class InventoryPage(BasePage):
             ProductImportPreviewDialog)
         dlg = ProductImportPreviewDialog(self)
         self._preview_dlg = dlg
+        dlg.shutdown_ready.connect(self._on_preview_dlg_shutdown_ready)
         dlg.exec()
-        self._preview_dlg = None
+        # Only clear ref if dialog is truly done (not deferred)
+        if not dlg.is_busy():
+            self._preview_dlg = None
+
+    def _on_preview_dlg_shutdown_ready(self):
+        if self._preview_dlg:
+            self._preview_dlg = None
+        if self._close_pending:
+            self._maybe_finish_shutdown()
 
     def _on_edit_selected(self):
         rows = set()
@@ -581,7 +590,9 @@ class InventoryPage(BasePage):
             return
         read_running = self._thread is not None and self._thread.isRunning()
         write_running = self._write_thread is not None and self._write_thread.isRunning()
-        if not read_running and not write_running:
+        preview_busy = (self._preview_dlg is not None
+                        and self._preview_dlg.is_busy())
+        if not read_running and not write_running and not preview_busy:
             self._close_pending = False
             self.shutdown_ready.emit()
 
@@ -604,12 +615,13 @@ class InventoryPage(BasePage):
         Preserves references on timeout — never clears a running QThread."""
         # Cancel active preview dialog
         if self._preview_dlg is not None:
-            if self._preview_dlg._cancel_event:
-                self._preview_dlg._cancel_event.set()
-            if self._preview_dlg._thread and self._preview_dlg._thread.isRunning():
-                self._preview_dlg._thread.quit()
-                self._preview_dlg._thread.wait(2000)
-            return False  # defer — MainWindow will retry
+            if self._preview_dlg.is_busy():
+                self._close_pending = True
+                self._preview_dlg.request_shutdown()
+                return False
+            # idle — close it and continue
+            self._preview_dlg.close()
+            self._preview_dlg = None
 
         all_stopped = True
 
