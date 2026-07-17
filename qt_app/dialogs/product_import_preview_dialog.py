@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFileDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QGroupBox, QProgressBar, QDialogButtonBox,
+    QCheckBox,
 )
 
 from qt_app import styles
@@ -98,8 +99,26 @@ class _ConflictWorker(QObject):
             cancel_event=self._cancel))
 
 
+class _CommitWorker(QObject):
+    finished = Signal(object)  # ImportCommitResult
+
+    def __init__(self, file_path, mapping, plan, db_path, cancel_event,
+                 parent=None):
+        super().__init__(parent)
+        self._fp, self._m, self._plan, self._db, self._cancel = (
+            file_path, mapping, plan, db_path, cancel_event)
+
+    def run(self):
+        from infrastructure.product_import_commit import (
+            commit_new_products_from_xlsx)
+        self.finished.emit(commit_new_products_from_xlsx(
+            self._fp, self._m, self._plan, self._db,
+            cancel_event=self._cancel))
+
+
 class ProductImportPreviewDialog(QDialog):
     shutdown_ready = Signal()
+    import_completed = Signal(int)
 
     def __init__(self, parent=None, db_path=""):
         super().__init__(parent)
@@ -117,6 +136,7 @@ class ProductImportPreviewDialog(QDialog):
         self._last_file_gen = 0
         self._current_file_path = ""
         self._last_conflict_result = None  # for plan building
+        self._current_plan = None  # ImportPlan
         self._build_ui()
         self._reset_state()
 
@@ -286,6 +306,19 @@ class ProductImportPreviewDialog(QDialog):
             f"color: {styles.ACCENT}; font-size: 12px;")
         self._plan_summary_lbl.hide()
         pl.addWidget(self._plan_summary_lbl)
+        self._commit_check = QCheckBox(
+            "Κατανοώ ότι θα προστεθούν μόνο νέα προϊόντα. "
+            "Τα υπάρχοντα δεν θα αλλάξουν.")
+        self._commit_check.hide()
+        self._commit_check.toggled.connect(self._on_commit_check_toggled)
+        pl.addWidget(self._commit_check)
+        self._commit_btn = QPushButton(
+            "✅  Εκτέλεση ασφαλούς εισαγωγής νέων προϊόντων")
+        self._commit_btn.setStyleSheet(self._btn_qss())
+        self._commit_btn.clicked.connect(self._on_run_commit)
+        self._commit_btn.setEnabled(False)
+        self._commit_btn.hide()
+        pl.addWidget(self._commit_btn)
         self._plan_grp.setLayout(pl)
         self._plan_grp.show()
         rs.addWidget(self._plan_grp)
@@ -563,6 +596,75 @@ class ProductImportPreviewDialog(QDialog):
         self._plan_summary_lbl.setText(summary)
         self._plan_summary_lbl.show()
 
+        # Store plan and show commit controls
+        self._current_plan = plan
+        self._commit_check.show()
+        self._commit_check.setChecked(False)
+        self._commit_btn.show()
+        self._commit_btn.setEnabled(False)
+
+    def _on_commit_check_toggled(self, checked):
+        self._commit_btn.setEnabled(
+            checked and self._current_plan is not None
+            and self._current_plan.planned_new > 0
+            and not self.is_busy())
+
+    def _on_run_commit(self):
+        if self.is_busy() or self._current_plan is None:
+            return
+        plan = self._current_plan
+        if plan.planned_new == 0:
+            return
+        # Confirmation
+        reply = QMessageBox.question(
+            self, "Επιβεβαίωση εισαγωγής",
+            f"Θα προστεθούν {plan.planned_new} νέα προϊόντα.\n"
+            f"Τα υπάρχοντα προϊόντα ΔΕΝ θα αλλάξουν.\n\n"
+            f"Συνέχεια;",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        mapping = self._get_mapping()
+        if mapping is None:
+            return
+        self._set_controls_enabled(False)
+        self._preview_btn.hide()
+        self._conflict_btn.hide()
+        self._plan_btn.hide()
+        self._commit_btn.hide()
+        self._cancel_btn.show()
+        self._progress.show()
+        self._status_lbl.setText("🔄 Εκτέλεση ασφαλούς εισαγωγής…")
+        self._cancel_event = threading.Event()
+        self._start_worker(
+            _CommitWorker(self._file_path, mapping, plan,
+                          self._db_path, self._cancel_event),
+            self._on_commit_done)
+
+    def _on_commit_done(self, result):
+        self._progress.hide()
+        self._cancel_btn.hide()
+        if result.cancelled:
+            self._status_lbl.setText(
+                "⚠ Η εισαγωγή ακυρώθηκε. Δεν έγιναν αλλαγές.")
+            self._no_write_lbl.show()
+        elif not result.ok:
+            self._status_lbl.setText(
+                f"❌ Αποτυχία: {result.error_message}")
+            self._no_write_lbl.show()
+        else:
+            self._status_lbl.setText(
+                f"✅ Εισήχθησαν {result.inserted_rows} νέα προϊόντα.")
+            self._no_write_lbl.hide()
+            self.import_completed.emit(result.inserted_rows)
+        # Invalidate plan after any commit attempt
+        self._current_plan = None
+        self._commit_check.hide()
+        self._commit_btn.hide()
+        self._commit_btn.setEnabled(False)
+        self._plan_btn.setEnabled(False)
+        self._last_conflict_result = None
+
     def _get_mapping(self) -> ImportColumnMapping | None:
         cols = {}
         for key in FIELD_KEYS:
@@ -657,6 +759,9 @@ class ProductImportPreviewDialog(QDialog):
         self._conflict_table.setRowCount(0)
         self._progress.hide()
         self._last_conflict_result = None
+        self._current_plan = None
+        self._commit_check.hide()
+        self._commit_btn.hide()
         self._plan_btn.setEnabled(False)
 
     def _reset_state(self):

@@ -356,6 +356,7 @@ class InventoryPage(BasePage):
         dlg = ProductImportPreviewDialog(self, db_path=self._db_path)
         self._preview_dlg = dlg
         dlg.shutdown_ready.connect(self._on_preview_dlg_shutdown_ready)
+        dlg.import_completed.connect(self._on_import_completed)
         dlg.exec()
         # Only clear ref if dialog is truly done (not deferred)
         if not dlg.is_busy():
@@ -366,6 +367,9 @@ class InventoryPage(BasePage):
             self._preview_dlg = None
         if self._close_pending:
             self._maybe_finish_shutdown()
+
+    def _on_import_completed(self, count):
+        self.refresh()
 
     def _on_edit_selected(self):
         rows = set()
