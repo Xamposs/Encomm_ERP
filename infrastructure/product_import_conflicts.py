@@ -156,15 +156,15 @@ class ImportConflictResult:
 
 
 def _compute_review_db_signature(conn: sqlite3.Connection,
-                                 seen_barcodes: Set[str]) -> str | None:
+                                 seen_barcodes: Set[str]) -> str:
     """Compute a deterministic SHA-256 signature of the current DB state.
 
-    Only for barcodes that exist in both the XLSX and ProductMaster.
+    Only for barcodes in seen_barcodes that also exist in ProductMaster.
     Canonical fields: Barcode, Name, Stock, Price (Decimal), ExpiryDate.
-    Returns None for empty or invalid inputs.
+    Returns the hex digest.  Raises ValueError if no barcodes match.
     """
     if not seen_barcodes:
-        return None
+        raise ValueError("No barcodes to sign")
     barcode_list = sorted(seen_barcodes)
     rows = []
     for i in range(0, len(barcode_list), 500):
@@ -176,7 +176,7 @@ def _compute_review_db_signature(conn: sqlite3.Connection,
             chunk).fetchall()
         rows.extend(chunk_rows)
     if not rows:
-        return None
+        raise ValueError("No matching DB rows for signature")
     # Build canonical string sorted by barcode
     parts = []
     for r in sorted(rows, key=lambda r: r["Barcode"]):
@@ -361,7 +361,7 @@ def analyze_import_conflicts(
     MAX_CONFLICT_DETAILS = 200
     BATCH_SIZE = 500
 
-    # Mapping validation
+    # Mapping validation (no DB needed yet)
     map_cols = [
         mapping.barcode_column, mapping.name_column,
         mapping.stock_column, mapping.price_column,
@@ -371,66 +371,60 @@ def analyze_import_conflicts(
             file_path, sheet_name or "—",
             "Κάθε στήλη αντιστοίχισης πρέπει να είναι μοναδική.")
 
-    # Open DB read-only before scanning XLSX
+    # Create source signature before opening DB
+    try:
+        sig_before = fingerprint_import_source(file_path, mapping)
+    except Exception as e:
+        return ImportConflictResult.failure(
+            file_path, sheet_name or "—",
+            f"Αδυναμία ταυτοποίησης αρχείου: {e}")
+
+    # ── Open single read-only connection with deferred read transaction ──
     conn = None
+    wb = None
     try:
         conn = _connect_ro(db_path)
+        # Deferred read transaction — stable snapshot for entire analysis
+        conn.execute("BEGIN")
+
+        # Schema check (inside transaction)
         info = conn.execute(
             "SELECT name FROM pragma_table_info('ProductMaster')").fetchall()
         existing_cols = {r["name"] for r in info}
         for col in ["Barcode", "Name", "Stock", "Price", "ExpiryDate"]:
             if col not in existing_cols:
-                conn.close()
                 return ImportConflictResult.failure(
                     file_path, sheet_name or "—",
                     f"Λείπει η στήλη {col} από τον ProductMaster.")
-    except sqlite3.Error as e:
-        if conn:
-            conn.close()
-        return ImportConflictResult.failure(
-            file_path, sheet_name or "—",
-            f"Σφάλμα βάσης δεδομένων: {e}")
 
-    # Create source signature before analysis
-    try:
-        sig_before = fingerprint_import_source(file_path, mapping)
-    except Exception as e:
-        if conn:
-            conn.close()
-        return ImportConflictResult.failure(
-            file_path, sheet_name or "—",
-            f"Αδυναμία ταυτοποίησης αρχείου: {e}")
+        # ── State ────────────────────────────────────────────────────
+        scanned = 0
+        valid = 0
+        invalid = 0
+        classified = 0
+        new_count = 0
+        unchanged_count = 0
+        changed_count = 0
+        errors: List[ImportRowErr] = []
+        samples: List[Tuple[str, str, int, float, str]] = []
+        conflicts: List[ConflictRecord] = []
+        details: List[ConflictDetail] = []
+        total_details_attempted: int = 0
+        seen_barcodes: Set[str] = set()
+        dupe_barcodes: Set[str] = set()
+        batch: List[IncomingProduct] = []
+        cancelled = False
+        limit_reached = False
 
-    # State
-    scanned = 0
-    valid = 0
-    invalid = 0
-    classified = 0
-    new_count = 0
-    unchanged_count = 0
-    changed_count = 0
-    errors: List[ImportRowErr] = []
-    samples: List[Tuple[str, str, int, float, str]] = []
-    conflicts: List[ConflictRecord] = []
-    details: List[ConflictDetail] = []
-    total_details_attempted: int = 0
-    seen_barcodes: Set[str] = set()
-    dupe_barcodes: Set[str] = set()
-    batch: List[IncomingProduct] = []
-    cancelled = False
-    limit_reached = False
+        # ── Open XLSX ────────────────────────────────────────────────
+        try:
+            wb = openpyxl.load_workbook(
+                file_path, read_only=True, data_only=True, keep_links=False)
+        except Exception as e:
+            return ImportConflictResult.failure(
+                file_path, sheet_name or "—",
+                f"Αδυναμία ανοίγματος αρχείου: {e}")
 
-    wb = None
-    try:
-        wb = openpyxl.load_workbook(
-            file_path, read_only=True, data_only=True, keep_links=False)
-    except Exception as e:
-        conn.close()
-        return ImportConflictResult.failure(
-            file_path, sheet_name or "—",
-            f"Αδυναμία ανοίγματος αρχείου: {e}")
-
-    try:
         ws = wb[sheet_name] if sheet_name else wb.active
         active_sheet = ws.title
         col_map: dict[str, int] = {}
@@ -446,8 +440,6 @@ def analyze_import_conflicts(
                 headers = tuple(
                     str(c).strip() if c is not None else "" for c in row)
                 if len(set(headers)) != len(headers):
-                    wb.close()
-                    conn.close()
                     return ImportConflictResult.failure(
                         file_path, active_sheet,
                         "Η κεφαλίδα περιέχει διπλότυπα ονόματα στηλών.")
@@ -460,8 +452,6 @@ def analyze_import_conflicts(
                     try:
                         col_map[key] = headers.index(col_name)
                     except ValueError:
-                        wb.close()
-                        conn.close()
                         return ImportConflictResult.failure(
                             file_path, active_sheet,
                             f"Στήλη '{col_name}' δεν βρέθηκε.")
@@ -527,11 +517,14 @@ def analyze_import_conflicts(
 
             # Flush when batch is full
             if len(batch) >= BATCH_SIZE:
-                processed, batch_cancelled, new_count, unchanged_count, changed_count, total_details_attempted = (
-                    _classify_batch(batch, conn, cancel_event, new_count,
-                                    unchanged_count, changed_count, conflicts,
-                                    details, total_details_attempted,
-                                    MAX_CONFLICT_SAMPLES, MAX_CONFLICT_DETAILS))
+                processed, batch_cancelled, new_count, unchanged_count, \
+                    changed_count, total_details_attempted = (
+                        _classify_batch(batch, conn, cancel_event, new_count,
+                                        unchanged_count, changed_count,
+                                        conflicts, details,
+                                        total_details_attempted,
+                                        MAX_CONFLICT_SAMPLES,
+                                        MAX_CONFLICT_DETAILS))
                 classified += processed
                 batch.clear()
                 if batch_cancelled:
@@ -540,73 +533,85 @@ def analyze_import_conflicts(
 
         # Flush remaining
         if batch and not cancelled:
-            processed, batch_cancelled, new_count, unchanged_count, changed_count, total_details_attempted = (
-                _classify_batch(batch, conn, cancel_event, new_count,
-                                unchanged_count, changed_count, conflicts,
-                                details, total_details_attempted,
-                                MAX_CONFLICT_SAMPLES, MAX_CONFLICT_DETAILS))
+            processed, batch_cancelled, new_count, unchanged_count, \
+                changed_count, total_details_attempted = (
+                    _classify_batch(batch, conn, cancel_event, new_count,
+                                    unchanged_count, changed_count,
+                                    conflicts, details,
+                                    total_details_attempted,
+                                    MAX_CONFLICT_SAMPLES,
+                                    MAX_CONFLICT_DETAILS))
             classified += processed
             batch.clear()
             if batch_cancelled:
                 cancelled = True
-            batch.clear()
+
+        dupes = len(dupe_barcodes)
+        details_truncated = total_details_attempted > MAX_CONFLICT_DETAILS
+
+        if cancelled:
+            return ImportConflictResult.cancelled(
+                file_path, active_sheet, scanned, valid, invalid, dupes,
+                classified, new_count, unchanged_count, changed_count,
+                conflicts, errors, samples,
+                details=details, truncated=details_truncated)
+
+        if limit_reached:
+            return ImportConflictResult.partial(
+                f"Υπέρβαση ορίου {max_rows:,} γραμμών.",
+                file_path, active_sheet, scanned, valid, invalid, dupes,
+                classified, new_count, unchanged_count, changed_count,
+                conflicts, errors, samples,
+                details=details, truncated=details_truncated)
+
+        # Verify source signature hasn't changed during analysis
+        try:
+            if not verify_import_source(sig_before, file_path, mapping):
+                return ImportConflictResult.failure(
+                    file_path, active_sheet,
+                    "Το αρχείο Excel άλλαξε κατά την ανάλυση. "
+                    "Επιλέξτε το ξανά.")
+        except Exception:
+            return ImportConflictResult.failure(
+                file_path, active_sheet,
+                "Αδυναμία επαλήθευσης ταυτότητας αρχείου.")
+
+        # ── Compute DB review signature from the SAME stable connection ──
+        review_sig: str | None = None
+        try:
+            review_sig = _compute_review_db_signature(conn, seen_barcodes)
+        except ValueError:
+            # No matching barcodes in DB → None is acceptable
+            review_sig = None
+        except Exception:
+            # If products were changed, a signature is mandatory for C3
+            if changed_count > 0:
+                return ImportConflictResult.failure(
+                    file_path, active_sheet,
+                    "Αδυναμία υπολογισμού υπογραφής βάσης "
+                    "για τα αλλαγμένα προϊόντα. "
+                    "Επανεκκινήστε την ανάλυση.")
+            review_sig = None
+
+        return ImportConflictResult.success(
+            file_path, active_sheet, scanned, valid, invalid, dupes,
+            classified, new_count, unchanged_count, changed_count,
+            conflicts, errors, samples, signature=sig_before,
+            details=details, truncated=details_truncated,
+            review_db_signature=review_sig)
 
     except Exception as e:
-        conn.close()
         return ImportConflictResult.failure(
             file_path, sheet_name or "—",
             f"Σφάλμα κατά την ανάγνωση: {e}")
     finally:
         if wb:
-            wb.close()
-
-    conn.close()
-    conn = None
-    dupes = len(dupe_barcodes)
-    details_truncated = total_details_attempted > MAX_CONFLICT_DETAILS
-
-    if cancelled:
-        return ImportConflictResult.cancelled(
-            file_path, active_sheet, scanned, valid, invalid, dupes,
-            classified, new_count, unchanged_count, changed_count,
-            conflicts, errors, samples,
-            details=details, truncated=details_truncated)
-
-    if limit_reached:
-        return ImportConflictResult.partial(
-            f"Υπέρβαση ορίου {max_rows:,} γραμμών.",
-            file_path, active_sheet, scanned, valid, invalid, dupes,
-            classified, new_count, unchanged_count, changed_count,
-            conflicts, errors, samples,
-            details=details, truncated=details_truncated)
-
-    # Verify source signature hasn't changed during analysis
-    try:
-        if not verify_import_source(sig_before, file_path, mapping):
-            return ImportConflictResult.failure(
-                file_path, active_sheet,
-                "Το αρχείο Excel άλλαξε κατά την ανάλυση. "
-                "Επιλέξτε το ξανά.")
-    except Exception:
-        return ImportConflictResult.failure(
-            file_path, active_sheet,
-            "Αδυναμία επαλήθευσης ταυτότητας αρχείου.")
-
-    # Compute DB review signature (need fresh read-only connection)
-    review_sig = None
-    review_conn = None
-    try:
-        review_conn = _connect_ro(db_path)
-        review_sig = _compute_review_db_signature(review_conn, seen_barcodes)
-    except Exception:
-        pass
-    finally:
-        if review_conn:
-            review_conn.close()
-
-    return ImportConflictResult.success(
-        file_path, active_sheet, scanned, valid, invalid, dupes,
-        classified, new_count, unchanged_count, changed_count,
-        conflicts, errors, samples, signature=sig_before,
-        details=details, truncated=details_truncated,
-        review_db_signature=review_sig)
+            try:
+                wb.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass

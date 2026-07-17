@@ -712,10 +712,12 @@ class ProductImportPreviewDialog(QDialog):
         self._commit_btn.setEnabled(False)
 
         # ── C3: show update controls only when manual_review > 0,
-        #     skipped_changed == 0, and policy is not skip ────────────
+        #     skipped_changed == 0, review_db_signature present,
+        #     and policy is not skip ──────────────────────────────────
         show_c3 = (plan.manual_review > 0
                    and plan.skipped_changed == 0
-                   and not skip_policy)
+                   and not skip_policy
+                   and plan.review_db_signature is not None)
         self._update_check.setVisible(show_c3)
         self._update_check.setChecked(False)
         self._update_btn.setVisible(show_c3)

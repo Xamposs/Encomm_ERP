@@ -750,17 +750,19 @@ class TestC3PrerequisiteGates:
 
 # ── Dialog gating tests ────────────────────────────────────────────────
 
+@pytest.fixture(scope="module")
+def qapp_module():
+    """Module-level QApplication for dialog tests (headless-safe)."""
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    yield app
+    # No quit — other tests may reuse the app
+
 
 class TestDialogC3Gating:
 
-    @pytest.fixture(scope="class")
-    def qapp_class(self):
-        from PySide6.QtWidgets import QApplication
-        app = QApplication.instance() or QApplication([])
-        return app
-
     @pytest.fixture
-    def dialog_factory(self, qapp_class):
+    def dialog_factory(self, qapp_module):
         dialogs = []
         def _make(**kw):
             from qt_app.dialogs.product_import_preview_dialog import (
@@ -853,3 +855,140 @@ class TestDialogC3Gating:
         d._on_update_check_toggled(True)
         assert not d._update_btn.isEnabled()
         d._thread = None
+
+    def test_c3_hidden_with_null_review_db_signature(self, dialog_factory):
+        """Manual-review plan with review_db_signature=None → C3 hidden."""
+        d = dialog_factory()
+        sig = ImportSourceSignature(1, "a" * 64, "b" * 64)
+        plan = ImportPlan(
+            read_only=True, planned_new=0,
+            skipped_identical=0, manual_review=3,
+            skipped_changed=0,
+            source_signature=sig,
+            review_db_signature=None)  # missing!
+        d._current_plan = plan
+        show = (plan.manual_review > 0
+                and plan.skipped_changed == 0
+                and plan.review_db_signature is not None)
+        d._update_check.setVisible(show)
+        d._update_btn.setVisible(show)
+        assert d._update_check.isHidden()
+        assert d._update_btn.isHidden()
+
+
+# ── Regression: stable snapshot prevents two-connection race ───────────
+
+
+class TestStableSnapshotRegression:
+
+    def test_wal_race_old_two_connection_would_fail(self, tmp_path):
+        """Demonstrate the old race: if C2 reads old state but signature
+        is computed from a second connection after a concurrent mutation,
+        the plan holds stale signature.  With the fix, a single deferred
+        read transaction prevents this — analysis signature equals the
+        reviewed state, and C3 should reject the mutated DB."""
+        db = str(tmp_path / "t.db")
+        xp = str(tmp_path / "t.xlsx")
+
+        # Create WAL-mode DB with one existing product
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE ProductMaster("
+            "Barcode TEXT, Name TEXT, Stock INTEGER, "
+            "Price REAL, ExpiryDate TEXT)")
+        conn.execute(
+            "CREATE TABLE stock_movements("
+            "id INTEGER PRIMARY KEY, barcode TEXT, product_name TEXT, "
+            "old_stock INTEGER, new_stock INTEGER, "
+            "change_amount INTEGER, reason TEXT, source TEXT, "
+            "operator TEXT, timestamp TEXT)")
+        conn.execute(
+            "INSERT INTO ProductMaster"
+            "(Barcode, Name, Stock, Price, ExpiryDate) "
+            "VALUES ('A', 'OldName', 1, 1.0, '2027-01-01')")
+        conn.commit()
+        conn.close()
+
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "NewName", 100, 2.5, "2028-01-01"]])
+
+        # Run analysis (now uses single deferred read transaction)
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.changed_existing == 1
+        orig_sig = r.review_db_signature
+        assert orig_sig is not None
+
+        # Build plan
+        plan = build_import_plan(
+            r, ImportReviewPolicy(changed=ChangedPolicy.REQUIRE_MANUAL_REVIEW))
+        assert plan.review_db_signature == orig_sig
+        sig = fingerprint_import_source(xp, M)
+
+        # Concurrent writer mutates the DB after analysis but before C3
+        writer = sqlite3.connect(db)
+        writer.execute("UPDATE ProductMaster SET Name='Hijacked' "
+                       "WHERE Barcode='A'")
+        writer.commit()
+        writer.close()
+
+        plan_with_sig = ImportPlan(
+            read_only=True,
+            file_name=plan.file_name,
+            sheet_name=plan.sheet_name,
+            valid_rows=plan.valid_rows,
+            invalid_rows=plan.invalid_rows,
+            duplicate_barcodes=plan.duplicate_barcodes,
+            classified_rows=plan.classified_rows,
+            planned_new=plan.planned_new,
+            skipped_identical=plan.skipped_identical,
+            manual_review=plan.manual_review,
+            skipped_changed=plan.skipped_changed,
+            rejected_invalid=plan.rejected_invalid,
+            skipped_duplicates=plan.skipped_duplicates,
+            source_signature=sig,
+            review_db_signature=orig_sig,
+        )
+
+        r = commit_approved_changed_products_from_xlsx(
+            xp, M, plan_with_sig, db)
+        # C3 MUST reject because the DB changed → zero writes
+        assert not r.ok
+        assert r.updated_rows == 0
+
+        # Verify no updates or audits
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT Name FROM ProductMaster WHERE Barcode='A'").fetchone()
+        assert row["Name"] == "Hijacked"  # writer's change survived
+        aud = conn.execute(
+            "SELECT COUNT(*) c FROM stock_movements").fetchone()["c"]
+        assert aud == 0
+        conn.close()
+
+    def test_signature_computation_failure_returns_failed_analysis(
+            self, tmp_path, monkeypatch):
+        """If changed_count > 0 and signature computation fails,
+        analysis must return failure, not success with None signature."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "NewName", 100, 2.5, "2028-01-01"]])
+        _make_db(db, [("A", "OldName", 1, 1.0, "2027-01-01")])
+
+        # Force _compute_review_db_signature to raise a non-ValueError
+        import infrastructure.product_import_conflicts as ic
+        orig_fn = ic._compute_review_db_signature
+
+        def _fail(*a, **kw):
+            raise RuntimeError("simulated signature failure")
+
+        monkeypatch.setattr(ic, "_compute_review_db_signature", _fail)
+
+        r = analyze_import_conflicts(xp, M, db)
+        # changed_count > 0 + signature failure → failed result
+        assert not r.ok
+        assert not r.cancelled
+        assert "υπογραφής" in (r.error_message or "")

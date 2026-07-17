@@ -342,7 +342,10 @@ def commit_approved_changed_products_from_xlsx(
                     f"Δημιουργήστε νέο σχέδιο.")
 
         # ── Recalculate DB review signature (inside txn) ────────────
-        recalc_sig = _compute_review_db_signature(conn, seen_barcodes)
+        try:
+            recalc_sig = _compute_review_db_signature(conn, seen_barcodes)
+        except ValueError:
+            recalc_sig = None
         if recalc_sig != plan.review_db_signature:
             conn.rollback()
             conn.close()
