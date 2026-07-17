@@ -13,6 +13,8 @@ from datetime import date as dt_date, datetime as dt_datetime
 from decimal import Decimal
 from math import isfinite
 from pathlib import Path
+
+from infrastructure.import_constants import MAX_IMPORT_ROWS
 from typing import Tuple, Dict, List, Set
 
 import openpyxl
@@ -255,7 +257,7 @@ def analyze_import_conflicts(
     db_path: str,
     sheet_name: str | None = None,
     cancel_event=None,
-    max_rows: int = 250_000,
+    max_rows: int = MAX_IMPORT_ROWS,
 ) -> ImportConflictResult:
     MAX_ERRORS = 200
     MAX_SAMPLES = 20

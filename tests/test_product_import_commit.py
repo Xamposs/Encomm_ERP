@@ -222,28 +222,52 @@ class TestRollback:
                      "ON CONFLICT"]:
             assert pat not in src, f"Forbidden '{pat}' in commit service"
 
-    def test_duplicate_barcode_only_unique_inserted(self, tmp_path):
-        """Duplicate barcodes in XLSX → only unique new rows inserted."""
+    def test_duplicate_barcode_one_invalid_b1_c1_atomic(self, tmp_path):
+        """Real B1 plan through duplicate A, A, B → valid_rows=2, invalid=1,
+        dupes=1; C1 inserts A and B atomically."""
         xp = str(tmp_path / "t.xlsx")
         db = str(tmp_path / "t.db")
         _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
               [["A", "N1", 1, 1.0, ""],
-               ["A", "N1", 1, 1.0, ""],  # duplicate
+               ["A", "N1", 1, 1.0, ""],
                ["B", "N2", 1, 1.0, ""]])
         _make_db(db)
-        plan = _plan(xp, M, db)
-        assert plan.planned_new == 2  # A and B are new, but A counted once
+
+        # B1 analysis with real plan
+        plan = _plan(xp, M, db, changed=ChangedPolicy.REQUIRE_MANUAL_REVIEW)
+        assert plan.valid_rows == 2
+        assert plan.invalid_rows == 1
         assert plan.duplicate_barcodes == 1
+        assert plan.planned_new == 2
+
         sig = fingerprint_import_source(xp, M)
-        plan_sig = ImportPlan(
-            read_only=True, file_name=plan.file_name,
+        # Build plan with source signature
+        plan_with_sig = ImportPlan(
+            read_only=True,
+            file_name=plan.file_name,
             sheet_name=plan.sheet_name,
-            valid_rows=2, invalid_rows=0, duplicate_barcodes=1,
-            classified_rows=2, planned_new=2,
-            source_signature=sig)
-        r = commit_new_products_from_xlsx(xp, M, plan_sig, db)
+            valid_rows=plan.valid_rows,
+            invalid_rows=plan.invalid_rows,
+            duplicate_barcodes=plan.duplicate_barcodes,
+            classified_rows=plan.classified_rows,
+            planned_new=plan.planned_new,
+            skipped_identical=plan.skipped_identical,
+            manual_review=plan.manual_review,
+            skipped_changed=plan.skipped_changed,
+            rejected_invalid=plan.rejected_invalid,
+            skipped_duplicates=plan.skipped_duplicates,
+            source_signature=sig,
+        )
+        r = commit_new_products_from_xlsx(xp, M, plan_with_sig, db)
         assert r.ok
         assert r.inserted_rows == 2
+
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        cnt = conn.execute(
+            "SELECT COUNT(*) c FROM ProductMaster").fetchone()["c"]
+        assert cnt == 2
+        conn.close()
 
     def test_audit_uses_log_stock_movement_on_conn(self, tmp_path):
         """Prove _log_stock_movement_on_conn is called (not raw INSERT)."""
@@ -266,3 +290,185 @@ class TestRollback:
         assert "δεν βρέθηκε" in r.error_message.lower()
         import os
         assert not os.path.exists(db)
+
+
+class TestB1C1Parity:
+
+    def test_b1_reports_dupe_then_c1_inserts_unique(self, tmp_path):
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "NA", 1, 1.0, ""],
+               ["A", "NA", 1, 1.0, ""],  # duplicate
+               ["B", "NB", 1, 1.0, ""]])
+        _make_db(db)
+        from infrastructure.product_import_conflicts import analyze_import_conflicts
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.valid_rows == 2
+        assert r.invalid_rows == 1
+        assert r.duplicate_barcodes == 1
+        from infrastructure.product_import_plan import build_import_plan
+        plan = build_import_plan(r, ImportReviewPolicy())
+        assert plan.planned_new == 2
+        sig = fingerprint_import_source(xp, M)
+        plan = ImportPlan(
+            read_only=True, file_name=plan.file_name,
+            sheet_name=plan.sheet_name,
+            valid_rows=2, invalid_rows=1, duplicate_barcodes=1,
+            classified_rows=2, planned_new=2, rejected_invalid=1,
+            skipped_duplicates=1, source_signature=sig)
+        res = commit_new_products_from_xlsx(xp, M, plan, db)
+        assert res.ok
+        assert res.inserted_rows == 2
+        conn = sqlite3.connect(db); conn.row_factory = sqlite3.Row
+        cnt = conn.execute(
+            "SELECT COUNT(*) c FROM ProductMaster").fetchone()["c"]
+        assert cnt == 2
+
+    def test_decimal_price_parity_changed_new(self, tmp_path):
+        """Existing price 1.0 vs XLSX price 1.00005 + new product:
+        B1 and C1 agree existing is changed; new product is inserted."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["EX", "Existing", 5, 1.00005, ""],
+               ["NW", "NewOne", 3, 2.0, ""]])
+        _make_db(db, products=[("EX", "Existing", 5, 1.0, "")])
+
+        # B1 analysis
+        from infrastructure.product_import_conflicts import analyze_import_conflicts
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.new_barcodes == 1
+        assert r.changed_existing == 1
+
+        # Build real plan from B1 result
+        plan = _plan(xp, M, db, changed=ChangedPolicy.REQUIRE_MANUAL_REVIEW)
+        sig = fingerprint_import_source(xp, M)
+        plan_with_sig = ImportPlan(
+            read_only=True,
+            file_name=plan.file_name,
+            sheet_name=plan.sheet_name,
+            valid_rows=plan.valid_rows,
+            invalid_rows=plan.invalid_rows,
+            duplicate_barcodes=plan.duplicate_barcodes,
+            classified_rows=plan.classified_rows,
+            planned_new=plan.planned_new,
+            skipped_identical=plan.skipped_identical,
+            manual_review=plan.manual_review,
+            skipped_changed=plan.skipped_changed,
+            rejected_invalid=plan.rejected_invalid,
+            skipped_duplicates=plan.skipped_duplicates,
+            source_signature=sig,
+        )
+
+        res = commit_new_products_from_xlsx(xp, M, plan_with_sig, db)
+        assert res.ok
+        assert res.inserted_rows == 1
+
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        nw = conn.execute(
+            "SELECT * FROM ProductMaster WHERE Barcode='NW'").fetchone()
+        assert nw is not None
+        ex = conn.execute(
+            "SELECT * FROM ProductMaster WHERE Barcode='EX'").fetchone()
+        assert ex["Price"] == 1.0
+        conn.close()
+
+
+class TestLimitAndSafety:
+
+    def test_over_limit_zero_inserts(self, tmp_path, monkeypatch):
+        import infrastructure.product_import_commit as pic
+        monkeypatch.setattr(pic, "MAX_IMPORT_ROWS", 2)
+        monkeypatch.setattr(
+            "infrastructure.product_import_conflicts.MAX_IMPORT_ROWS", 2)
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "NA", 1, 1.0, ""],
+               ["B", "NB", 1, 1.0, ""],
+               ["C", "NC", 1, 1.0, ""]])
+        _make_db(db)
+        sig = fingerprint_import_source(xp, M)
+        plan = ImportPlan(
+            read_only=True, planned_new=3, source_signature=sig,
+            valid_rows=3, invalid_rows=0, duplicate_barcodes=0,
+            classified_rows=3)
+        res = commit_new_products_from_xlsx(xp, M, plan, db)
+        assert not res.ok
+        assert res.inserted_rows == 0
+        conn = sqlite3.connect(db)
+        cnt = conn.execute("SELECT COUNT(*) c FROM ProductMaster").fetchone()[0]
+        assert cnt == 0
+        aud = conn.execute(
+            "SELECT COUNT(*) c FROM stock_movements").fetchone()[0]
+        assert aud == 0
+
+    def test_audit_failure_rolls_back(self, tmp_path, monkeypatch):
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "NA", 1, 1.0, ""]])
+        _make_db(db)
+        sig = fingerprint_import_source(xp, M)
+        plan = ImportPlan(
+            read_only=True, planned_new=1, source_signature=sig,
+            valid_rows=1, invalid_rows=0, duplicate_barcodes=0,
+            classified_rows=1)
+        from infrastructure import database_service
+        def _boom(*a, **k):
+            raise RuntimeError("audit down")
+        monkeypatch.setattr(
+            database_service.DatabaseService,
+            "_log_stock_movement_on_conn", staticmethod(_boom))
+        res = commit_new_products_from_xlsx(xp, M, plan, db)
+        assert not res.ok
+        assert res.inserted_rows == 0
+        conn = sqlite3.connect(db)
+        cnt = conn.execute("SELECT COUNT(*) c FROM ProductMaster").fetchone()[0]
+        assert cnt == 0
+
+    def test_foreign_keys_enabled(self, tmp_path, monkeypatch):
+        import infrastructure.product_import_commit as pic
+        import unittest.mock as mock
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "NA", 1, 1.0, ""]])
+        _make_db(db)
+        sig = fingerprint_import_source(xp, M)
+        plan = ImportPlan(
+            read_only=True, planned_new=1, source_signature=sig,
+            valid_rows=1, invalid_rows=0, duplicate_barcodes=0,
+            classified_rows=1)
+        captured = {}
+        orig = pic._connect_rw
+        def spy(path):
+            c = orig(path)
+            captured["fk"] = c.execute("PRAGMA foreign_keys").fetchone()[0]
+            return c
+        with mock.patch.object(pic, "_connect_rw", spy):
+            commit_new_products_from_xlsx(xp, M, plan, db)
+        assert captured["fk"] == 1
+
+    def test_missing_columns_fail_safe(self, tmp_path):
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "NA", 1, 1.0, ""]])
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE ProductMaster(Barcode TEXT, Name TEXT)")
+        conn.commit(); conn.close()
+        sig = fingerprint_import_source(xp, M)
+        plan = ImportPlan(
+            read_only=True, planned_new=1, source_signature=sig,
+            valid_rows=1, invalid_rows=0, duplicate_barcodes=0,
+            classified_rows=1)
+        res = commit_new_products_from_xlsx(xp, M, plan, db)
+        assert not res.ok
+        conn2 = sqlite3.connect(db)
+        cnt = conn2.execute("SELECT COUNT(*) c FROM ProductMaster").fetchone()[0]
+        assert cnt == 0

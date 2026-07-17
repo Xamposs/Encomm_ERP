@@ -401,3 +401,39 @@ class TestCommitUI:
         d._on_build_plan()
         d._hide_results()
         assert d._current_plan is None
+
+    def test_commit_done_success_no_crash(self, dialog_factory):
+        from infrastructure.product_import_commit import ImportCommitResult
+        from infrastructure.product_import_identity import ImportSourceSignature
+        d = dialog_factory(db_path="/tmp/test.db")
+        emitted = []
+        d.import_completed.connect(emitted.append)
+        sig = ImportSourceSignature(
+            file_size_bytes=1, file_sha256="a"*64, mapping_sha256="b"*64)
+        result = ImportCommitResult.success(
+            inserted=2, skipped_id=0, skipped_ch=0, rejected=0,
+            skipped_dup=0, sig=sig)
+        # plan wording visible before; should be hidden after
+        d._plan_summary_lbl.show()
+        assert not d._plan_summary_lbl.isHidden()
+        d._on_commit_done(result)
+        assert d._plan_summary_lbl.isHidden()
+        assert d._no_write_lbl.isHidden()
+        assert emitted == [2]
+        assert d._current_plan is None
+        assert d._operation == ""
+
+
+class TestInventoryRefresh:
+
+    def test_import_completed_calls_refresh_and_dashboard(self):
+        """_on_import_completed must refresh inventory AND dashboard."""
+        from qt_app.pages import inventory_page as ip_mod
+        calls = []
+        page = ip_mod.InventoryPage.__new__(ip_mod.InventoryPage)
+        page.refresh = lambda: calls.append("refresh")
+        page._refresh_dashboard = lambda: calls.append("dashboard")
+        # Invoke the actual production method (unbound) on the stand-in
+        ip_mod.InventoryPage._on_import_completed(page, 3)
+        assert "refresh" in calls
+        assert "dashboard" in calls

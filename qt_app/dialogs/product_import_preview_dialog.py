@@ -653,6 +653,7 @@ class ProductImportPreviewDialog(QDialog):
     def _on_commit_done(self, result):
         self._progress.hide()
         self._cancel_btn.hide()
+        self._operation = ""
         # Hide the old plan text (future addition wording)
         self._plan_summary_lbl.hide()
         if result.cancelled:
@@ -666,11 +667,12 @@ class ProductImportPreviewDialog(QDialog):
         else:
             self._status_lbl.setText(
                 f"✅ Εισήχθησαν {result.inserted_rows} νέα προϊόντα. "
-                f"({plan.skipped_identical} ίδια παραλείφθηκαν, "
-                f"{plan.skipped_changed + plan.manual_review} "
-                f"υπάρχουσες αλλαγές παραλείφθηκαν)")
+                f"({result.skipped_identical} ίδια παραλείφθηκαν, "
+                f"{result.skipped_changed} υπάρχουσες αλλαγές "
+                f"παραλείφθηκαν)")
             self._no_write_lbl.hide()
             self.import_completed.emit(result.inserted_rows)
+        # Invalidate plan after any commit attempt
         self._current_plan = None
         self._commit_check.hide()
         self._commit_btn.hide()
