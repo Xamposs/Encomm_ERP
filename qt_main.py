@@ -49,11 +49,14 @@ def create_main_window(
     """
     resolved_path = db_path or os.getenv("DB_PATH", "encomm_erp.db")
 
-    app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName(app_name)
-    app.setOrganizationName("ENCOMM")
-    app.setPalette(DARK_PALETTE)
-    app.setStyleSheet(GLOBAL_QSS)
+    existing = QApplication.instance()
+    app = existing or QApplication(sys.argv)
+    if not existing:
+        # Only set global style on a brand-new QApp instance
+        app.setApplicationName(app_name)
+        app.setOrganizationName("ENCOMM")
+        app.setPalette(DARK_PALETTE)
+        app.setStyleSheet(GLOBAL_QSS)
 
     db_service = DatabaseService(db_path=resolved_path)
     config: dict = {"db_path": resolved_path, "theme": "Dark"}

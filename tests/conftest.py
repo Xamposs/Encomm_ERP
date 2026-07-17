@@ -12,6 +12,20 @@ import pytest
 # Qt offscreen — must be set before any PySide6 import
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# ── Shared QApplication session fixture ──────────────────────────────
+# Prevents competing QApp instances across test modules which cause
+# Windows DLL unload crashes (STATUS_ENTRYPOINT_NOT_FOUND) on teardown.
+# Always defined so every Qt-using module shares one QApplication.
+
+@pytest.fixture(scope="session")
+def qapp():
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(["offscreen"])
+    from qt_app.styles import DARK_PALETTE, GLOBAL_QSS
+    app.setPalette(DARK_PALETTE)
+    app.setStyleSheet(GLOBAL_QSS)
+    return app
+
 # Ensure the project root is importable when running `pytest` from anywhere.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
