@@ -32,6 +32,7 @@ FIELD_LABELS = {
 class _InspectResult:
     ok: bool
     token: int = 0
+    file_gen: int = 0
     file_path: str = ""
     sheet_name: str = ""
     error: str = ""
@@ -43,9 +44,10 @@ class _InspectResult:
 class _InspectWorker(QObject):
     finished = Signal(_InspectResult)
 
-    def __init__(self, token, file_path, sheet_name=None, parent=None):
+    def __init__(self, token, file_gen, file_path, sheet_name=None, parent=None):
         super().__init__(parent)
-        self._token, self._fp, self._sn = token, file_path, sheet_name
+        self._token, self._file_gen, self._fp, self._sn = (
+            token, file_gen, file_path, sheet_name)
 
     def run(self):
         try:
@@ -54,7 +56,8 @@ class _InspectWorker(QObject):
             headers = inspect_xlsx_headers(self._fp, sn) if sn else ()
             suggested = suggest_mapping(self._fp, sn) if sn else None
             self.finished.emit(_InspectResult(
-                ok=True, token=self._token, file_path=self._fp,
+                ok=True, token=self._token, file_gen=self._file_gen,
+                file_path=self._fp,
                 sheet_name=sn, sheets=sheets, headers=headers,
                 suggested_mapping=suggested))
         except Exception as e:
@@ -89,14 +92,15 @@ class ProductImportPreviewDialog(QDialog):
         self._thread: QThread | None = None
         self._closing = False
         self._inspect_token = 0
-        self._file_gen = 0          # incremented on each new file
+        self._file_gen = 0
+        self._last_file_gen = 0
         self._current_file_path = ""  # file identity for stale-check
         self._build_ui()
         self._reset_state()
 
     # ── Public shutdown contract ──────────────────────────────────────
     def is_busy(self) -> bool:
-        return self._thread is not None and self._thread.isRunning()
+        return self._thread is not None
 
     def request_shutdown(self) -> None:
         if not self.is_busy():
@@ -278,11 +282,11 @@ class ProductImportPreviewDialog(QDialog):
         self._set_controls_enabled(False)
         self._status_lbl.setText("🔄 Ανάγνωση δομής αρχείου…")
         self._start_worker(
-            _InspectWorker(self._inspect_token, self._file_path, sheet_name),
+            _InspectWorker(self._inspect_token, self._file_gen,
+                           self._file_path, sheet_name),
             self._on_inspect_done)
 
     def _on_inspect_done(self, result: _InspectResult):
-        # Stale rejection: wrong token OR wrong file
         if (result.token != self._inspect_token
                 or result.file_path != self._current_file_path):
             return
@@ -290,8 +294,9 @@ class ProductImportPreviewDialog(QDialog):
             QMessageBox.warning(self, "Σφάλμα",
                                 f"Αδυναμία ανάγνωσης: {result.error}")
             return
-        # Repopulate sheet combo when file identity changes
-        if result.token == self._inspect_token:
+        # Repopulate sheet combo only on new file (file_gen increased)
+        if result.file_gen > self._last_file_gen:
+            self._last_file_gen = result.file_gen
             self._sheet_combo.blockSignals(True)
             self._sheet_combo.clear()
             self._sheet_combo.addItems(result.sheets)
@@ -405,8 +410,8 @@ class ProductImportPreviewDialog(QDialog):
 
     # ── Worker lifecycle ──────────────────────────────────────────────
     def _start_worker(self, worker, slot):
-        # Defensive: refuse if busy
-        if self.is_busy():
+        # Defensive: refuse if thread ref still present
+        if self._thread is not None:
             return
         self._worker = worker
         self._thread = QThread(self)
