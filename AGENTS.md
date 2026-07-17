@@ -27,35 +27,42 @@ Qt UI (qt_app) → Business Rules (core) → Database (infrastructure)
 | File | Risk | What it does |
 |------|:----:|-------------|
 | `qt_main.py` | Low | App entry: QApplication + MainWindow factory + `main()` |
-| `qt_app/main_window.py` | Medium | Sidebar + QStackedWidget + lazy pages + AI command bar |
+| `qt_app/main_window.py` | Medium | Sidebar + QStackedWidget + lazy pages + AI input bar (placeholder) |
 | `qt_app/pages/` | Medium | 10 page subclasses (Dashboard, Inventory, POS, etc.) |
 | `qt_app/styles.py` | Low | Dark palette + global QSS stylesheet |
 | `qt_app/data_source.py` | Medium | Read-only SQLite queries for Qt pages |
 | `infrastructure/database_service.py` | ⚠️ HIGH | All DB operations, schema init, migrations |
 | `infrastructure/inventory_command_service.py` | Medium | Write commands for product CRUD from Qt |
 | `infrastructure/excel_parser_service.py` | Medium | Excel import for products/invoices |
-| `infrastructure/ai_service.py` | Medium | AI integration |
-| `core/business_rules.py` | Low | VAT, expiry, stock checks, EAN-13 |
+| `infrastructure/ai_service.py` | Medium | AI service layer (planned — not wired into end-user automation) |
+| `core/business_rules.py` | Low | Expiry, stock checks, EAN-13 |
 | `core/domain_models.py` | Low | Product, Supplier, Invoice dataclasses |
-| `core/undo_stack.py` | Medium | Undo/redo operations |
-| `core/intent_factory.py` | Medium | Intent parsing |
+| `core/undo_stack.py` | Low | Standalone domain utility for undo/redo (not currently wired into Qt UI) |
+| `core/intent_factory.py` | Low | Intent parsing (planned — not wired into end-user automation) |
 
 ## Database (SQLite — encomm_erp.db)
 
 Tables: `ProductMaster`, `suppliers`, `customers`, `invoices`, `invoice_items`, `stock_movements`, `goods_receipts`, `goods_receipt_items`, `stock_lots`, `SystemConfig`
 
 - Schema loaded by `DatabaseService.__init__()` — initialized on first run
-- Config persisted in `SystemConfig` table (VAT rate, stock thresholds, expiry alerts)
+- Config persisted in `SystemConfig` table (stock thresholds, expiry alerts)
 - WAL journal mode active (set once at init, not per-connection)
 - New installs get CHECK constraints (`Stock >= 0`, `Price >= 0`) and FKs
 - **DO NOT change DB schema without asking**
 
+## VAT Policy — FROZEN
+
+VAT implementation is frozen and out of scope. Do not modify VAT calculations, defaults, schema, configuration, imports, or tests unless the user explicitly authorizes it.
+
 ## Conventions
 - Language: Greek locale (el) — UI is Greek
 - Date format: YYYY-MM-DD
-- VAT: 15% default (configurable)
 - Logging: file + console, format: `%(asctime)s - %(levelname)s - %(message)s`
 - Use `patch` tool for targeted edits (NOT full rewrites of large files)
+
+## AI Integration — Planned, Not Active
+
+AI integration is planned and must later use explicit intent/policy/approval/audit boundaries. The `ai_service.py` layer and `intent_factory.py` exist as infrastructure scaffolding but are **not** wired into end-user automation. Do not present them as implemented features.
 
 ## Running the app
 ```bash
@@ -78,16 +85,3 @@ python -m pytest -q
 - `plan` — write a plan before touching critical files
 - `systematic-debugging` — root cause analysis for bugs
 - `requesting-code-review` — pre-commit quality gates
-
-## graphify
-
-This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
-
-When the user types `/graphify`, use the installed graphify skill or instructions before doing anything else.
-
-Rules:
-- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
-- Dirty graphify-out/ files are expected after hooks or incremental updates; dirty graph files are not a reason to skip graphify. Only skip graphify if the task is about stale or incorrect graph output, or the user explicitly says not to use it.
-- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
-- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
-- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
