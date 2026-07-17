@@ -370,6 +370,7 @@ class InventoryPage(BasePage):
 
     def _on_import_completed(self, count):
         self.refresh()
+        self._refresh_dashboard()
 
     def _on_edit_selected(self):
         rows = set()

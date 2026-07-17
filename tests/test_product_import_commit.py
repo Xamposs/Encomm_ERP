@@ -221,3 +221,48 @@ class TestRollback:
         for pat in ["UPDATE ", "DELETE FROM", "REPLACE", "UPSERT",
                      "ON CONFLICT"]:
             assert pat not in src, f"Forbidden '{pat}' in commit service"
+
+    def test_duplicate_barcode_only_unique_inserted(self, tmp_path):
+        """Duplicate barcodes in XLSX → only unique new rows inserted."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "N1", 1, 1.0, ""],
+               ["A", "N1", 1, 1.0, ""],  # duplicate
+               ["B", "N2", 1, 1.0, ""]])
+        _make_db(db)
+        plan = _plan(xp, M, db)
+        assert plan.planned_new == 2  # A and B are new, but A counted once
+        assert plan.duplicate_barcodes == 1
+        sig = fingerprint_import_source(xp, M)
+        plan_sig = ImportPlan(
+            read_only=True, file_name=plan.file_name,
+            sheet_name=plan.sheet_name,
+            valid_rows=2, invalid_rows=0, duplicate_barcodes=1,
+            classified_rows=2, planned_new=2,
+            source_signature=sig)
+        r = commit_new_products_from_xlsx(xp, M, plan_sig, db)
+        assert r.ok
+        assert r.inserted_rows == 2
+
+    def test_audit_uses_log_stock_movement_on_conn(self, tmp_path):
+        """Prove _log_stock_movement_on_conn is called (not raw INSERT)."""
+        import inspect
+        from infrastructure import product_import_commit as pic
+        src = inspect.getsource(pic.commit_new_products_from_xlsx)
+        assert "_log_stock_movement_on_conn" in src
+
+    def test_missing_db_path_fails(self, tmp_path):
+        """Non-existent db path fails without creating file."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "nonexistent.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "N", 1, 1.0, ""]])
+        sig = ImportSourceSignature(file_size_bytes=100,
+                                     file_sha256="a"*64, mapping_sha256="b"*64)
+        plan = ImportPlan(read_only=True, planned_new=1, source_signature=sig)
+        r = commit_new_products_from_xlsx(xp, M, plan, db)
+        assert not r.ok
+        assert "δεν βρέθηκε" in r.error_message.lower()
+        import os
+        assert not os.path.exists(db)

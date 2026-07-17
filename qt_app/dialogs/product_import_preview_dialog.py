@@ -137,6 +137,7 @@ class ProductImportPreviewDialog(QDialog):
         self._current_file_path = ""
         self._last_conflict_result = None  # for plan building
         self._current_plan = None  # ImportPlan
+        self._operation = ""  # "preview", "conflict", "commit"
         self._build_ui()
         self._reset_state()
 
@@ -460,6 +461,7 @@ class ProductImportPreviewDialog(QDialog):
         self._cancel_btn.show()
         self._progress.show()
         self._status_lbl.setText("🔄 Εκτέλεση προεπισκόπησης…")
+        self._operation = "preview"
         self._cancel_event = threading.Event()
         self._start_worker(
             _PreviewWorker(self._file_path, mapping, self._sheet_name,
@@ -470,7 +472,12 @@ class ProductImportPreviewDialog(QDialog):
         if self._cancel_event:
             self._cancel_event.set()
         self._cancel_btn.setEnabled(False)
-        self._status_lbl.setText("Ακύρωση προεπισκόπησης…")
+        if self._operation == "commit":
+            self._status_lbl.setText("Ακύρωση εισαγωγής…")
+        elif self._operation == "conflict":
+            self._status_lbl.setText("Ακύρωση ανάλυσης…")
+        else:
+            self._status_lbl.setText("Ακύρωση προεπισκόπησης…")
 
     # ── Conflict analysis ─────────────────────────────────────────────
     def _on_run_conflict(self):
@@ -488,6 +495,7 @@ class ProductImportPreviewDialog(QDialog):
         self._cancel_btn.show()
         self._progress.show()
         self._status_lbl.setText("🔄 Ανάλυση συγκρούσεων βάσης…")
+        self._operation = "conflict"
         self._cancel_event = threading.Event()
         self._start_worker(
             _ConflictWorker(self._file_path, mapping, self._db_path,
@@ -635,6 +643,7 @@ class ProductImportPreviewDialog(QDialog):
         self._cancel_btn.show()
         self._progress.show()
         self._status_lbl.setText("🔄 Εκτέλεση ασφαλούς εισαγωγής…")
+        self._operation = "commit"
         self._cancel_event = threading.Event()
         self._start_worker(
             _CommitWorker(self._file_path, mapping, plan,
@@ -644,6 +653,8 @@ class ProductImportPreviewDialog(QDialog):
     def _on_commit_done(self, result):
         self._progress.hide()
         self._cancel_btn.hide()
+        # Hide the old plan text (future addition wording)
+        self._plan_summary_lbl.hide()
         if result.cancelled:
             self._status_lbl.setText(
                 "⚠ Η εισαγωγή ακυρώθηκε. Δεν έγιναν αλλαγές.")
@@ -654,10 +665,12 @@ class ProductImportPreviewDialog(QDialog):
             self._no_write_lbl.show()
         else:
             self._status_lbl.setText(
-                f"✅ Εισήχθησαν {result.inserted_rows} νέα προϊόντα.")
+                f"✅ Εισήχθησαν {result.inserted_rows} νέα προϊόντα. "
+                f"({plan.skipped_identical} ίδια παραλείφθηκαν, "
+                f"{plan.skipped_changed + plan.manual_review} "
+                f"υπάρχουσες αλλαγές παραλείφθηκαν)")
             self._no_write_lbl.hide()
             self.import_completed.emit(result.inserted_rows)
-        # Invalidate plan after any commit attempt
         self._current_plan = None
         self._commit_check.hide()
         self._commit_btn.hide()

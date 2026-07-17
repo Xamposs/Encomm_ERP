@@ -6,22 +6,24 @@ Insert-only — never updates, overwrites, or deletes existing products.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Tuple
 
 import openpyxl
 from infrastructure.product_import_preview import ImportColumnMapping
 from infrastructure.product_import_conflicts import (
     _normalize_barcode, _normalize_name, _normalize_stock,
     _normalize_price, _normalize_expiry, IncomingProduct,
-    _connect_ro as _conflicts_connect_ro,
 )
 from infrastructure.product_import_plan import ImportPlan
 from infrastructure.product_import_identity import (
     verify_import_source, ImportSourceSignature,
 )
+from infrastructure.database_service import DatabaseService
+
+
+MAX_IMPORT_ROWS = 250_000
 
 
 @dataclass(frozen=True)
@@ -53,19 +55,27 @@ class ImportCommitResult:
 
 
 def _connect_rw(db_path: str) -> sqlite3.Connection:
+    if not os.path.isfile(db_path):
+        raise FileNotFoundError(f"Η βάση δεδομένων δεν βρέθηκε: {db_path}")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = OFF")
     return conn
+
+
+def _verify_productmaster_columns(conn):
+    info = conn.execute(
+        "SELECT name FROM pragma_table_info('ProductMaster')").fetchall()
+    cols = {r["name"] for r in info}
+    for required in ["Barcode", "Name", "Stock", "Price", "ExpiryDate"]:
+        if required not in cols:
+            raise ValueError(f"Λείπει η στήλη {required} από τον ProductMaster.")
 
 
 def _revalidate_stream(
     file_path, mapping, sheet_name, conn, cancel_event, max_rows,
-) -> Tuple[bool, str, dict, int, int, int, int, int]:
-    """Stream XLSX, validate, classify against current DB.
-    Returns (ok, error_msg, incoming_dict, valid, invalid, dupes,
-             new_count, identical_count, changed_count).
-    """
+):
+    """Revalidate against current DB.  Returns tuple.
+    Matches B1 validation semantics exactly."""
     BATCH_SIZE = 500
     valid = invalid = dupes = 0
     new_count = identical_count = changed_count = 0
@@ -79,19 +89,29 @@ def _revalidate_stream(
         wb = openpyxl.load_workbook(
             file_path, read_only=True, data_only=True, keep_links=False)
         ws = wb[sheet_name] if sheet_name else wb.active
-        active_sheet = ws.title
 
         for row_idx, row in enumerate(
             ws.iter_rows(min_row=1, values_only=True), start=1):
 
             if cancel_event and cancel_event.is_set():
                 wb.close()
-                return (False, "Ακυρώθηκε", {}, valid, invalid, len(dupe_set),
+                return (False, "Ακυρώθηκε", valid, invalid, len(dupe_set),
                         0, 0, 0)
 
             if row_idx == 1:
                 headers = tuple(
                     str(c).strip() if c is not None else "" for c in row)
+                if len(set(headers)) != len(headers):
+                    wb.close()
+                    return (False, "Διπλότυπα ονόματα στηλών.",
+                            valid, invalid, 0, 0, 0, 0)
+                map_cols = [mapping.barcode_column, mapping.name_column,
+                            mapping.stock_column, mapping.price_column,
+                            mapping.expiry_date_column]
+                if len(set(map_cols)) != 5:
+                    wb.close()
+                    return (False, "Μη μοναδική αντιστοίχιση.",
+                            valid, invalid, 0, 0, 0, 0)
                 for key, col_name in [
                     ("barcode", mapping.barcode_column),
                     ("name", mapping.name_column),
@@ -103,24 +123,26 @@ def _revalidate_stream(
                     except ValueError:
                         wb.close()
                         return (False,
-                                f"Στήλη '{col_name}' δεν βρέθηκε.", {},
-                                0, 0, 0, 0, 0, 0)
+                                f"Στήλη '{col_name}' δεν βρέθηκε.",
+                                valid, invalid, 0, 0, 0, 0)
                 continue
 
-            if row_idx - 1 > max_rows:
+            if row_idx - 1 >= max_rows:
                 break
 
             def _col(key):
                 idx = col_map[key]
                 return row[idx] if idx < len(row) else None
 
+            # Use B1 normalization exactly
             barcode = _normalize_barcode(_col("barcode"))
             name = _normalize_name(_col("name"))
             stock = _normalize_stock(_col("stock"))
             price = _normalize_price(_col("price"))
             expiry = _normalize_expiry(_col("expiry"))
 
-            if not all([barcode, name, stock is not None, price is not None, expiry is not None]):
+            if not all([barcode, name, stock is not None,
+                        price is not None, expiry is not None]):
                 invalid += 1
                 continue
             if barcode in seen:
@@ -128,12 +150,12 @@ def _revalidate_stream(
                 dupes += 1
                 continue
             seen.add(barcode)
-
-            incoming[barcode] = IncomingProduct(
-                barcode, name, stock, price, expiry or "")
             valid += 1
 
-            # Classify in batches
+            prod = IncomingProduct(
+                barcode, name, stock, price, expiry or "")
+            incoming[barcode] = prod
+
             if len(incoming) >= BATCH_SIZE:
                 nc, ic, cc = _classify_chunk(incoming, conn, cancel_event)
                 new_count += nc
@@ -141,25 +163,24 @@ def _revalidate_stream(
                 changed_count += cc
                 incoming.clear()
 
-        # Final batch
         if incoming:
             nc, ic, cc = _classify_chunk(incoming, conn, cancel_event)
             new_count += nc
             identical_count += ic
             changed_count += cc
 
-        return (True, "", incoming, valid, invalid, len(dupe_set),
+        return (True, "", valid, invalid, len(dupe_set),
                 new_count, identical_count, changed_count)
 
     except Exception as e:
-        return (False, str(e), {}, 0, 0, 0, 0, 0, 0)
+        return (False, str(e), 0, 0, 0, 0, 0, 0)
     finally:
         if wb:
             wb.close()
 
 
 def _classify_chunk(incoming, conn, cancel_event):
-    """Classify one chunk against DB. Returns (new, identical, changed)."""
+    """Returns (new, identical, changed)."""
     barcodes = list(incoming.keys())
     placeholders = ",".join("?" for _ in barcodes)
     rows = conn.execute(
@@ -179,8 +200,8 @@ def _classify_chunk(incoming, conn, cancel_event):
             continue
         if (prod.name == (existing["Name"] or "") and
                 prod.stock == (existing["Stock"] or 0) and
-                abs(float(prod.price) - float(existing["Price"] or 0.0)) < 0.0001 and
-                (prod.expiry_date or "") == (existing["ExpiryDate"] or "")):
+                abs(float(prod.price) - float(existing["Price"] or 0.0)) < 0.0001
+                and (prod.expiry_date or "") == (existing["ExpiryDate"] or "")):
             identical += 1
         else:
             changed += 1
@@ -194,8 +215,6 @@ def commit_new_products_from_xlsx(
     db_path: str,
     cancel_event=None,
 ) -> ImportCommitResult:
-    """Atomic commit of only NEW products."""
-    # Preconditions
     if not plan.read_only:
         return ImportCommitResult.failure(
             "Το σχέδιο δεν είναι ανάγνωσης μόνο.")
@@ -205,10 +224,11 @@ def commit_new_products_from_xlsx(
     if plan.planned_new == 0:
         return ImportCommitResult.failure(
             "Δεν υπάρχουν νέα προϊόντα για εισαγωγή.")
-
-    # Verify source before any DB work
-    if not verify_import_source(
-            plan.source_signature, file_path, mapping):
+    # Check DB exists before signature (avoid confusing error msg)
+    if not os.path.isfile(db_path):
+        return ImportCommitResult.failure(
+            f"Η βάση δεδομένων δεν βρέθηκε: {db_path}")
+    if not verify_import_source(plan.source_signature, file_path, mapping):
         return ImportCommitResult.failure(
             "Το αρχείο ή η αντιστοίχιση άλλαξε από τη δημιουργία "
             "του σχεδίου. Δημιουργήστε νέο σχέδιο.")
@@ -216,47 +236,43 @@ def commit_new_products_from_xlsx(
     conn = None
     try:
         conn = _connect_rw(db_path)
+        _verify_productmaster_columns(conn)
         conn.execute("BEGIN IMMEDIATE")
 
-        # Re-verify inside transaction
-        if not verify_import_source(
-                plan.source_signature, file_path, mapping):
-            conn.rollback()
-            conn.close()
+        if not verify_import_source(plan.source_signature, file_path, mapping):
+            conn.rollback(); conn.close()
             return ImportCommitResult.failure(
                 "Το αρχείο άλλαξε μετά το κλείδωμα. "
                 "Δημιουργήστε νέο σχέδιο.")
 
-        # Revalidate
-        ok, err, incoming, valid, invalid, dupes, new_cnt, ident_cnt, chg_cnt = (
+        ok, err, valid, invalid, dupes, new_cnt, ident_cnt, chg_cnt = (
             _revalidate_stream(file_path, mapping, plan.sheet_name,
-                               conn, cancel_event, 250_000))
+                               conn, cancel_event, MAX_IMPORT_ROWS))
 
         if cancel_event and cancel_event.is_set():
-            conn.rollback()
-            conn.close()
+            conn.rollback(); conn.close()
             return ImportCommitResult.cancelled_result(plan.source_signature)
 
         if not ok:
-            conn.rollback()
-            conn.close()
+            conn.rollback(); conn.close()
             return ImportCommitResult.failure(
                 f"Αποτυχία επανεπικύρωσης: {err}")
 
-        # Compare counters against plan
         changed_total = plan.manual_review + plan.skipped_changed
         if (valid != plan.valid_rows or invalid != plan.invalid_rows or
                 dupes != plan.duplicate_barcodes or
+                plan.classified_rows != (
+                    plan.planned_new + plan.skipped_identical
+                    + changed_total) or
                 new_cnt != plan.planned_new or
                 ident_cnt != plan.skipped_identical or
                 chg_cnt != changed_total):
-            conn.rollback()
-            conn.close()
+            conn.rollback(); conn.close()
             return ImportCommitResult.failure(
                 "Η βάση δεδομένων ή το αρχείο άλλαξε από τη "
                 "δημιουργία του σχεδίου. Δημιουργήστε νέο σχέδιο.")
 
-        # ---- Insert pass ---- 
+        # Insert pass
         inserted = 0
         wb = None
         try:
@@ -271,16 +287,14 @@ def commit_new_products_from_xlsx(
 
                 if cancel_event and cancel_event.is_set():
                     conn.rollback()
-                    if wb:
-                        wb.close()
+                    if wb: wb.close()
                     conn.close()
                     return ImportCommitResult.cancelled_result(
                         plan.source_signature)
 
                 if row_idx == 1:
                     headers = tuple(
-                        str(c).strip() if c is not None else ""
-                        for c in row)
+                        str(c).strip() if c is not None else "" for c in row)
                     for key, col_name in [
                         ("barcode", mapping.barcode_column),
                         ("name", mapping.name_column),
@@ -291,12 +305,14 @@ def commit_new_products_from_xlsx(
                             col_map[key] = headers.index(col_name)
                         except ValueError:
                             conn.rollback()
-                            if wb:
-                                wb.close()
+                            if wb: wb.close()
                             conn.close()
                             return ImportCommitResult.failure(
                                 f"Στήλη '{col_name}' δεν βρέθηκε.")
                     continue
+
+                if row_idx - 1 >= MAX_IMPORT_ROWS:
+                    break
 
                 def _col(key):
                     idx = col_map[key]
@@ -315,28 +331,24 @@ def commit_new_products_from_xlsx(
                     continue
                 seen_insert.add(barcode)
 
-                # Check: only insert if NEW (not in DB)
                 existing = conn.execute(
                     "SELECT Barcode FROM ProductMaster WHERE Barcode=?",
                     (barcode,)).fetchone()
                 if existing is not None:
                     continue
 
-                # Insert product
                 conn.execute(
                     "INSERT INTO ProductMaster "
                     "(Barcode, Name, Stock, ExpiryDate, Price) "
                     "VALUES (?,?,?,?,?)",
                     (barcode, name, stock, expiry, price))
 
-                # Audit row
-                conn.execute(
-                    "INSERT INTO stock_movements "
-                    "(barcode, product_name, old_stock, new_stock, "
-                    "change_amount, reason, source, operator, timestamp) "
-                    "VALUES (?,?,?,?,?,?,?,?,datetime('now'))",
-                    (barcode, name, 0, stock, stock,
-                     "Εισαγωγή Excel", "Excel Import", "system"))
+                DatabaseService._log_stock_movement_on_conn(
+                    conn, barcode, name,
+                    old_stock=0, new_stock=stock,
+                    reason="Εισαγωγή Excel",
+                    source="Excel Import",
+                    operator="Σύστημα")
 
                 inserted += 1
 
@@ -344,11 +356,14 @@ def commit_new_products_from_xlsx(
             if wb:
                 wb.close()
 
-        # Final signature check before commit
-        if not verify_import_source(
-                plan.source_signature, file_path, mapping):
-            conn.rollback()
-            conn.close()
+        if inserted != plan.planned_new:
+            conn.rollback(); conn.close()
+            return ImportCommitResult.failure(
+                f"Ασυνέπεια: εισήχθησαν {inserted} αντί για "
+                f"{plan.planned_new}. Δημιουργήστε νέο σχέδιο.")
+
+        if not verify_import_source(plan.source_signature, file_path, mapping):
+            conn.rollback(); conn.close()
             return ImportCommitResult.failure(
                 "Το αρχείο άλλαξε πριν την ολοκλήρωση. "
                 "Δημιουργήστε νέο σχέδιο.")
@@ -369,5 +384,4 @@ def commit_new_products_from_xlsx(
             except Exception:
                 pass
             conn.close()
-        return ImportCommitResult.failure(
-            f"Σφάλμα εισαγωγής: {e}")
+        return ImportCommitResult.failure(f"Σφάλμα εισαγωγής: {e}")
