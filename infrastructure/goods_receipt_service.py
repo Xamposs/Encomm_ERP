@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -161,6 +162,21 @@ def ensure_goods_receipt_schema(conn: sqlite3.Connection) -> None:
 # Validation helpers
 # ═══════════════════════════════════════════════════════════════════════
 
+def _normalize_search(value: str) -> str:
+    """Greek accent- and case-insensitive normalization (NFD + strip Mn)."""
+    s = str(value).casefold()
+    decomposed = unicodedata.normalize("NFD", s)
+    stripped = "".join(
+        ch for ch in decomposed if unicodedata.category(ch) != "Mn"
+    )
+    return unicodedata.normalize("NFC", stripped)
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE wildcards so they are treated as literal text."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _validate_receipt_line(line: dict, idx: int) -> str | None:
     """Return a Greek error message or None."""
     if not isinstance(line.get("barcode"), str) or not line["barcode"].strip():
@@ -223,15 +239,16 @@ def create_receipt_draft(
     if any(not isinstance(li, dict) for li in lines):
         return CreateDraftResult(False, "Κάθε γραμμή πρέπει να είναι λεξικό.")
 
-    has_qty = any(li.get("received_qty", 0) > 0 for li in lines)
-    if not has_qty:
-        return CreateDraftResult(False,
-            "Τουλάχιστον μία γραμμή πρέπει να έχει ποσότητα > 0.")
-
+    # Validate every line before any numeric comparison
     for i, li in enumerate(lines):
         err = _validate_receipt_line(li, i)
         if err:
             return CreateDraftResult(False, err)
+
+    has_qty = any(li.get("received_qty", 0) > 0 for li in lines)
+    if not has_qty:
+        return CreateDraftResult(False,
+            "Τουλάχιστον μία γραμμή πρέπει να έχει ποσότητα > 0.")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if not received_at:
@@ -367,8 +384,13 @@ def list_receipts(
     page_size: int = 50,
     supplier_id: int | None = None,
     status: str | None = None,
+    search_text: str = "",
 ) -> ReceiptListResult:
-    """List receipts, newest first, with optional filters."""
+    """List receipts, newest first, with optional filters and search.
+
+    search_text filters by supplier name or document number using
+    Greek-safe accent/case-insensitive matching.
+    """
     page = max(1, page)
     page_size = min(max(1, page_size), 100)
 
@@ -376,6 +398,7 @@ def list_receipts(
     try:
         conn = _get_conn(db_path)
         ensure_goods_receipt_schema(conn)
+        conn.create_function("search_normalize", 1, _normalize_search, deterministic=True)
 
         conditions: list[str] = []
         params: list = []
@@ -386,11 +409,21 @@ def list_receipts(
         if status is not None:
             conditions.append("r.status = ?")
             params.append(status)
+        if search_text.strip():
+            norm = _normalize_search(search_text.strip())
+            esc = _escape_like(norm)
+            conditions.append(
+                "(search_normalize(COALESCE(s.name, '')) LIKE ? ESCAPE '\\' "
+                "OR search_normalize(r.document_number) LIKE ? ESCAPE '\\')")
+            params.append(f"%{esc}%")
+            params.append(f"%{esc}%")
 
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        # When search_text filters by supplier name, the COUNT query needs the JOIN too
+        join_clause = " LEFT JOIN suppliers s ON s.id = r.supplier_id" if search_text.strip() else ""
 
         total = conn.execute(
-            f"SELECT COUNT(*) FROM goods_receipts r{where}", params).fetchone()[0]
+            f"SELECT COUNT(*) FROM goods_receipts r{join_clause}{where}", params).fetchone()[0]
 
         if total == 0:
             page = 1

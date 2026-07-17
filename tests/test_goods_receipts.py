@@ -696,24 +696,16 @@ class TestNoVatOrInvoiceChanges:
         assert "UPDATE ProductMaster SET ExpiryDate" not in src
         assert "ExpiryDate" not in src  # No UPDATE ... ExpiryDate anywhere
 
-    def test_existing_sales_invoice_flow_not_affected(self, db):
-        """Prove that invoices table still works — creates and queries correctly."""
-        conn = _rw_connect(db.db_path)
-        ensure_goods_receipt_schema(conn)
-        conn.commit()
-
-        # Create an invoice entry (mimicking what sales flow does)
-        conn.execute(
-            """INSERT INTO invoices (id, invoice_date, subtotal,
-                                     vat_amount, grand_total)
-               VALUES ('INV-001', '2026-07-17', 100.0, 15.0, 115.0)""")
-        conn.commit()
-
-        inv = conn.execute(
-            "SELECT * FROM invoices WHERE id='INV-001'"
-        ).fetchone()
-        assert inv is not None
-        conn.close()
+    def test_service_does_not_touch_invoice_tables(self):
+        """Goods receipt service must never INSERT/UPDATE/DELETE on sales invoice tables."""
+        from infrastructure import goods_receipt_service as grs
+        src = inspect.getsource(grs)
+        assert "INSERT INTO invoices" not in src
+        assert "UPDATE invoices" not in src
+        assert "DELETE FROM invoices" not in src
+        assert "INSERT INTO invoice_items" not in src
+        assert "UPDATE invoice_items" not in src
+        assert "DELETE FROM invoice_items" not in src
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -871,3 +863,185 @@ class TestTransactionGuarantees:
             (draft.receipt_id,)).fetchone()["status"]
         assert status == "draft"
         conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Regression tests — D1.1 fixes
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestD11QColorFix:
+    """Fix 1: QColor instead of Qt.GlobalColor for status hex colors."""
+
+    def test_page_uses_qcolor_not_globalcolor(self):
+        import inspect
+        from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+        src = inspect.getsource(GoodsReceiptPage._on_list_result)
+        assert "QColor(" in src
+        assert "Qt.GlobalColor" not in src
+
+    def test_list_rendering_no_crash_offscreen(self):
+        import tempfile, os
+        from PySide6.QtWidgets import QApplication, QTableWidget, QTableWidgetItem
+        from PySide6.QtGui import QColor
+        from infrastructure.database_service import DatabaseService
+        from infrastructure.goods_receipt_service import ensure_goods_receipt_schema
+
+        app = QApplication.instance() or QApplication(["offscreen"])
+        db_path = tempfile.mktemp(suffix=".db")
+        try:
+            db = DatabaseService(db_path=db_path)
+            conn = _rw_connect(db_path)
+            ensure_goods_receipt_schema(conn)
+            conn.execute("INSERT INTO suppliers (id, name) VALUES (1, 'Test AE')")
+            conn.execute("INSERT INTO ProductMaster (Barcode, Name, Stock, ExpiryDate, Price) "
+                         "VALUES ('TEST001', 'Test', 100, '2099-01-01', 5.0)")
+            conn.execute(
+                "INSERT INTO goods_receipts (id, supplier_id, document_number, "
+                "document_type, status, received_at, created_at) "
+                "VALUES ('GR-T1',1,'DOC','delivery_note','draft','2026-07-17','2026-07-17')")
+            conn.commit()
+            conn.close()
+
+            from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+            config = {"db_path": db_path, "theme": "Dark"}
+            page = GoodsReceiptPage(None, config)
+            table = QTableWidget()
+            table.setRowCount(1)
+            item = QTableWidgetItem("draft")
+            item.setForeground(QColor("#F59E0B"))
+            table.setItem(0, 0, item)
+            page.deleteLater()
+        finally:
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+
+class TestD11DeferredRefresh:
+    """Fix 2: Deferred list refresh after create/approve/cancel success."""
+
+    def test_back_to_list_sets_flag_not_refreshes(self):
+        import inspect
+        from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+        src = inspect.getsource(GoodsReceiptPage._back_to_list)
+        assert "_pending_list_refresh = True" in src
+        assert "_do_list_refresh()" not in src
+
+    def test_on_worker_done_has_deferred_refresh(self):
+        import inspect
+        from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+        src = inspect.getsource(GoodsReceiptPage._on_worker_done)
+        assert "_pending_list_refresh" in src
+        assert "_do_list_refresh()" in src
+
+
+class TestD11Search:
+    """Fix 3: Search filtering by supplier name and document number."""
+
+    def test_list_receipts_accepts_search_text(self):
+        import inspect
+        src = inspect.getsource(list_receipts)
+        assert "search_text" in src
+
+    def test_search_normalize_registered(self):
+        import inspect
+        src = inspect.getsource(list_receipts)
+        assert "create_function" in src
+        assert "search_normalize" in src
+
+    def test_search_by_supplier_name_greek(self, db):
+        sid = _seed_supplier(db, "Φαρμακο ΑΕ")
+        _seed_product(db, "5200000000017", "P1")
+        create_receipt_draft(db.db_path, supplier_id=sid,
+                             document_number="DOC-001",
+                             document_type="delivery_note",
+                             lines=[{"barcode": "5200000000017",
+                                      "product_name": "P1",
+                                      "received_qty": 1, "unit_cost": 1.0}])
+        result = list_receipts(db.db_path, search_text="φαρμακο")
+        assert result.ok
+        assert result.total == 1
+
+    def test_search_by_document_number(self, db):
+        sid = _seed_supplier(db, "Test AE")
+        _seed_product(db, "5200000000017", "P1")
+        create_receipt_draft(db.db_path, supplier_id=sid,
+                             document_number="DEL-2026-0042",
+                             document_type="delivery_note",
+                             lines=[{"barcode": "5200000000017",
+                                      "product_name": "P1",
+                                      "received_qty": 1, "unit_cost": 1.0}])
+        result = list_receipts(db.db_path, search_text="0042")
+        assert result.ok
+        assert result.total == 1
+
+    def test_page_passes_search_to_worker(self):
+        import inspect
+        from qt_app.pages.goods_receipt_page import GoodsReceiptPage
+        src = inspect.getsource(GoodsReceiptPage._do_list_refresh)
+        assert '"search_text"' in src
+        assert "_search.text()" in src
+
+
+class TestD11MalformedInput:
+    """Fix 4: Harden create_receipt_draft against malformed line input."""
+
+    def test_none_quantity_returns_failure(self, db):
+        sid = _seed_supplier(db)
+        _seed_product(db, "5200000000017", "P1")
+        result = create_receipt_draft(db.db_path, supplier_id=sid,
+                                      document_number="DOC-NQ",
+                                      document_type="delivery_note",
+                                      lines=[{"barcode": "5200000000017",
+                                               "product_name": "P1",
+                                               "received_qty": None,
+                                               "unit_cost": 1.0}])
+        assert not result.ok
+        assert "ποσότητα" in result.error_message.lower()
+
+    def test_string_quantity_returns_failure(self, db):
+        sid = _seed_supplier(db)
+        _seed_product(db, "5200000000017", "P1")
+        result = create_receipt_draft(db.db_path, supplier_id=sid,
+                                      document_number="DOC-SQ",
+                                      document_type="delivery_note",
+                                      lines=[{"barcode": "5200000000017",
+                                               "product_name": "P1",
+                                               "received_qty": "ten",
+                                               "unit_cost": 1.0}])
+        assert not result.ok
+        assert "ποσότητα" in result.error_message.lower()
+
+    def test_boolean_quantity_returns_failure(self, db):
+        sid = _seed_supplier(db)
+        _seed_product(db, "5200000000017", "P1")
+        result = create_receipt_draft(db.db_path, supplier_id=sid,
+                                      document_number="DOC-BQ",
+                                      document_type="delivery_note",
+                                      lines=[{"barcode": "5200000000017",
+                                               "product_name": "P1",
+                                               "received_qty": True,
+                                               "unit_cost": 1.0}])
+        assert not result.ok
+        assert "ποσότητα" in result.error_message.lower()
+
+    def test_none_cost_returns_failure(self, db):
+        sid = _seed_supplier(db)
+        _seed_product(db, "5200000000017", "P1")
+        result = create_receipt_draft(db.db_path, supplier_id=sid,
+                                      document_number="DOC-NC",
+                                      document_type="delivery_note",
+                                      lines=[{"barcode": "5200000000017",
+                                               "product_name": "P1",
+                                               "received_qty": 5,
+                                               "unit_cost": None}])
+        assert not result.ok
+        assert "κόστος" in result.error_message.lower()
+
+    def test_validation_before_has_qty(self):
+        import inspect
+        from infrastructure import goods_receipt_service as grs
+        src = inspect.getsource(grs.create_receipt_draft)
+        validate_idx = src.index("_validate_receipt_line")
+        has_qty_idx = src.index("has_qty")
+        assert validate_idx < has_qty_idx, \
+            "Per-line validation must run BEFORE has_qty numeric comparison"

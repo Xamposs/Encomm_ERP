@@ -7,6 +7,7 @@ from datetime import date
 from typing import Any
 
 from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
@@ -78,6 +79,7 @@ class _ReceiptWorker(QObject):
                 self._db_path,
                 page=self._args.get("page", 1),
                 page_size=self._args.get("page_size", 50),
+                search_text=self._args.get("search_text", ""),
             ))
         elif self._mode == "detail":
             self.finished.emit(get_receipt(
@@ -129,6 +131,7 @@ class GoodsReceiptPage(BasePage):
         self._selected_receipt_id: str | None = None
         self._draft_lines: list[dict] = []  # in-memory lines for new draft
         self._supplier_map: dict[int, str] = {}  # id → name for combo
+        self._pending_list_refresh = False   # deferred refresh after worker completes
 
         super().__init__(db_service, config, parent)
 
@@ -431,7 +434,8 @@ class GoodsReceiptPage(BasePage):
         self._mode = "list"
         self._refresh_btn.setEnabled(False)
         self._set_status("🔄 Φόρτωση παραλαβών...", styles.TEXT_MUTED)
-        self._launch_worker("list", {"page": self._page, "page_size": self._page_size})
+        self._launch_worker("list", {"page": self._page, "page_size": self._page_size,
+                                       "search_text": self._search.text().strip()})
 
     def _on_selection_changed(self) -> None:
         rows = {it.row() for it in self._list_table.selectedItems()}
@@ -629,7 +633,7 @@ class GoodsReceiptPage(BasePage):
         self._selected_receipt_id = None
         self._confirm_cb.setChecked(False)
         self._draft_lines = []
-        self._do_list_refresh()
+        self._pending_list_refresh = True   # deferred — worker must finish first
 
     # ── Worker lifecycle ─────────────────────────────────────────────
 
@@ -684,7 +688,8 @@ class GoodsReceiptPage(BasePage):
             self._list_table.setItem(r_idx, 2, QTableWidgetItem(dt_label))
             self._list_table.setItem(r_idx, 3, QTableWidgetItem(recv_at))
             st_item = QTableWidgetItem(STATUS_LABELS.get(status, status))
-            st_item.setForeground(Qt.GlobalColor(STATUS_COLORS.get(status, styles.TEXT_PRIMARY)))
+            hex_color = STATUS_COLORS.get(status, styles.TEXT_PRIMARY)
+            st_item.setForeground(QColor(hex_color))
             self._list_table.setItem(r_idx, 4, st_item)
 
         self._page = result.page
@@ -825,6 +830,11 @@ class GoodsReceiptPage(BasePage):
         if self._close_pending:
             self._close_pending = False
             self.shutdown_ready.emit()
+            return
+        # Deferred list refresh — was requested while worker was still alive
+        if self._pending_list_refresh:
+            self._pending_list_refresh = False
+            self._do_list_refresh()
 
     def _set_status(self, text: str, color: str) -> None:
         self._status_lbl.setText(text)
