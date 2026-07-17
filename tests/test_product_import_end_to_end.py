@@ -4,8 +4,7 @@ import sqlite3, pytest, openpyxl
 from infrastructure.product_import_preview import ImportColumnMapping
 from infrastructure.product_import_conflicts import analyze_import_conflicts
 from infrastructure.product_import_plan import (
-    build_import_plan, ImportReviewPolicy, ChangedPolicy, ImportPlan)
-from infrastructure.product_import_identity import fingerprint_import_source
+    build_import_plan, ImportReviewPolicy, ChangedPolicy)
 from infrastructure.product_import_commit import commit_new_products_from_xlsx
 from infrastructure.product_import_update_commit import (
     commit_approved_changed_products_from_xlsx)
@@ -28,8 +27,7 @@ def _make_db(path, products=None):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS ProductMaster("
         "Barcode TEXT, Name TEXT, Stock INTEGER, "
-        "Price REAL, ExpiryDate TEXT, supplier_id INTEGER, "
-        "vat_category INTEGER DEFAULT 13)")
+        "Price REAL, ExpiryDate TEXT)")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS stock_movements("
         "id INTEGER PRIMARY KEY, barcode TEXT, product_name TEXT, "
@@ -54,55 +52,6 @@ def _run_analysis(xp, mapping, db_path):
     plan = build_import_plan(
         r, ImportReviewPolicy(changed=ChangedPolicy.REQUIRE_MANUAL_REVIEW))
     return r, plan
-
-
-def _run_c1(xp, mapping, plan, db_path):
-    """Execute C1 commit. Returns the commit result."""
-    sig = fingerprint_import_source(xp, mapping)
-    plan_with_sig = ImportPlan(
-        read_only=True,
-        file_name=plan.file_name,
-        sheet_name=plan.sheet_name,
-        valid_rows=plan.valid_rows,
-        invalid_rows=plan.invalid_rows,
-        duplicate_barcodes=plan.duplicate_barcodes,
-        classified_rows=plan.classified_rows,
-        planned_new=plan.planned_new,
-        skipped_identical=plan.skipped_identical,
-        manual_review=plan.manual_review,
-        skipped_changed=plan.skipped_changed,
-        rejected_invalid=plan.rejected_invalid,
-        skipped_duplicates=plan.skipped_duplicates,
-        source_signature=sig,
-        review_db_signature=plan.review_db_signature,
-    )
-    r = commit_new_products_from_xlsx(xp, mapping, plan_with_sig, db_path)
-    return r
-
-
-def _run_c3(xp, mapping, plan, db_path):
-    """Execute C3 update commit. Returns the update result."""
-    sig = fingerprint_import_source(xp, mapping)
-    plan_with_sig = ImportPlan(
-        read_only=True,
-        file_name=plan.file_name,
-        sheet_name=plan.sheet_name,
-        valid_rows=plan.valid_rows,
-        invalid_rows=plan.invalid_rows,
-        duplicate_barcodes=plan.duplicate_barcodes,
-        classified_rows=plan.classified_rows,
-        planned_new=plan.planned_new,
-        skipped_identical=plan.skipped_identical,
-        manual_review=plan.manual_review,
-        skipped_changed=plan.skipped_changed,
-        rejected_invalid=plan.rejected_invalid,
-        skipped_duplicates=plan.skipped_duplicates,
-        source_signature=sig,
-        review_db_signature=plan.review_db_signature,
-    )
-    r = commit_approved_changed_products_from_xlsx(
-        xp, mapping, plan_with_sig, db_path)
-    return r
 
 
 class TestEndToEnd:
@@ -145,7 +94,7 @@ class TestEndToEnd:
         # ═══════════════════════════════════════════════════════════════
         # Step 2: C1 — insert new product only
         # ═══════════════════════════════════════════════════════════════
-        c1_result = _run_c1(xp, M, plan1, db)
+        c1_result = commit_new_products_from_xlsx(xp, M, plan1, db)
         assert c1_result.ok, f"C1 failed: {c1_result.error_message}"
         assert c1_result.inserted_rows == 1
 
@@ -209,7 +158,7 @@ class TestEndToEnd:
         # ═══════════════════════════════════════════════════════════════
         # Step 4: C3 — update changed existing product
         # ═══════════════════════════════════════════════════════════════
-        c3_result = _run_c3(xp, M, plan2, db)
+        c3_result = commit_approved_changed_products_from_xlsx(xp, M, plan2, db)
         assert c3_result.ok, f"C3 failed: {c3_result.error_message}"
         assert c3_result.updated_rows == 1
         assert c3_result.updated_name == 1
