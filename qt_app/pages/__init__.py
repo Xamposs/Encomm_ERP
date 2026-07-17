@@ -14,6 +14,7 @@ from qt_app.pages.invoice_history_page import InvoiceHistoryPage
 from qt_app.pages.stock_movements_page import StockMovementsPage
 from qt_app.pages.settings_page import SettingsPage
 from qt_app.pages.ai_page import AIPage
+from qt_app.pages.goods_receipt_page import GoodsReceiptPage
 
 PAGE_CLASSES = {
     "dashboard":        DashboardPage,
@@ -25,4 +26,5 @@ PAGE_CLASSES = {
     "stock_movements":  StockMovementsPage,
     "settings":         SettingsPage,
     "ai_assistant":     AIPage,
+    "goods_receipts":   GoodsReceiptPage,
 }

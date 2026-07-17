@@ -39,7 +39,7 @@ GUI (presentation) → Business Rules (core) → Database (infrastructure)
 
 ## Database (SQLite — encomm_erp.db)
 
-Tables: `ProductMaster`, `suppliers`, `customers`, `invoices`, `invoice_items`, `stock_movements`, `SystemConfig`
+Tables: `ProductMaster`, `suppliers`, `customers`, `invoices`, `invoice_items`, `stock_movements`, `goods_receipts`, `goods_receipt_items`, `stock_lots`, `SystemConfig`
 
 - Schema loaded by `DatabaseService.__init__()` — check `_initialize_db` method
 - Config persisted in `SystemConfig` table (VAT rate, stock thresholds, expiry alerts)

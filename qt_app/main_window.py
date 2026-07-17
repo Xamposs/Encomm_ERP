@@ -1,8 +1,8 @@
 """Main window shell — sidebar + stacked pages + navigation.
 
 The MainWindow owns:
-- A fixed-width sidebar (220 px) with 9 Greek navigation buttons.
-- A QStackedWidget that holds all 9 pages, one of which is visible.
+- A fixed-width sidebar (220 px) with 10 Greek navigation buttons.
+- A QStackedWidget that holds all 10 pages, one of which is visible.
 - A status bar.
 
 Navigation is via sidebar button clicks.  The active button is highlighted.
@@ -26,6 +26,7 @@ NAV_ITEMS = [
     ("dashboard",        "📊  Αρχική"),
     ("inventory",        "📦  Αποθήκη"),
     ("suppliers",        "🏭  Προμηθευτές"),
+    ("goods_receipts",   "🚚  Παραλαβές"),
     ("pos",              "🧾  Ταμείο / Πωλήσεις"),
     ("customers",        "👥  Πελάτες"),
     ("invoice_history",  "🔎  Ιστορικό"),
@@ -38,6 +39,7 @@ PAGE_TITLES = {
     "dashboard":        "Επισκόπηση Συστήματος",
     "inventory":        "Διαχείριση Αποθήκης",
     "suppliers":        "Μητρώο Προμηθευτών",
+    "goods_receipts":   "Παραλαβές Προμηθευτών",
     "pos":              "Ταμείο / Πωλήσεις (POS)",
     "customers":        "Μητρώο Πελατών",
     "invoice_history":  "Ιστορικό Παραστατικών",
