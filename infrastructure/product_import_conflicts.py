@@ -17,6 +17,8 @@ from typing import Tuple, Dict, List, Set
 
 import openpyxl
 from infrastructure.product_import_preview import ImportColumnMapping
+from infrastructure.product_import_identity import (
+    ImportSourceSignature, fingerprint_import_source, verify_import_source)
 
 
 # ── Typed result models ──────────────────────────────────────────────
@@ -72,7 +74,7 @@ class ImportConflictResult:
     conflict_samples: Tuple[ConflictRecord, ...] = ()
     errors: Tuple[ImportRowErr, ...] = ()
     sample_rows: Tuple[Tuple[str, str, int, float, str], ...] = ()
-    source_signature: object | None = None  # ImportSourceSignature
+    source_signature: ImportSourceSignature | None = None
 
     @classmethod
     def _make(cls, ok, cancelled, msg, fn, sn, scanned, valid, invalid,
@@ -292,8 +294,6 @@ def analyze_import_conflicts(
 
     # Create source signature before analysis
     try:
-        from infrastructure.product_import_identity import (
-            fingerprint_import_source)
         sig_before = fingerprint_import_source(file_path, mapping)
     except Exception as e:
         if conn:
@@ -476,8 +476,6 @@ def analyze_import_conflicts(
 
     # Verify source signature hasn't changed during analysis
     try:
-        from infrastructure.product_import_identity import (
-            fingerprint_import_source, verify_import_source)
         if not verify_import_source(sig_before, file_path, mapping):
             return ImportConflictResult.failure(
                 file_path, active_sheet,

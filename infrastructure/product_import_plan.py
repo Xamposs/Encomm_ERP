@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from infrastructure.product_import_conflicts import ImportConflictResult
+from infrastructure.product_import_identity import ImportSourceSignature
 
 
 class ChangedPolicy(Enum):
@@ -38,7 +39,7 @@ class ImportPlan:
     skipped_changed: int = 0
     rejected_invalid: int = 0
     skipped_duplicates: int = 0
-    source_signature: object | None = None  # ImportSourceSignature
+    source_signature: ImportSourceSignature | None = None
 
 
 def build_import_plan(

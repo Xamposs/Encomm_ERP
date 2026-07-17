@@ -246,6 +246,20 @@ class TestRobustness:
         ).fetchall()
         assert before == after
 
+    def test_signature_mismatch_fails_analysis(self, tmp_path, monkeypatch):
+        """Monkeypatch verify to return False → analysis fails with Greek msg."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "N", 1, 1.0, ""]])
+        _make_db(db, [])
+        from infrastructure import product_import_conflicts as ic
+        monkeypatch.setattr(ic, "verify_import_source", lambda *a, **kw: False)
+        r = analyze_import_conflicts(xp, M, db)
+        assert not r.ok
+        assert r.source_signature is None
+        assert "άλλαξε" in r.error_message
+
     def test_no_write_sql(self):
         import inspect
         from infrastructure import product_import_conflicts as ic
