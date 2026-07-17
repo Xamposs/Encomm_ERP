@@ -12,7 +12,6 @@
 ### Configured database path
 
 - `qt_main.py:31` — `config["db_path"] = os.getenv("DB_PATH", "encomm_erp.db")`
-- `main.py:38` — identical fallback pattern
 - **Production default**: `encomm_erp.db` in the repository root
 - No WAL-checkpoint or multi-file database sharding exists for the POS path.
 

@@ -1,9 +1,9 @@
 """ENCOMM ERP — PySide6 / Qt Application Shell.
 
-This package is the future presentation layer.  It is currently a
-navigation-only shell with placeholder pages.  Business logic, database
-access, and AI integration will be wired in during the gradual migration
-from the CustomTkinter application.
+This package is the active presentation layer for ENCOMM ERP.
+All UI is delivered through PySide6 / Qt; business logic, database
+access, and AI integration are shared with the core and infrastructure
+layers.
 
 Package structure:
 

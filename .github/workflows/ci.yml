@@ -28,7 +28,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Syntax / import check
-        run: python -m compileall -q core infrastructure qt_app presentation
+        run: python -m compileall -q core infrastructure qt_app
 
       - name: Run tests
         shell: pwsh

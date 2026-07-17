@@ -3,48 +3,52 @@
 ## Project Identity
 - **Name:** ENCOMM ERP (Pharmacy Management System)
 - **Repo:** https://github.com/Xamposs/Encomm_ERP
-- **Stack:** Python 3.11, CustomTkinter, SQLite
-- **Entry:** `main.py` → `python main.py`
+- **Stack:** Python 3.11, PySide6 (Qt), SQLite
+- **Entry:** `qt_main.py` → `python qt_main.py`
 
-## Architecture (3-Layer)
+## Architecture
 
 ```
-presentation/     → CustomTkinter GUI (main_window.py shell + presentation/views/* modules)
-infrastructure/   → Database, Excel parser, AI service, licensing
+qt_main.py        → PySide6 entry point (QApplication + MainWindow)
+qt_app/           → Qt UI layer (main window, pages, styles, data source)
+infrastructure/   → Database, Excel parser, AI service, licensing, command services
 core/             → Domain models, business rules, undo stack, intent factory
-tests/            → pytest suite (business_rules, database_service, undo_stack, intent_factory)
+tests/            → pytest suite (business rules, database, Qt pages, commands)
 ```
 
 ### Data flow
 ```
-GUI (presentation) → Business Rules (core) → Database (infrastructure)
-                                         → AI Service (infrastructure)
+Qt UI (qt_app) → Business Rules (core) → Database (infrastructure)
+                                       → AI Service (infrastructure)
 ```
 
 ## Key Files
 
-| File | Size | Risk | What it does |
-|------|------|:----:|-------------|
-| `main.py` | 4KB | Low | App entry, logging, config, DB init |
-| `presentation/main_window.py` | ~30KB | Medium | GUI shell + view wiring (views live in `presentation/views/`) |
-| `presentation/views/` | ~10 files | Medium | One `BaseView` subclass per screen (dashboard, inventory, POS, etc.) |
-| `infrastructure/database_service.py` | ~80KB | ⚠️ HIGH | All DB operations, ~1900 lines |
-| `infrastructure/excel_parser_service.py` | 6KB | Medium | Excel import for products/invoices |
-| `infrastructure/ai_service.py` | 6.5KB | Medium | AI integration |
-| `core/business_rules.py` | 4.7KB | Low | VAT, expiry, stock checks, EAN-13 |
-| `core/domain_models.py` | 1.3KB | Low | Product, Supplier, Invoice dataclasses |
-| `core/undo_stack.py` | 3.8KB | Medium | Undo/redo operations |
-| `core/intent_factory.py` | 4KB | Medium | Intent parsing |
-| `tests/` | — | Low | pytest suite |
+| File | Risk | What it does |
+|------|:----:|-------------|
+| `qt_main.py` | Low | App entry: QApplication + MainWindow factory + `main()` |
+| `qt_app/main_window.py` | Medium | Sidebar + QStackedWidget + lazy pages + AI command bar |
+| `qt_app/pages/` | Medium | 10 page subclasses (Dashboard, Inventory, POS, etc.) |
+| `qt_app/styles.py` | Low | Dark palette + global QSS stylesheet |
+| `qt_app/data_source.py` | Medium | Read-only SQLite queries for Qt pages |
+| `infrastructure/database_service.py` | ⚠️ HIGH | All DB operations, schema init, migrations |
+| `infrastructure/inventory_command_service.py` | Medium | Write commands for product CRUD from Qt |
+| `infrastructure/excel_parser_service.py` | Medium | Excel import for products/invoices |
+| `infrastructure/ai_service.py` | Medium | AI integration |
+| `core/business_rules.py` | Low | VAT, expiry, stock checks, EAN-13 |
+| `core/domain_models.py` | Low | Product, Supplier, Invoice dataclasses |
+| `core/undo_stack.py` | Medium | Undo/redo operations |
+| `core/intent_factory.py` | Medium | Intent parsing |
 
 ## Database (SQLite — encomm_erp.db)
 
 Tables: `ProductMaster`, `suppliers`, `customers`, `invoices`, `invoice_items`, `stock_movements`, `goods_receipts`, `goods_receipt_items`, `stock_lots`, `SystemConfig`
 
-- Schema loaded by `DatabaseService.__init__()` — check `_initialize_db` method
+- Schema loaded by `DatabaseService.__init__()` — initialized on first run
 - Config persisted in `SystemConfig` table (VAT rate, stock thresholds, expiry alerts)
 - WAL journal mode active (set once at init, not per-connection)
 - New installs get CHECK constraints (`Stock >= 0`, `Price >= 0`) and FKs
+- **DO NOT change DB schema without asking**
 
 ## Conventions
 - Language: Greek locale (el) — UI is Greek
@@ -53,25 +57,19 @@ Tables: `ProductMaster`, `suppliers`, `customers`, `invoices`, `invoice_items`, 
 - Logging: file + console, format: `%(asctime)s - %(levelname)s - %(message)s`
 - Use `patch` tool for targeted edits (NOT full rewrites of large files)
 
-## DO NOT
-- Rewrite `main_window.py` from scratch — it is a thin shell; GUI logic lives in `presentation/views/`
-- Change DB schema without asking
-- Delete pharmacy.db without backup
-- Modify `main.py` logging/config structure unless necessary
-
 ## Running the app
 ```bash
 cd C:/Users/xampos/Desktop/ERP
-python main.py
+python qt_main.py
 ```
 
 ## Tests
 ```bash
-# Syntax check before commits
-python -m py_compile main.py core/*.py infrastructure/*.py presentation/*.py presentation/views/*.py
+# Syntax / import check before commits
+python -m compileall -q core infrastructure qt_app
 
-# Unit + integration tests (DB layer, business rules, undo, intents)
-pytest -q
+# Full test suite (off-screen Qt)
+python -m pytest -q
 ```
 
 ## Hermes Skills for this project
