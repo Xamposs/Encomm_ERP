@@ -285,6 +285,33 @@ class ProductImportPreviewDialog(QDialog):
         self._conflict_table.hide()
         rs.addWidget(self._conflict_table)
 
+        # C2: read-only detail table — current vs incoming values
+        self._detail_notice_lbl = QLabel(
+            "⚠ Τα παρακάτω προϊόντα έχουν διαφορές αλλά "
+            "ΔΕΝ θα αλλάξουν από αυτή την εισαγωγή. "
+            "Εμφανίζονται μόνο για έλεγχο.")
+        self._detail_notice_lbl.setWordWrap(True)
+        self._detail_notice_lbl.setStyleSheet(
+            f"color: {styles.AMBER}; font-size: 12px; font-weight: bold;")
+        self._detail_notice_lbl.hide()
+        rs.addWidget(self._detail_notice_lbl)
+
+        self._detail_truncated_lbl = QLabel("")
+        self._detail_truncated_lbl.setWordWrap(True)
+        self._detail_truncated_lbl.setStyleSheet(
+            f"color: {styles.TEXT_MUTED}; font-size: 11px;")
+        self._detail_truncated_lbl.hide()
+        rs.addWidget(self._detail_truncated_lbl)
+
+        self._detail_table = QTableWidget(0, 4)
+        self._detail_table.setHorizontalHeaderLabels(
+            ["Barcode", "Πεδίο", "Τρέχουσα Τιμή", "Νέα Τιμή (Excel)"])
+        self._detail_table.horizontalHeader().setStretchLastSection(True)
+        self._detail_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._detail_table.setMaximumHeight(250)
+        self._detail_table.hide()
+        rs.addWidget(self._detail_table)
+
         # Import plan section
         self._plan_grp = QGroupBox("4. Σχέδιο εισαγωγής (χωρίς αλλαγές)")
         pl = QVBoxLayout()
@@ -551,6 +578,39 @@ class ProductImportPreviewDialog(QDialog):
                     r, 1, QTableWidgetItem(greek_fields))
             self._conflict_table.show()
 
+        # C2: detail rows with current/incoming values
+        details = getattr(result, 'conflict_details', ())
+        FIELD_GREEK_REV = {
+            "Name": "Όνομα", "Stock": "Απόθεμα",
+            "Price": "Τιμή", "ExpiryDate": "Ημ. Λήξης"}
+        if details:
+            self._detail_notice_lbl.show()
+            self._detail_table.setRowCount(len(details))
+            for r, d in enumerate(details):
+                self._detail_table.setItem(
+                    r, 0, QTableWidgetItem(d.barcode))
+                self._detail_table.setItem(
+                    r, 1, QTableWidgetItem(
+                        FIELD_GREEK_REV.get(d.field, d.field)))
+                self._detail_table.setItem(
+                    r, 2, QTableWidgetItem(d.current_value))
+                self._detail_table.setItem(
+                    r, 3, QTableWidgetItem(d.incoming_value))
+            self._detail_table.show()
+            # Show truncation notice if detail buffer is full
+            _MAX_DETAILS = 200
+            if len(details) >= _MAX_DETAILS:
+                self._detail_truncated_lbl.setText(
+                    f"⚠ Εμφανίζονται οι πρώτες {len(details)} διαφορές "
+                    f"(όριο {_MAX_DETAILS}). "
+                    f"Συνολικά υπάρχουν {result.changed_existing} προϊόντα "
+                    f"με αλλαγές. Τα υπάρχοντα ΔΕΝ θα τροποποιηθούν.")
+                self._detail_truncated_lbl.show()
+        else:
+            self._detail_notice_lbl.hide()
+            self._detail_table.hide()
+            self._detail_truncated_lbl.hide()
+
         # Also show preview errors/samples from the underlying scan
         if hasattr(result, 'sample_rows') and result.sample_rows:
             self._sample_lbl.setText(
@@ -767,11 +827,14 @@ class ProductImportPreviewDialog(QDialog):
         for w in [self._sample_lbl, self._sample_table,
                   self._error_lbl, self._error_table, self._no_write_lbl,
                   self._conflict_summary_lbl, self._conflict_table,
+                  self._detail_notice_lbl, self._detail_table,
+                  self._detail_truncated_lbl,
                   self._plan_summary_lbl]:
             w.hide()
         self._sample_table.setRowCount(0)
         self._error_table.setRowCount(0)
         self._conflict_table.setRowCount(0)
+        self._detail_table.setRowCount(0)
         self._progress.hide()
         self._last_conflict_result = None
         self._current_plan = None

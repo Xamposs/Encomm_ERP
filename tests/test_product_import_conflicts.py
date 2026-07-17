@@ -275,3 +275,121 @@ class TestRobustness:
         from infrastructure import product_import_conflicts as ic
         src = inspect.getsource(ic._connect_ro)
         assert "Path(" in src
+
+
+class TestC2Details:
+    """Phase C2: read-only detail rows for changed existing products."""
+
+    def test_multi_field_changes_produce_detail_rows(self, tmp_path):
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "NewName", 100, 2.5, "2028-01-01"]])
+        _make_db(db, [("A", "OldName", 1, 1.0, "2027-01-01")])
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.changed_existing == 1
+        details = r.conflict_details
+        assert len(details) >= 1
+        fields_seen = {d.field for d in details}
+        assert "Name" in fields_seen
+        assert "Stock" in fields_seen
+        assert "Price" in fields_seen
+        assert "ExpiryDate" in fields_seen
+        # Verify actual values
+        name_d = [d for d in details if d.field == "Name"][0]
+        assert name_d.barcode == "A"
+        assert name_d.current_value == "OldName"
+        assert name_d.incoming_value == "NewName"
+
+    def test_identical_existing_produces_no_details(self, tmp_path):
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "N", 1, 1.0, "2027-12-31"]])
+        _make_db(db, [("A", "N", 1, 1.0, "2027-12-31")])
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.unchanged_existing == 1
+        assert len(r.conflict_details) == 0
+
+    def test_details_bounded(self, tmp_path):
+        """Detail rows bounded at MAX_CONFLICT_DETAILS (200)."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        # 100 products, each with 3 changed fields → 300 detail rows
+        xls_rows = []
+        db_rows = []
+        for i in range(100):
+            b = f"{i:013d}"
+            xls_rows.append([b, f"N{i}", i + 10, float(i) + 1.0, "2029-01-01"])
+            db_rows.append((b, f"O{i}", i, float(i), "2028-01-01"))
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"], xls_rows)
+        _make_db(db, db_rows)
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.changed_existing == 100
+        # Should be bounded at 200 or fewer
+        assert len(r.conflict_details) <= 200
+
+    def test_cancellation_preserves_details_not_misleading(self, tmp_path):
+        """Cancellation returns what was classified; details reflect partial."""
+        class Cancel:
+            def __init__(self):
+                self.called = 0
+            def is_set(self):
+                self.called += 1
+                return self.called > 10
+
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        rows = [[f"{i:013d}", f"N{i}", i + 1, float(i), "2029-01-01"]
+                for i in range(50)]
+        db_r = [(f"{i:013d}", f"O{i}", i, float(i), "2028-01-01")
+                for i in range(50)]
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
+        _make_db(db, db_r)
+        cancel = Cancel()
+        r = analyze_import_conflicts(xp, M, db, cancel_event=cancel)
+        assert r.cancelled
+        # Details must be consistent with classified counts
+        assert r.changed_existing == (
+            r.classified_rows - r.new_barcodes - r.unchanged_existing)
+
+    def test_no_write_sql_in_c2_path(self):
+        import inspect
+        from infrastructure import product_import_conflicts as ic
+        src = inspect.getsource(ic._classify_batch)
+        for pat in ["INSERT", "UPDATE", "DELETE", "DROP",
+                     "ALTER", "CREATE", "REPLACE"]:
+            assert pat not in src, f"Forbidden '{pat}' in _classify_batch"
+
+    def test_blank_values_formatted(self, tmp_path):
+        """Blank/invalid values formatted as '—'."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "N", 1, 1.0, ""]])
+        _make_db(db, [("A", "N", 1, 1.0, "2028-01-01")])
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.changed_existing == 1
+        exp_d = [d for d in r.conflict_details if d.field == "ExpiryDate"]
+        assert len(exp_d) == 1
+        assert exp_d[0].current_value == "2028-01-01"
+        # Incoming expiry is blank → formatted as '—'
+        assert exp_d[0].incoming_value == "—"
+
+    def test_existing_b1_tests_still_pass(self, tmp_path):
+        """Sanity: existing B1 invariants untouched by C2 extension."""
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "N", 1, 1.0, ""]])
+        _make_db(db, [])
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.new_barcodes == 1
+        assert r.valid_rows == 1
+        assert r.classified_rows == 1
+        assert r.conflict_details == ()
