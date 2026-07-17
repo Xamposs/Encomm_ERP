@@ -115,7 +115,8 @@ class ProductImportPreviewDialog(QDialog):
         self._inspect_token = 0
         self._file_gen = 0
         self._last_file_gen = 0
-        self._current_file_path = ""  # file identity for stale-check
+        self._current_file_path = ""
+        self._last_conflict_result = None  # for plan building
         self._build_ui()
         self._reset_state()
 
@@ -262,6 +263,31 @@ class ProductImportPreviewDialog(QDialog):
         self._conflict_table.setMaximumHeight(200)
         self._conflict_table.hide()
         rs.addWidget(self._conflict_table)
+
+        # Import plan section
+        self._plan_grp = QGroupBox("4. Σχέδιο εισαγωγής (χωρίς αλλαγές)")
+        pl = QVBoxLayout()
+        pol_row = QHBoxLayout()
+        pol_row.addWidget(QLabel("Πολιτική για υπάρχουσες αλλαγές:"))
+        self._plan_policy = QComboBox()
+        self._plan_policy.addItem(
+            "Απαιτείται χειροκίνητος έλεγχος (προτεινόμενο)")
+        self._plan_policy.addItem("Παράλειψη αλλαγών")
+        pol_row.addWidget(self._plan_policy, 1)
+        pl.addLayout(pol_row)
+        self._plan_btn = QPushButton("📋  Δημιουργία σχεδίου εισαγωγής")
+        self._plan_btn.setStyleSheet(self._btn_qss())
+        self._plan_btn.clicked.connect(self._on_build_plan)
+        self._plan_btn.setEnabled(False)
+        pl.addWidget(self._plan_btn)
+        self._plan_summary_lbl = QLabel("")
+        self._plan_summary_lbl.setWordWrap(True)
+        self._plan_summary_lbl.setStyleSheet(
+            f"color: {styles.ACCENT}; font-size: 12px;")
+        self._plan_summary_lbl.hide()
+        pl.addWidget(self._plan_summary_lbl)
+        self._plan_grp.setLayout(pl)
+        rs.addWidget(self._plan_grp)
         lay.addLayout(rs)
 
         dbb = QDialogButtonBox(QDialogButtonBox.Close)
@@ -446,11 +472,17 @@ class ProductImportPreviewDialog(QDialog):
             self._status_lbl.setText(
                 f"⚠ Ανάλυση ακυρώθηκε (μερική). "
                 f"Ταξινομήθηκαν {result.classified_rows} γραμμές.")
+            self._last_conflict_result = None
+            self._plan_btn.setEnabled(False)
         elif not result.ok:
             self._status_lbl.setText(
                 f"❌ {result.error_message or 'Ανάλυση απέτυχε.'}")
+            self._last_conflict_result = None
+            self._plan_btn.setEnabled(False)
         else:
             self._status_lbl.setText("✅ Ανάλυση συγκρούσεων ολοκληρώθηκε.")
+            self._last_conflict_result = result
+            self._plan_btn.setEnabled(True)
 
         summary = (
             f"Νέα προϊόντα: {result.new_barcodes}  ·  "
@@ -498,6 +530,31 @@ class ProductImportPreviewDialog(QDialog):
                 self._error_table.setItem(r, 3, QTableWidgetItem(e.message))
             self._error_table.show()
         # Do NOT re-enable controls — _on_thread_done does it
+
+    def _on_build_plan(self):
+        if self._last_conflict_result is None:
+            return
+        from infrastructure.product_import_plan import (
+            build_import_plan, ImportReviewPolicy, ChangedPolicy)
+        policy = ImportReviewPolicy(
+            changed=ChangedPolicy.REQUIRE_MANUAL_REVIEW
+            if self._plan_policy.currentIndex() == 0
+            else ChangedPolicy.SKIP_CHANGES)
+        try:
+            plan = build_import_plan(self._last_conflict_result, policy)
+        except ValueError as e:
+            self._plan_summary_lbl.setText(f"❌ {e}")
+            self._plan_summary_lbl.show()
+            return
+        summary = (
+            f"📋 Σχέδιο εισαγωγής (ανάγνωση μόνο):\n"
+            f"Προς μελλοντική προσθήκη: {plan.planned_new}\n"
+            f"Ίδια προϊόντα που θα παραλειφθούν: {plan.skipped_identical}\n"
+            f"Αλλαγές που απαιτούν έλεγχο: {plan.manual_review}\n"
+            f"Άκυρες γραμμές που απορρίπτονται: {plan.rejected_invalid}\n"
+            f"Διπλότυπα που παραλείπονται: {plan.skipped_duplicates}")
+        self._plan_summary_lbl.setText(summary)
+        self._plan_summary_lbl.show()
 
     def _get_mapping(self) -> ImportColumnMapping | None:
         cols = {}
@@ -585,12 +642,15 @@ class ProductImportPreviewDialog(QDialog):
     def _hide_results(self):
         for w in [self._sample_lbl, self._sample_table,
                   self._error_lbl, self._error_table, self._no_write_lbl,
-                  self._conflict_summary_lbl, self._conflict_table]:
+                  self._conflict_summary_lbl, self._conflict_table,
+                  self._plan_summary_lbl, self._plan_grp]:
             w.hide()
         self._sample_table.setRowCount(0)
         self._error_table.setRowCount(0)
         self._conflict_table.setRowCount(0)
         self._progress.hide()
+        self._last_conflict_result = None
+        self._plan_btn.setEnabled(False)
 
     def _reset_state(self):
         self._hide_results()

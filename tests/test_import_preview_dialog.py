@@ -1,17 +1,12 @@
 """Regression tests for ProductImportPreviewDialog — runs under pytest, exit 0."""
 
 import pytest
-import sys
-from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import QApplication
 
 
 @pytest.fixture(scope="session")
 def qapp():
-    """Stable session QApplication — never destroyed during tests."""
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
+    app = QApplication.instance() or QApplication([])
     return app
 
 
@@ -256,3 +251,103 @@ class TestConflictUI:
             "f", "S1", 10, 10, 0, 0, 10, 0, 0, 10, samples, [], [])
         d._on_conflict_done(result)
         assert d._conflict_table.rowCount() == 50
+
+
+class TestPlanUI:
+
+    def test_plan_btn_disabled_before_analysis(self, dialog_factory):
+        d = dialog_factory(db_path="/tmp/test.db")
+        assert not d._plan_btn.isEnabled()
+
+    def test_plan_btn_enabled_after_success(self, dialog_factory):
+        from infrastructure.product_import_conflicts import (
+            ImportConflictResult)
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
+        result = ImportConflictResult.success(
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3,
+            [], [], [])
+        d._on_conflict_done(result)
+        assert d._plan_btn.isEnabled()
+
+    def test_plan_btn_disabled_after_cancelled(self, dialog_factory):
+        from infrastructure.product_import_conflicts import (
+            ImportConflictResult)
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
+        result = ImportConflictResult.cancelled(
+            "f", "S1", 10, 10, 0, 0, 5, 2, 2, 1, [], [], [])
+        d._on_conflict_done(result)
+        assert not d._plan_btn.isEnabled()
+
+    def test_build_plan_greek_summary(self, dialog_factory):
+        from infrastructure.product_import_conflicts import (
+            ImportConflictResult)
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
+        result = ImportConflictResult.success(
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
+        d._on_conflict_done(result)
+        d._on_build_plan()
+        txt = d._plan_summary_lbl.text()
+        assert "Προς μελλοντική προσθήκη: 4" in txt
+        assert "Ίδια προϊόντα που θα παραλειφθούν: 3" in txt
+        assert "Αλλαγές που απαιτούν έλεγχο: 3" in txt
+
+    def test_plan_cleared_on_new_file(self, dialog_factory):
+        from infrastructure.product_import_conflicts import (
+            ImportConflictResult)
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
+        result = ImportConflictResult.success(
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
+        d._on_conflict_done(result)
+        d._on_build_plan()
+        assert d._plan_summary_lbl.text() != ""
+        # Simulate new file clears
+        d._file_path = "/new.xlsx"
+        d._file_gen += 1
+        d._current_file_path = "/new.xlsx"
+        d._sheet_combo.clear()
+        d._hide_results()
+        assert d._plan_summary_lbl.isHidden()
+        assert not d._plan_btn.isEnabled()
+
+    def test_plan_cleared_on_mapping_change(self, dialog_factory):
+        from infrastructure.product_import_conflicts import (
+            ImportConflictResult)
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
+        result = ImportConflictResult.success(
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
+        d._on_conflict_done(result)
+        d._on_build_plan()
+        assert d._plan_btn.isEnabled()
+        # _hide_results is the clearing mechanism; test it directly
+        d._hide_results()
+        assert not d._plan_btn.isEnabled()
+        assert d._last_conflict_result is None
+
+    def test_skip_policy_zeroes_manual_review(self, dialog_factory):
+        from infrastructure.product_import_conflicts import (
+            ImportConflictResult)
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
+        result = ImportConflictResult.success(
+            "f", "S1", 10, 10, 0, 0, 10, 4, 3, 3, [], [], [])
+        d._on_conflict_done(result)
+        d._plan_policy.setCurrentIndex(1)  # skip
+        d._on_build_plan()
+        assert "Αλλαγές που απαιτούν έλεγχο: 0" in d._plan_summary_lbl.text()
