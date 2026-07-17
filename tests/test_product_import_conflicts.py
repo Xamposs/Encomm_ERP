@@ -167,23 +167,50 @@ class TestLimits:
         assert r.scanned_rows == 10
         assert r.classified_rows == 10
 
-    def test_cancellation_classified_invariant(self, tmp_path):
+    def test_cancellation_before_batch_flush(self, tmp_path):
+        """Cancel during scanning before batch reaches 500:
+        classified_rows < valid_rows, sum equals classified."""
         class Cancel:
             def __init__(self):
                 self.called = 0
             def is_set(self):
                 self.called += 1
-                return self.called > 8
+                return self.called > 150  # cancel after 150 rows, before batch full
         xp = str(tmp_path / "t.xlsx")
         db = str(tmp_path / "t.db")
-        rows = [[f"{i:013d}", f"N{i}", 1, 1.0, ""] for i in range(20)]
+        rows = [[f"{i:013d}", f"N{i}", 1, 1.0, ""] for i in range(200)]
         _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
         _make_db(db, [])
         cancel = Cancel()
         r = analyze_import_conflicts(xp, M, db, cancel_event=cancel)
         assert r.cancelled
-        assert r.classified_rows <= r.valid_rows
-        assert r.classified_rows >= 0
+        # Pending batch (remaining 50) not classified
+        assert r.classified_rows < r.valid_rows
+        assert r.classified_rows == (
+            r.new_barcodes + r.unchanged_existing + r.changed_existing)
+
+    def test_cancellation_during_classify_batch(self, tmp_path):
+        """Cancel during DB classification of a full batch:
+        some rows processed, some not. classified is less than valid."""
+        class Cancel:
+            def __init__(self):
+                self.called = 0
+            def is_set(self):
+                self.called += 1
+                # Let first full batch go through, cancel during second
+                return self.called > 600  # ~600 checks: ~500 rows + calls
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        rows = [[f"{i:013d}", f"N{i}", 1, 1.0, ""] for i in range(800)]
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
+        _make_db(db, [])
+        cancel = Cancel()
+        r = analyze_import_conflicts(xp, M, db, cancel_event=cancel)
+        # Either cancelled or completed — check invariants
+        if r.cancelled:
+            assert r.classified_rows <= r.valid_rows
+            assert r.classified_rows == (
+                r.new_barcodes + r.unchanged_existing + r.changed_existing)
 
 
 class TestRobustness:

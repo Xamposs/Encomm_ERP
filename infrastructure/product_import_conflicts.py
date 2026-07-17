@@ -197,8 +197,8 @@ def _normalize_expiry(raw) -> str | None:
 def _classify_batch(batch: List[IncomingProduct], conn: sqlite3.Connection,
                     cancel_event, new_count: int, unchanged_count: int,
                     changed_count: int, conflicts: List[ConflictRecord],
-                    MAX_CONFLICT_SAMPLES: int) -> Tuple[int, int, int]:
-    """Query DB for one batch, classify, update counters in-place."""
+                    MAX_CONFLICT_SAMPLES: int) -> Tuple[int, bool, int, int, int]:
+    """Classify a batch. Returns (processed, cancelled, new, unchanged, changed)."""
     barcodes = [p.barcode for p in batch]
     placeholders = ",".join("?" for _ in barcodes)
     rows = conn.execute(
@@ -213,29 +213,32 @@ def _classify_batch(batch: List[IncomingProduct], conn: sqlite3.Connection,
             stock=r["Stock"] or 0, price=r["Price"] or 0.0,
             expiry_date=r["ExpiryDate"] or "")
 
+    processed = 0
     for prod in batch:
         if cancel_event and cancel_event.is_set():
-            return new_count, unchanged_count, changed_count
+            return processed, True, new_count, unchanged_count, changed_count
         existing = db_data.get(prod.barcode)
         if existing is None:
             new_count += 1
-            continue
-        changed = []
-        if prod.name != existing.name:
-            changed.append("Name")
-        if prod.stock != existing.stock:
-            changed.append("Stock")
-        if Decimal(str(prod.price)) != Decimal(str(existing.price)):
-            changed.append("Price")
-        if prod.expiry_date != existing.expiry_date:
-            changed.append("ExpiryDate")
-        if changed:
-            changed_count += 1
-            if len(conflicts) < MAX_CONFLICT_SAMPLES:
-                conflicts.append(ConflictRecord(prod.barcode, tuple(changed)))
         else:
-            unchanged_count += 1
-    return new_count, unchanged_count, changed_count
+            changed = []
+            if prod.name != existing.name:
+                changed.append("Name")
+            if prod.stock != existing.stock:
+                changed.append("Stock")
+            if Decimal(str(prod.price)) != Decimal(str(existing.price)):
+                changed.append("Price")
+            if prod.expiry_date != existing.expiry_date:
+                changed.append("ExpiryDate")
+            if changed:
+                changed_count += 1
+                if len(conflicts) < MAX_CONFLICT_SAMPLES:
+                    conflicts.append(
+                        ConflictRecord(prod.barcode, tuple(changed)))
+            else:
+                unchanged_count += 1
+        processed += 1
+    return processed, False, new_count, unchanged_count, changed_count
 
 
 # ── Public API ───────────────────────────────────────────────────────
@@ -408,21 +411,26 @@ def analyze_import_conflicts(
 
             # Flush when batch is full
             if len(batch) >= BATCH_SIZE:
-                new_count, unchanged_count, changed_count = _classify_batch(
-                    batch, conn, cancel_event, new_count, unchanged_count,
-                    changed_count, conflicts, MAX_CONFLICT_SAMPLES)
-                if cancel_event and cancel_event.is_set():
+                processed, batch_cancelled, new_count, unchanged_count, changed_count = (
+                    _classify_batch(batch, conn, cancel_event, new_count,
+                                    unchanged_count, changed_count, conflicts,
+                                    MAX_CONFLICT_SAMPLES))
+                classified += processed
+                batch.clear()
+                if batch_cancelled:
                     cancelled = True
                     break
-                classified += len(batch)
-                batch.clear()
 
         # Flush remaining
-        if batch:
-            new_count, unchanged_count, changed_count = _classify_batch(
-                batch, conn, cancel_event, new_count, unchanged_count,
-                changed_count, conflicts, MAX_CONFLICT_SAMPLES)
-            classified += len(batch)
+        if batch and not cancelled:
+            processed, batch_cancelled, new_count, unchanged_count, changed_count = (
+                _classify_batch(batch, conn, cancel_event, new_count,
+                                unchanged_count, changed_count, conflicts,
+                                MAX_CONFLICT_SAMPLES))
+            classified += processed
+            batch.clear()
+            if batch_cancelled:
+                cancelled = True
             batch.clear()
 
     except Exception as e:
