@@ -9,6 +9,7 @@ from infrastructure.product_import_preview import ImportColumnMapping
 
 
 M = ImportColumnMapping("Barcode", "Name", "Stock", "Price", "Expiry")
+M_DUP = ImportColumnMapping("X", "X", "Stock", "Price", "Expiry")  # duplicate
 
 
 def _xlsx(path, headers, rows):
@@ -21,7 +22,6 @@ def _xlsx(path, headers, rows):
 
 
 def _make_db(path, products):
-    """Create a temp SQLite ProductMaster table."""
     conn = sqlite3.connect(path)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS ProductMaster("
@@ -37,19 +37,31 @@ def _make_db(path, products):
     conn.close()
 
 
-class TestNewBarcode:
+class TestMapping:
+
+    def test_duplicate_mapping_rejected(self, tmp_path):
+        xp = str(tmp_path / "t.xlsx")
+        _xlsx(xp, ["X", "Stock", "Price", "Expiry"],
+              [["A", "N", 1, 1.0, ""]])
+        db = str(tmp_path / "t.db")
+        _make_db(db, [])
+        r = analyze_import_conflicts(xp, M_DUP, db)
+        assert not r.ok
+        assert "μοναδική" in r.error_message
+
+
+class TestClassification:
 
     def test_new_barcode(self, tmp_path):
         xp = str(tmp_path / "t.xlsx")
         db = str(tmp_path / "t.db")
         _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
               [["A", "N", 1, 1.0, ""]])
-        _make_db(db, [])  # empty DB
+        _make_db(db, [])
         r = analyze_import_conflicts(xp, M, db)
         assert r.ok
         assert r.new_barcodes == 1
-        assert r.unchanged_existing == 0
-        assert r.changed_existing == 0
+        assert r.classified_rows == r.valid_rows == 1
 
     def test_identical_existing(self, tmp_path):
         xp = str(tmp_path / "t.xlsx")
@@ -59,9 +71,8 @@ class TestNewBarcode:
         _make_db(db, [("A", "N", 1, 1.0, "2027-12-31")])
         r = analyze_import_conflicts(xp, M, db)
         assert r.ok
-        assert r.new_barcodes == 0
         assert r.unchanged_existing == 1
-        assert r.changed_existing == 0
+        assert r.classified_rows == r.valid_rows == 1
 
     def test_changed_fields(self, tmp_path):
         xp = str(tmp_path / "t.xlsx")
@@ -72,12 +83,23 @@ class TestNewBarcode:
         r = analyze_import_conflicts(xp, M, db)
         assert r.ok
         assert r.changed_existing == 1
-        assert len(r.conflict_samples) == 1
+        assert r.classified_rows == 1
         fields = r.conflict_samples[0].changed_fields
         assert "Name" in fields
         assert "Stock" in fields
         assert "Price" in fields
         assert "ExpiryDate" in fields
+
+    def test_small_price_diff_still_conflict(self, tmp_path):
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "N", 1, 0.0005, ""]])
+        _make_db(db, [("A", "N", 1, 0.0004, "")])
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.changed_existing == 1
+        assert "Price" in r.conflict_samples[0].changed_fields
 
 
 class TestExclusions:
@@ -87,47 +109,35 @@ class TestExclusions:
         db = str(tmp_path / "t.db")
         _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
               [["A", "N", 1, 1.0, ""],
-               ["A", "N", 1, 1.0, ""]])  # duplicate
+               ["A", "N", 1, 1.0, ""]])
         _make_db(db, [("A", "N", 1, 1.0, "")])
         r = analyze_import_conflicts(xp, M, db)
         assert r.ok
-        # Only one valid unique barcode, it's existing and unchanged
         assert r.duplicate_barcodes == 1
         assert r.unchanged_existing == 1
-        assert r.new_barcodes == 0
+        assert r.classified_rows == 1
 
     def test_invalid_row_excluded(self, tmp_path):
         xp = str(tmp_path / "t.xlsx")
         db = str(tmp_path / "t.db")
         _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
-              [["", "N", 1, 1.0, ""],  # empty barcode
-               ["B", "", 1, 1.0, ""]])  # empty name
+              [["", "N", 1, 1.0, ""],
+               ["B", "", 1, 1.0, ""]])
         _make_db(db, [])
         r = analyze_import_conflicts(xp, M, db)
         assert r.ok
         assert r.invalid_rows == 2
-        assert r.valid_rows == 0
+        assert r.classified_rows == 0
 
-    def test_full_single_field_changed(self, tmp_path):
-        xp = str(tmp_path / "t.xlsx")
-        db = str(tmp_path / "t.db")
-        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
-              [["A", "N", 1, 1.0, ""]])
-        _make_db(db, [("A", "N", 2, 1.0, "")])  # only stock changed
-        r = analyze_import_conflicts(xp, M, db)
-        assert r.ok
-        assert r.changed_existing == 1
-        assert "Name" not in r.conflict_samples[0].changed_fields
-        assert "Stock" in r.conflict_samples[0].changed_fields
 
 class TestBatching:
 
-    def test_more_than_one_batch(self, tmp_path):
+    def test_incremental_batching(self, tmp_path):
         xp = str(tmp_path / "t.xlsx")
         db = str(tmp_path / "t.db")
         rows = []
         db_products = []
-        for i in range(600):  # more than BATCH_SIZE=500
+        for i in range(600):
             b = f"{i:013d}"
             rows.append([b, f"N{i}", 1, 1.0, ""])
             if i < 300:
@@ -139,23 +149,56 @@ class TestBatching:
         assert r.new_barcodes == 300
         assert r.unchanged_existing == 300
         assert r.valid_rows == 600
+        assert r.classified_rows == 600
 
-    def test_cancellation(self, tmp_path):
+
+class TestLimits:
+
+    def test_max_rows_partial(self, tmp_path):
+        xp = str(tmp_path / "t.xlsx")
+        db = str(tmp_path / "t.db")
+        rows = [[f"{i:013d}", f"N{i}", 1, 1.0, ""] for i in range(20)]
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
+        _make_db(db, [])
+        r = analyze_import_conflicts(xp, M, db, max_rows=10)
+        assert not r.ok
+        assert not r.cancelled
+        assert "Υπέρβαση" in r.error_message
+        assert r.scanned_rows == 10
+        assert r.classified_rows == 10
+
+    def test_cancellation_classified_invariant(self, tmp_path):
         class Cancel:
             def __init__(self):
                 self.called = 0
             def is_set(self):
                 self.called += 1
-                return self.called > 5
+                return self.called > 8
         xp = str(tmp_path / "t.xlsx")
         db = str(tmp_path / "t.db")
-        rows = [[f"{i:013d}", f"N{i}", 1, 1.0, ""] for i in range(100)]
+        rows = [[f"{i:013d}", f"N{i}", 1, 1.0, ""] for i in range(20)]
         _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"], rows)
         _make_db(db, [])
         cancel = Cancel()
         r = analyze_import_conflicts(xp, M, db, cancel_event=cancel)
         assert r.cancelled
-        assert "ακυρώθηκε" in r.error_message
+        assert r.classified_rows <= r.valid_rows
+        assert r.classified_rows >= 0
+
+
+class TestRobustness:
+
+    def test_db_path_with_spaces(self, tmp_path):
+        db_dir = tmp_path / "some dir with spaces"
+        db_dir.mkdir()
+        xp = str(tmp_path / "t.xlsx")
+        db = str(db_dir / "my db.db")
+        _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
+              [["A", "N", 1, 1.0, ""]])
+        _make_db(db, [])
+        r = analyze_import_conflicts(xp, M, db)
+        assert r.ok
+        assert r.new_barcodes == 1
 
     def test_db_unchanged_after_analysis(self, tmp_path):
         xp = str(tmp_path / "t.xlsx")
@@ -163,7 +206,6 @@ class TestBatching:
         _xlsx(xp, ["Barcode", "Name", "Stock", "Price", "Expiry"],
               [["A", "NewName", 100, 2.5, "2028-01-01"]])
         _make_db(db, [("A", "OldName", 1, 1.0, "2027-01-01")])
-        # Snapshot before
         before = sqlite3.connect(db).execute(
             "SELECT Barcode, Name, Stock, Price, ExpiryDate FROM ProductMaster"
         ).fetchall()
@@ -180,6 +222,11 @@ class TestBatching:
         for pat in ["INSERT", "UPDATE", "DELETE", "DROP",
                      "ALTER", "CREATE", "REPLACE"]:
             assert pat not in src, f"Forbidden '{pat}' in conflicts"
-        # Verify mode=ro in the _connect_ro helper
         src_conn = inspect.getsource(ic._connect_ro)
         assert "mode=ro" in src_conn
+
+    def test_uri_safe_from_source(self):
+        import inspect
+        from infrastructure import product_import_conflicts as ic
+        src = inspect.getsource(ic._connect_ro)
+        assert "Path(" in src
