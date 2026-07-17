@@ -1,15 +1,19 @@
 """Regression tests for ProductImportPreviewDialog — runs under pytest."""
 
 import pytest
+import sys
 from PySide6.QtWidgets import QApplication
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def qapp():
     app = QApplication.instance()
     if app is None:
-        app = QApplication([])
-    return app
+        app = QApplication(sys.argv)
+    yield app
+    app.quit()
+    from PySide6.QtCore import QCoreApplication
+    QCoreApplication.processEvents()
 
 
 @pytest.fixture
@@ -208,3 +212,53 @@ class TestConflictUI:
         dlg._on_conflict_done(result)
         assert "μερική" in dlg._status_lbl.text()
         assert "Ταξινομήθηκαν 300" in dlg._conflict_summary_lbl.text()
+
+    def test_conflict_btn_restored_after_cleanup(self, qapp):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
+        dlg._file_path = "f.xlsx"
+        dlg._sheet_combo.addItem("S1")
+        dlg._sheet_combo.setCurrentIndex(0)
+        dlg._closing = False
+        dlg._on_thread_done()
+        assert dlg._conflict_btn.isVisible()
+        assert dlg._conflict_btn.isEnabled()
+
+    def test_mapping_change_clears_conflict(self, qapp):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
+        dlg._conflict_summary_lbl.setText("stale")
+        dlg._conflict_summary_lbl.show()
+        dlg._conflict_table.setRowCount(3)
+        dlg._conflict_table.show()
+        # Simulate mapping combo change (not busy)
+        dlg._on_mapping_changed("NewCol")
+        assert dlg._conflict_summary_lbl.isHidden()
+        assert dlg._conflict_table.isHidden()
+        assert dlg._conflict_table.rowCount() == 0
+
+    def test_conflict_refuses_when_busy(self, qapp):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
+        dlg._thread = object()  # simulate busy
+        dlg._on_run_conflict()
+        assert dlg._worker is None  # no worker started
+
+    def test_conflict_capped_at_50(self, qapp):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        from infrastructure.product_import_conflicts import (
+            ImportConflictResult, ConflictRecord)
+        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
+        dlg._file_path = "f.xlsx"
+        dlg._sheet_combo.addItem("S1")
+        dlg._sheet_combo.setCurrentIndex(0)
+        samples = tuple(
+            ConflictRecord(f"B{i}", ("Name",)) for i in range(80))
+        result = ImportConflictResult.success(
+            "f", "S1", 10, 10, 0, 0, 10, 0, 0, 10, samples, [], [])
+        dlg._on_conflict_done(result)
+        assert dlg._conflict_table.rowCount() == 50

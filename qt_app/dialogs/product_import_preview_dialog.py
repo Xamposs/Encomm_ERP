@@ -172,6 +172,7 @@ class ProductImportPreviewDialog(QDialog):
             row.addWidget(lbl)
             cb = QComboBox()
             cb.setMinimumWidth(200)
+            cb.currentTextChanged.connect(self._on_mapping_changed)
             self._map_combos[key] = cb
             row.addWidget(cb, 1)
             row.addStretch()
@@ -287,6 +288,7 @@ class ProductImportPreviewDialog(QDialog):
             self._preview_btn.setEnabled(
                 bool(self._file_path)
                 and len(self._sheet_combo.currentText()) > 0)
+            self._conflict_btn.show()
             self._conflict_btn.setEnabled(
                 bool(self._db_path) and bool(self._file_path)
                 and len(self._sheet_combo.currentText()) > 0)
@@ -296,6 +298,7 @@ class ProductImportPreviewDialog(QDialog):
             self._conflict_btn.setEnabled(False)
             if not self.is_busy():
                 self._preview_btn.hide()
+                self._conflict_btn.hide()
                 self._cancel_btn.hide()
 
     # ── File / sheet ──────────────────────────────────────────────────
@@ -361,8 +364,15 @@ class ProductImportPreviewDialog(QDialog):
     def _on_sheet_changed(self, name):
         if not name or not self._file_path or self.is_busy():
             return
+        self._hide_results()
         self._sheet_name = name
         self._inspect_file(sheet_name=name)
+
+    def _on_mapping_changed(self, _text):
+        """Clear stale results when user changes column mapping."""
+        if not self.is_busy():
+            self._hide_results()
+            self._status_lbl.setText("")
 
     def _apply_headers(self, headers, suggested):
         for key in FIELD_KEYS:
@@ -454,8 +464,10 @@ class ProductImportPreviewDialog(QDialog):
         self._conflict_summary_lbl.show()
 
         if result.conflict_samples:
-            self._conflict_table.setRowCount(len(result.conflict_samples))
-            for r, c in enumerate(result.conflict_samples):
+            display_count = min(len(result.conflict_samples), 50)
+            self._conflict_table.setRowCount(display_count)
+            for r in range(display_count):
+                c = list(result.conflict_samples)[r]
                 self._conflict_table.setItem(
                     r, 0, QTableWidgetItem(c.barcode))
                 greek_fields = ", ".join(
