@@ -1,49 +1,58 @@
-"""Regression tests for ProductImportPreviewDialog — runs under pytest."""
+"""Regression tests for ProductImportPreviewDialog — runs under pytest, exit 0."""
 
 import pytest
 import sys
+from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import QApplication
 
 
 @pytest.fixture(scope="session")
 def qapp():
+    """Stable session QApplication — never destroyed during tests."""
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
-    yield app
-    app.quit()
-    from PySide6.QtCore import QCoreApplication
-    QCoreApplication.processEvents()
+    return app
 
 
 @pytest.fixture
-def dialog(qapp):
-    from qt_app.dialogs.product_import_preview_dialog import (
-        ProductImportPreviewDialog)
-    dlg = ProductImportPreviewDialog()
-    yield dlg
-    dlg.close()
-    dlg.deleteLater()
-    from PySide6.QtCore import QCoreApplication
-    QCoreApplication.processEvents()
+def dialog_factory(request, qapp):
+    """Factory that records dialogs and cleans them up on teardown."""
+    dialogs = []
+
+    def _make(**kw):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        dlg = ProductImportPreviewDialog(**kw)
+        dialogs.append(dlg)
+        return dlg
+
+    yield _make
+
+    for dlg in dialogs:
+        dlg.close()
+        dlg.deleteLater()
 
 
 class TestBusyLifecycle:
 
-    def test_idle_by_default(self, dialog):
-        assert not dialog.is_busy()
+    def test_idle_by_default(self, dialog_factory):
+        d = dialog_factory()
+        assert not d.is_busy()
 
-    def test_busy_when_thread_ref_exists(self, dialog):
-        dialog._thread = object()
-        assert dialog.is_busy()
-        dialog._thread = None
+    def test_busy_when_thread_ref_exists(self, dialog_factory):
+        d = dialog_factory()
+        d._thread = object()
+        assert d.is_busy()
+        d._thread = None
 
-    def test_start_worker_refuses_when_busy(self, dialog):
-        dialog._thread = object()
-        dialog._start_worker(object(), lambda x: None)
-        assert dialog._worker is None
-        assert dialog._thread is not None
-        dialog._thread = None
+    def test_start_worker_refuses_when_busy(self, dialog_factory):
+        d = dialog_factory()
+        d._thread = object()
+        d._start_worker(object(), lambda x: None)
+        assert d._worker is None
+        assert d._thread is not None
+        d._thread = None
 
 
 class TestFileWorksheetIdentity:
@@ -66,199 +75,184 @@ class TestFileWorksheetIdentity:
         d._inspect_token = 20
         d._last_file_gen = 0
 
-    def test_workbook_a_populates_sheets(self, dialog):
-        self._setup(dialog, "/a.xlsx", 1)
+    def test_workbook_a_populates_sheets(self, dialog_factory):
+        d = dialog_factory()
+        self._setup(d, "/a.xlsx", 1)
         r = self._r(20, 1, "/a.xlsx", ("Sheet1", "Sheet2"),
                      ("ColA", "ColB", "ColC", "ColD", "ColE"))
-        dialog._on_inspect_done(r)
-        assert dialog._sheet_combo.count() == 2
-        assert dialog._sheet_combo.itemText(0) == "Sheet1"
-        assert dialog._map_combos["barcode"].count() > 1
+        d._on_inspect_done(r)
+        assert d._sheet_combo.count() == 2
+        assert d._sheet_combo.itemText(0) == "Sheet1"
+        assert d._map_combos["barcode"].count() > 1
 
-    def test_workbook_b_replaces_sheets(self, dialog):
-        self._setup(dialog, "/a.xlsx", 1)
-        dialog._on_inspect_done(
+    def test_workbook_b_replaces_sheets(self, dialog_factory):
+        d = dialog_factory()
+        self._setup(d, "/a.xlsx", 1)
+        d._on_inspect_done(
             self._r(20, 1, "/a.xlsx", ("Sheet1", "Sheet2"),
                     ("ColA", "ColB", "ColC", "ColD", "ColE")))
-        dialog._file_path = "/b.xlsx"
-        dialog._file_gen = 2
-        dialog._current_file_path = "/b.xlsx"
-        dialog._inspect_token = 21
+        d._file_path = "/b.xlsx"
+        d._file_gen = 2
+        d._current_file_path = "/b.xlsx"
+        d._inspect_token = 21
         r2 = self._r(21, 2, "/b.xlsx", ("Data",),
                       ("X", "Y", "Z", "W", "Q"), sheet_name="Data")
-        dialog._on_inspect_done(r2)
-        assert dialog._sheet_combo.count() == 1
-        assert dialog._sheet_combo.itemText(0) == "Data"
+        d._on_inspect_done(r2)
+        assert d._sheet_combo.count() == 1
+        assert d._sheet_combo.itemText(0) == "Data"
 
-    def test_sheet_switch_preserves_list(self, dialog):
-        self._setup(dialog, "/b.xlsx", 2)
-        dialog._last_file_gen = 2
-        dialog._sheet_combo.clear()
-        dialog._sheet_combo.addItems(["Data", "Extra"])
-        dialog._inspect_token = 22
+    def test_sheet_switch_preserves_list(self, dialog_factory):
+        d = dialog_factory()
+        self._setup(d, "/b.xlsx", 2)
+        d._last_file_gen = 2
+        d._sheet_combo.clear()
+        d._sheet_combo.addItems(["Data", "Extra"])
+        d._inspect_token = 22
         r = self._r(22, 2, "/b.xlsx", ("Data", "Extra"),
                      ("Alpha", "Beta", "Gamma", "Delta", "Epsilon"),
                      sheet_name="Extra")
-        dialog._on_inspect_done(r)
-        assert dialog._sheet_combo.count() == 2
+        d._on_inspect_done(r)
+        assert d._sheet_combo.count() == 2
 
-    def test_wrong_token_rejected(self, dialog):
-        self._setup(dialog, "/f.xlsx", 1)
-        dialog._sheet_combo.clear()
-        dialog._sheet_combo.addItems(["RealSheet"])
-        dialog._on_inspect_done(
-            self._r(3, 1, "/f.xlsx", ("Bad",)))
-        assert dialog._sheet_combo.itemText(0) == "RealSheet"
+    def test_wrong_token_rejected(self, dialog_factory):
+        d = dialog_factory()
+        self._setup(d, "/f.xlsx", 1)
+        d._sheet_combo.clear()
+        d._sheet_combo.addItems(["RealSheet"])
+        d._on_inspect_done(self._r(3, 1, "/f.xlsx", ("Bad",)))
+        assert d._sheet_combo.itemText(0) == "RealSheet"
 
-    def test_wrong_file_path_rejected(self, dialog):
-        self._setup(dialog, "/real.xlsx", 1)
-        dialog._sheet_combo.clear()
-        dialog._sheet_combo.addItems(["Real"])
-        dialog._on_inspect_done(
-            self._r(20, 1, "/other.xlsx", ("Bad",)))
-        assert dialog._sheet_combo.itemText(0) == "Real"
+    def test_wrong_file_path_rejected(self, dialog_factory):
+        d = dialog_factory()
+        self._setup(d, "/real.xlsx", 1)
+        d._sheet_combo.clear()
+        d._sheet_combo.addItems(["Real"])
+        d._on_inspect_done(self._r(20, 1, "/other.xlsx", ("Bad",)))
+        assert d._sheet_combo.itemText(0) == "Real"
 
 
 class TestPreviewUIReset:
 
-    def test_hide_results_clears_rows(self, dialog):
-        dialog._sample_table.setRowCount(3)
-        dialog._error_table.setRowCount(5)
-        dialog._hide_results()
-        assert dialog._sample_table.rowCount() == 0
-        assert dialog._error_table.rowCount() == 0
+    def test_hide_results_clears_rows(self, dialog_factory):
+        d = dialog_factory()
+        d._sample_table.setRowCount(3)
+        d._error_table.setRowCount(5)
+        d._hide_results()
+        assert d._sample_table.rowCount() == 0
+        assert d._error_table.rowCount() == 0
 
-    def test_completed_preview_restores_ui(self, dialog):
-        dialog._preview_btn.hide()
-        dialog._cancel_btn.show()
-        dialog._file_path = "f.xlsx"
-        dialog._sheet_combo.addItem("S1")
-        dialog._sheet_combo.setCurrentIndex(0)
-        dialog._closing = False
-        dialog._on_thread_done()
-        assert dialog._preview_btn.isEnabled()
-        assert not dialog._preview_btn.isHidden()
-        assert dialog._cancel_btn.isHidden()
-        assert not dialog.is_busy()
+    def test_completed_preview_restores_ui(self, dialog_factory):
+        d = dialog_factory()
+        d._preview_btn.hide()
+        d._cancel_btn.show()
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
+        d._closing = False
+        d._on_thread_done()
+        assert d._preview_btn.isEnabled()
+        assert not d._preview_btn.isHidden()
+        assert d._cancel_btn.isHidden()
+        assert not d.is_busy()
 
 
 class TestConflictUI:
 
-    def test_conflict_btn_disabled_without_db(self, qapp):
-        from qt_app.dialogs.product_import_preview_dialog import (
-            ProductImportPreviewDialog)
-        dlg = ProductImportPreviewDialog(db_path="")
-        assert not dlg._conflict_btn.isEnabled()
+    def test_conflict_btn_disabled_without_db(self, dialog_factory):
+        d = dialog_factory(db_path="")
+        assert not d._conflict_btn.isEnabled()
 
-    def test_conflict_btn_enabled_with_db_and_file(self, qapp):
-        from qt_app.dialogs.product_import_preview_dialog import (
-            ProductImportPreviewDialog)
-        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
-        dlg._file_path = "f.xlsx"
-        dlg._sheet_combo.addItem("S1")
-        dlg._sheet_combo.setCurrentIndex(0)
-        dlg._set_controls_enabled(True)
-        assert dlg._conflict_btn.isEnabled()
+    def test_conflict_btn_enabled_with_db_and_file(self, dialog_factory):
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
+        d._set_controls_enabled(True)
+        assert d._conflict_btn.isEnabled()
 
-    def test_conflict_clears_on_new_file(self, qapp):
-        from qt_app.dialogs.product_import_preview_dialog import (
-            ProductImportPreviewDialog)
-        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
-        dlg._conflict_summary_lbl.setText("old")
-        dlg._conflict_summary_lbl.show()
-        dlg._conflict_table.setRowCount(3)
-        dlg._conflict_table.show()
-        dlg._file_path = "/new.xlsx"
-        dlg._file_gen += 1
-        dlg._current_file_path = "/new.xlsx"
-        dlg._sheet_combo.clear()
-        dlg._hide_results()
-        dlg._status_lbl.setText("")
-        # Verify conflict output cleared
-        assert dlg._conflict_summary_lbl.isHidden()
-        assert dlg._conflict_table.isHidden()
-        assert dlg._conflict_table.rowCount() == 0
+    def test_conflict_clears_on_new_file(self, dialog_factory):
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._conflict_summary_lbl.setText("old")
+        d._conflict_summary_lbl.show()
+        d._conflict_table.setRowCount(3)
+        d._conflict_table.show()
+        d._file_path = "/new.xlsx"
+        d._file_gen += 1
+        d._current_file_path = "/new.xlsx"
+        d._sheet_combo.clear()
+        d._hide_results()
+        d._status_lbl.setText("")
+        assert d._conflict_summary_lbl.isHidden()
+        assert d._conflict_table.isHidden()
+        assert d._conflict_table.rowCount() == 0
 
-    def test_conflict_result_renders_summary(self, qapp):
-        from qt_app.dialogs.product_import_preview_dialog import (
-            ProductImportPreviewDialog)
+    def test_conflict_result_renders_summary(self, dialog_factory):
         from infrastructure.product_import_conflicts import (
             ImportConflictResult, ConflictRecord)
-        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
-        dlg._file_path = "f.xlsx"
-        dlg._sheet_combo.addItem("S1")
-        dlg._sheet_combo.setCurrentIndex(0)
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.success(
             "f.xlsx", "S1", 10, 10, 0, 0, 10, 5, 3, 2,
             [ConflictRecord("A", ("Name", "Price")),
              ConflictRecord("B", ("Stock",))],
             [], [])
-        dlg._on_conflict_done(result)
-        assert "Νέα προϊόντα: 5" in dlg._conflict_summary_lbl.text()
-        assert "Όνομα, Τιμή" in dlg._conflict_table.item(0, 1).text()
-        assert dlg._conflict_table.rowCount() == 2
+        d._on_conflict_done(result)
+        assert "Νέα προϊόντα: 5" in d._conflict_summary_lbl.text()
+        assert "Όνομα, Τιμή" in d._conflict_table.item(0, 1).text()
+        assert d._conflict_table.rowCount() == 2
 
-    def test_cancelled_conflict_result_partial(self, qapp):
-        from qt_app.dialogs.product_import_preview_dialog import (
-            ProductImportPreviewDialog)
+    def test_cancelled_conflict_result_partial(self, dialog_factory):
         from infrastructure.product_import_conflicts import (
-            ImportConflictResult, ConflictRecord)
-        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
-        dlg._file_path = "f.xlsx"
-        dlg._sheet_combo.addItem("S1")
-        dlg._sheet_combo.setCurrentIndex(0)
+            ImportConflictResult)
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
         result = ImportConflictResult.cancelled(
             "f.xlsx", "S1", 500, 500, 0, 0, 300, 200, 70, 30, [], [], [])
-        dlg._on_conflict_done(result)
-        assert "μερική" in dlg._status_lbl.text()
-        assert "Ταξινομήθηκαν 300" in dlg._conflict_summary_lbl.text()
+        d._on_conflict_done(result)
+        assert "μερική" in d._status_lbl.text()
+        assert "Ταξινομήθηκαν: 300" in d._conflict_summary_lbl.text().replace("\n", " ")
 
-    def test_conflict_btn_restored_after_cleanup(self, qapp):
-        from qt_app.dialogs.product_import_preview_dialog import (
-            ProductImportPreviewDialog)
-        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
-        dlg._file_path = "f.xlsx"
-        dlg._sheet_combo.addItem("S1")
-        dlg._sheet_combo.setCurrentIndex(0)
-        dlg._closing = False
-        dlg._on_thread_done()
-        assert dlg._conflict_btn.isVisible()
-        assert dlg._conflict_btn.isEnabled()
+    def test_conflict_btn_restored_after_cleanup(self, dialog_factory):
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
+        d._closing = False
+        d._on_thread_done()
+        assert not d._conflict_btn.isHidden()
+        assert d._conflict_btn.isEnabled()
 
-    def test_mapping_change_clears_conflict(self, qapp):
-        from qt_app.dialogs.product_import_preview_dialog import (
-            ProductImportPreviewDialog)
-        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
-        dlg._conflict_summary_lbl.setText("stale")
-        dlg._conflict_summary_lbl.show()
-        dlg._conflict_table.setRowCount(3)
-        dlg._conflict_table.show()
-        # Simulate mapping combo change (not busy)
-        dlg._on_mapping_changed("NewCol")
-        assert dlg._conflict_summary_lbl.isHidden()
-        assert dlg._conflict_table.isHidden()
-        assert dlg._conflict_table.rowCount() == 0
+    def test_mapping_change_clears_conflict(self, dialog_factory):
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._conflict_summary_lbl.setText("stale")
+        d._conflict_summary_lbl.show()
+        d._conflict_table.setRowCount(3)
+        d._conflict_table.show()
+        d._on_mapping_changed("NewCol")
+        assert d._conflict_summary_lbl.isHidden()
+        assert d._conflict_table.isHidden()
+        assert d._conflict_table.rowCount() == 0
 
-    def test_conflict_refuses_when_busy(self, qapp):
-        from qt_app.dialogs.product_import_preview_dialog import (
-            ProductImportPreviewDialog)
-        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
-        dlg._thread = object()  # simulate busy
-        dlg._on_run_conflict()
-        assert dlg._worker is None  # no worker started
+    def test_conflict_refuses_when_busy(self, dialog_factory):
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._thread = object()
+        d._on_run_conflict()
+        assert d._worker is None
 
-    def test_conflict_capped_at_50(self, qapp):
-        from qt_app.dialogs.product_import_preview_dialog import (
-            ProductImportPreviewDialog)
+    def test_conflict_capped_at_50(self, dialog_factory):
         from infrastructure.product_import_conflicts import (
             ImportConflictResult, ConflictRecord)
-        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
-        dlg._file_path = "f.xlsx"
-        dlg._sheet_combo.addItem("S1")
-        dlg._sheet_combo.setCurrentIndex(0)
+        d = dialog_factory(db_path="/tmp/test.db")
+        d._file_path = "f.xlsx"
+        d._sheet_combo.addItem("S1")
+        d._sheet_combo.setCurrentIndex(0)
         samples = tuple(
             ConflictRecord(f"B{i}", ("Name",)) for i in range(80))
         result = ImportConflictResult.success(
             "f", "S1", 10, 10, 0, 0, 10, 0, 0, 10, samples, [], [])
-        dlg._on_conflict_done(result)
-        assert dlg._conflict_table.rowCount() == 50
+        d._on_conflict_done(result)
+        assert d._conflict_table.rowCount() == 50
