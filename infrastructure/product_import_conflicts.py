@@ -581,10 +581,14 @@ def analyze_import_conflicts(
         try:
             review_sig = _compute_review_db_signature(conn, seen_barcodes)
         except ValueError:
-            # No matching barcodes in DB → None is acceptable
+            if changed_count > 0:
+                return ImportConflictResult.failure(
+                    file_path, active_sheet,
+                    "Αδυναμία υπολογισμού υπογραφής βάσης "
+                    "για τα αλλαγμένα προϊόντα. "
+                    "Επανεκκινήστε την ανάλυση.")
             review_sig = None
         except Exception:
-            # If products were changed, a signature is mandatory for C3
             if changed_count > 0:
                 return ImportConflictResult.failure(
                     file_path, active_sheet,
