@@ -353,7 +353,7 @@ class InventoryPage(BasePage):
     def _on_preview_xlsx(self):
         from qt_app.dialogs.product_import_preview_dialog import (
             ProductImportPreviewDialog)
-        dlg = ProductImportPreviewDialog(self)
+        dlg = ProductImportPreviewDialog(self, db_path=self._db_path)
         self._preview_dlg = dlg
         dlg.shutdown_ready.connect(self._on_preview_dlg_shutdown_ready)
         dlg.exec()

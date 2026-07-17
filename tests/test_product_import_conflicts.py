@@ -191,14 +191,13 @@ class TestLimits:
 
     def test_cancellation_during_classify_batch(self, tmp_path):
         """Cancel during DB classification of a full batch:
-        some rows processed, some not. classified is less than valid."""
+        exactly cancelled, classified < valid, sum equals classified."""
         class Cancel:
             def __init__(self):
                 self.called = 0
             def is_set(self):
                 self.called += 1
-                # Let first full batch go through, cancel during second
-                return self.called > 600  # ~600 checks: ~500 rows + calls
+                return self.called > 600
         xp = str(tmp_path / "t.xlsx")
         db = str(tmp_path / "t.db")
         rows = [[f"{i:013d}", f"N{i}", 1, 1.0, ""] for i in range(800)]
@@ -206,11 +205,12 @@ class TestLimits:
         _make_db(db, [])
         cancel = Cancel()
         r = analyze_import_conflicts(xp, M, db, cancel_event=cancel)
-        # Either cancelled or completed — check invariants
-        if r.cancelled:
-            assert r.classified_rows <= r.valid_rows
-            assert r.classified_rows == (
-                r.new_barcodes + r.unchanged_existing + r.changed_existing)
+        assert r.cancelled, "Should be cancelled mid-batch"
+        assert r.classified_rows > 0, "Some rows must be classified"
+        assert r.classified_rows < r.valid_rows, (
+            "Not all valid rows classified")
+        assert r.classified_rows == (
+            r.new_barcodes + r.unchanged_existing + r.changed_existing)
 
 
 class TestRobustness:

@@ -78,13 +78,34 @@ class _PreviewWorker(QObject):
             self._fp, self._m, self._sn, cancel_event=self._cancel))
 
 
+class _ConflictWorker(QObject):
+    finished = Signal(object)  # ImportConflictResult
+
+    def __init__(self, file_path, mapping, db_path, sheet_name,
+                 cancel_event, parent=None):
+        super().__init__(parent)
+        self._fp = file_path
+        self._m = mapping
+        self._db = db_path
+        self._sn = sheet_name
+        self._cancel = cancel_event
+
+    def run(self):
+        from infrastructure.product_import_conflicts import (
+            analyze_import_conflicts)
+        self.finished.emit(analyze_import_conflicts(
+            self._fp, self._m, self._db, self._sn,
+            cancel_event=self._cancel))
+
+
 class ProductImportPreviewDialog(QDialog):
     shutdown_ready = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, db_path=""):
         super().__init__(parent)
         self.setWindowTitle("Προεπισκόπηση Εισαγωγής Excel")
         self.setMinimumSize(750, 600)
+        self._db_path = db_path
         self._file_path: str = ""
         self._sheet_name: str = ""
         self._cancel_event: threading.Event | None = None
@@ -181,6 +202,14 @@ class ProductImportPreviewDialog(QDialog):
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._cancel_btn.hide()
         btns_row.addWidget(self._cancel_btn)
+        self._conflict_btn = QPushButton("🔎  Ανάλυση συγκρούσεων βάσης")
+        self._conflict_btn.setStyleSheet(self._btn_qss())
+        self._conflict_btn.clicked.connect(self._on_run_conflict)
+        self._conflict_btn.setEnabled(False)
+        if not self._db_path:
+            self._conflict_btn.setToolTip(
+                "Απαιτείται διαδρομή βάσης δεδομένων.")
+        btns_row.addWidget(self._conflict_btn)
         btns_row.addStretch()
         lay.addLayout(btns_row)
 
@@ -216,6 +245,22 @@ class ProductImportPreviewDialog(QDialog):
         self._no_write_lbl.setStyleSheet(f"color: {styles.AMBER}; font-size: 12px;")
         self._no_write_lbl.hide()
         rs.addWidget(self._no_write_lbl)
+
+        # Conflict analysis results
+        self._conflict_summary_lbl = QLabel("")
+        self._conflict_summary_lbl.setWordWrap(True)
+        self._conflict_summary_lbl.setStyleSheet(
+            f"color: {styles.ACCENT}; font-size: 12px;")
+        self._conflict_summary_lbl.hide()
+        rs.addWidget(self._conflict_summary_lbl)
+        self._conflict_table = QTableWidget(0, 2)
+        self._conflict_table.setHorizontalHeaderLabels(
+            ["Barcode", "Αλλαγμένα Πεδία"])
+        self._conflict_table.horizontalHeader().setStretchLastSection(True)
+        self._conflict_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._conflict_table.setMaximumHeight(200)
+        self._conflict_table.hide()
+        rs.addWidget(self._conflict_table)
         lay.addLayout(rs)
 
         dbb = QDialogButtonBox(QDialogButtonBox.Close)
@@ -242,10 +287,13 @@ class ProductImportPreviewDialog(QDialog):
             self._preview_btn.setEnabled(
                 bool(self._file_path)
                 and len(self._sheet_combo.currentText()) > 0)
+            self._conflict_btn.setEnabled(
+                bool(self._db_path) and bool(self._file_path)
+                and len(self._sheet_combo.currentText()) > 0)
             self._cancel_btn.hide()
         else:
             self._preview_btn.setEnabled(False)
-            # Hide preview btn but keep cancel visible during preview
+            self._conflict_btn.setEnabled(False)
             if not self.is_busy():
                 self._preview_btn.hide()
                 self._cancel_btn.hide()
@@ -354,6 +402,91 @@ class ProductImportPreviewDialog(QDialog):
         self._cancel_btn.setEnabled(False)
         self._status_lbl.setText("Ακύρωση προεπισκόπησης…")
 
+    # ── Conflict analysis ─────────────────────────────────────────────
+    def _on_run_conflict(self):
+        if self.is_busy() or not self._db_path:
+            return
+        mapping = self._get_mapping()
+        if mapping is None:
+            QMessageBox.warning(self, "Σφάλμα",
+                "Επιλέξτε μοναδικές στήλες για κάθε πεδίο.")
+            return
+        self._hide_results()
+        self._set_controls_enabled(False)
+        self._preview_btn.hide()
+        self._conflict_btn.hide()
+        self._cancel_btn.show()
+        self._progress.show()
+        self._status_lbl.setText("🔄 Ανάλυση συγκρούσεων βάσης…")
+        self._cancel_event = threading.Event()
+        self._start_worker(
+            _ConflictWorker(self._file_path, mapping, self._db_path,
+                            self._sheet_name, self._cancel_event),
+            self._on_conflict_done)
+
+    def _on_conflict_done(self, result):
+        self._progress.hide()
+        self._cancel_btn.hide()
+        self._no_write_lbl.show()
+
+        FIELD_GREEK = {"Name": "Όνομα", "Stock": "Απόθεμα",
+                       "Price": "Τιμή", "ExpiryDate": "Ημ. λήξης"}
+
+        if result.cancelled:
+            self._status_lbl.setText(
+                f"⚠ Ανάλυση ακυρώθηκε (μερική). "
+                f"Ταξινομήθηκαν {result.classified_rows} γραμμές.")
+        elif not result.ok:
+            self._status_lbl.setText(
+                f"❌ {result.error_message or 'Ανάλυση απέτυχε.'}")
+        else:
+            self._status_lbl.setText("✅ Ανάλυση συγκρούσεων ολοκληρώθηκε.")
+
+        summary = (
+            f"Νέα προϊόντα: {result.new_barcodes}  ·  "
+            f"Ήδη ίδια: {result.unchanged_existing}  ·  "
+            f"Υπάρχουσες αλλαγές: {result.changed_existing}\n"
+            f"Έγκυρα: {result.valid_rows}  ·  "
+            f"Άκυρα: {result.invalid_rows}  ·  "
+            f"Διπλότυπα: {result.duplicate_barcodes}  ·  "
+            f"Ταξινομήθηκαν: {result.classified_rows}")
+        self._conflict_summary_lbl.setText(summary)
+        self._conflict_summary_lbl.show()
+
+        if result.conflict_samples:
+            self._conflict_table.setRowCount(len(result.conflict_samples))
+            for r, c in enumerate(result.conflict_samples):
+                self._conflict_table.setItem(
+                    r, 0, QTableWidgetItem(c.barcode))
+                greek_fields = ", ".join(
+                    FIELD_GREEK.get(f, f) for f in c.changed_fields)
+                self._conflict_table.setItem(
+                    r, 1, QTableWidgetItem(greek_fields))
+            self._conflict_table.show()
+
+        # Also show preview errors/samples from the underlying scan
+        if hasattr(result, 'sample_rows') and result.sample_rows:
+            self._sample_lbl.setText(
+                f"Δείγμα ({len(result.sample_rows)}):")
+            self._sample_lbl.show()
+            self._sample_table.setRowCount(len(result.sample_rows))
+            for r, row in enumerate(result.sample_rows):
+                for c, val in enumerate(row):
+                    self._sample_table.setItem(r, c, QTableWidgetItem(str(val)))
+            self._sample_table.show()
+        if hasattr(result, 'errors') and result.errors:
+            self._error_lbl.setText(f"Σφάλματα ({len(result.errors)}):")
+            self._error_lbl.show()
+            self._error_table.setRowCount(len(result.errors))
+            for r, e in enumerate(result.errors):
+                self._error_table.setItem(r, 0,
+                    QTableWidgetItem(str(e.row_number)))
+                self._error_table.setItem(r, 1, QTableWidgetItem(e.barcode))
+                self._error_table.setItem(r, 2, QTableWidgetItem(e.code))
+                self._error_table.setItem(r, 3, QTableWidgetItem(e.message))
+            self._error_table.show()
+        # Do NOT re-enable controls — _on_thread_done does it
+
     def _get_mapping(self) -> ImportColumnMapping | None:
         cols = {}
         for key in FIELD_KEYS:
@@ -439,10 +572,12 @@ class ProductImportPreviewDialog(QDialog):
     # ── Reset / hide ──────────────────────────────────────────────────
     def _hide_results(self):
         for w in [self._sample_lbl, self._sample_table,
-                  self._error_lbl, self._error_table, self._no_write_lbl]:
+                  self._error_lbl, self._error_table, self._no_write_lbl,
+                  self._conflict_summary_lbl, self._conflict_table]:
             w.hide()
         self._sample_table.setRowCount(0)
         self._error_table.setRowCount(0)
+        self._conflict_table.setRowCount(0)
         self._progress.hide()
 
     def _reset_state(self):

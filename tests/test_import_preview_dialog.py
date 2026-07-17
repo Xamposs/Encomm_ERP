@@ -136,3 +136,75 @@ class TestPreviewUIReset:
         assert not dialog._preview_btn.isHidden()
         assert dialog._cancel_btn.isHidden()
         assert not dialog.is_busy()
+
+
+class TestConflictUI:
+
+    def test_conflict_btn_disabled_without_db(self, qapp):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        dlg = ProductImportPreviewDialog(db_path="")
+        assert not dlg._conflict_btn.isEnabled()
+
+    def test_conflict_btn_enabled_with_db_and_file(self, qapp):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
+        dlg._file_path = "f.xlsx"
+        dlg._sheet_combo.addItem("S1")
+        dlg._sheet_combo.setCurrentIndex(0)
+        dlg._set_controls_enabled(True)
+        assert dlg._conflict_btn.isEnabled()
+
+    def test_conflict_clears_on_new_file(self, qapp):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
+        dlg._conflict_summary_lbl.setText("old")
+        dlg._conflict_summary_lbl.show()
+        dlg._conflict_table.setRowCount(3)
+        dlg._conflict_table.show()
+        dlg._file_path = "/new.xlsx"
+        dlg._file_gen += 1
+        dlg._current_file_path = "/new.xlsx"
+        dlg._sheet_combo.clear()
+        dlg._hide_results()
+        dlg._status_lbl.setText("")
+        # Verify conflict output cleared
+        assert dlg._conflict_summary_lbl.isHidden()
+        assert dlg._conflict_table.isHidden()
+        assert dlg._conflict_table.rowCount() == 0
+
+    def test_conflict_result_renders_summary(self, qapp):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        from infrastructure.product_import_conflicts import (
+            ImportConflictResult, ConflictRecord)
+        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
+        dlg._file_path = "f.xlsx"
+        dlg._sheet_combo.addItem("S1")
+        dlg._sheet_combo.setCurrentIndex(0)
+        result = ImportConflictResult.success(
+            "f.xlsx", "S1", 10, 10, 0, 0, 10, 5, 3, 2,
+            [ConflictRecord("A", ("Name", "Price")),
+             ConflictRecord("B", ("Stock",))],
+            [], [])
+        dlg._on_conflict_done(result)
+        assert "Νέα προϊόντα: 5" in dlg._conflict_summary_lbl.text()
+        assert "Όνομα, Τιμή" in dlg._conflict_table.item(0, 1).text()
+        assert dlg._conflict_table.rowCount() == 2
+
+    def test_cancelled_conflict_result_partial(self, qapp):
+        from qt_app.dialogs.product_import_preview_dialog import (
+            ProductImportPreviewDialog)
+        from infrastructure.product_import_conflicts import (
+            ImportConflictResult, ConflictRecord)
+        dlg = ProductImportPreviewDialog(db_path="/tmp/test.db")
+        dlg._file_path = "f.xlsx"
+        dlg._sheet_combo.addItem("S1")
+        dlg._sheet_combo.setCurrentIndex(0)
+        result = ImportConflictResult.cancelled(
+            "f.xlsx", "S1", 500, 500, 0, 0, 300, 200, 70, 30, [], [], [])
+        dlg._on_conflict_done(result)
+        assert "μερική" in dlg._status_lbl.text()
+        assert "Ταξινομήθηκαν 300" in dlg._conflict_summary_lbl.text()
