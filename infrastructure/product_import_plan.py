@@ -40,6 +40,8 @@ class ImportPlan:
     rejected_invalid: int = 0
     skipped_duplicates: int = 0
     source_signature: ImportSourceSignature | None = None
+    # ── C3 fields (appended; never inserted between legacy fields) ───
+    review_db_signature: str | None = None
 
 
 def build_import_plan(
@@ -79,6 +81,7 @@ def build_import_plan(
         rejected_invalid=result.invalid_rows,
         skipped_duplicates=result.duplicate_barcodes,
         source_signature=result.source_signature,
+        review_db_signature=result.review_db_signature,
     )
 
     total = (plan.planned_new + plan.skipped_identical

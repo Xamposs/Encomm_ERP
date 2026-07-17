@@ -116,6 +116,24 @@ class _CommitWorker(QObject):
             cancel_event=self._cancel))
 
 
+class _UpdateCommitWorker(QObject):
+    """C3: atomic update of changed existing products."""
+    finished = Signal(object)  # ImportUpdateCommitResult
+
+    def __init__(self, file_path, mapping, plan, db_path, cancel_event,
+                 parent=None):
+        super().__init__(parent)
+        self._fp, self._m, self._plan, self._db, self._cancel = (
+            file_path, mapping, plan, db_path, cancel_event)
+
+    def run(self):
+        from infrastructure.product_import_update_commit import (
+            commit_approved_changed_products_from_xlsx)
+        self.finished.emit(commit_approved_changed_products_from_xlsx(
+            self._fp, self._m, self._plan, self._db,
+            cancel_event=self._cancel))
+
+
 class ProductImportPreviewDialog(QDialog):
     shutdown_ready = Signal()
     import_completed = Signal(int)
@@ -287,9 +305,9 @@ class ProductImportPreviewDialog(QDialog):
 
         # C2: read-only detail table — current vs incoming values
         self._detail_notice_lbl = QLabel(
-            "⚠ Τα παρακάτω προϊόντα έχουν διαφορές αλλά "
-            "ΔΕΝ θα αλλάξουν από αυτή την εισαγωγή. "
-            "Εμφανίζονται μόνο για έλεγχο.")
+            "⚠ Τα παρακάτω προϊόντα έχουν διαφορές. "
+            "Δεν εφαρμόζονται μέχρι την ξεχωριστή εγκεκριμένη "
+            "ενέργεια ενημέρωσης υπαρχόντων.")
         self._detail_notice_lbl.setWordWrap(True)
         self._detail_notice_lbl.setStyleSheet(
             f"color: {styles.AMBER}; font-size: 12px; font-weight: bold;")
@@ -347,6 +365,21 @@ class ProductImportPreviewDialog(QDialog):
         self._commit_btn.setEnabled(False)
         self._commit_btn.hide()
         pl.addWidget(self._commit_btn)
+        # ── C3: update changed existing products ─────────────────────
+        self._update_check = QCheckBox(
+            "Κατανοώ ότι τα υπάρχοντα προϊόντα θα ενημερωθούν "
+            "από αυτό το ακριβώς αρχείο Excel και την τρέχουσα "
+            "κατάσταση της βάσης δεδομένων.")
+        self._update_check.hide()
+        self._update_check.toggled.connect(self._on_update_check_toggled)
+        pl.addWidget(self._update_check)
+        self._update_btn = QPushButton(
+            "🔄  Εκτέλεση εγκεκριμένης ενημέρωσης υπαρχόντων")
+        self._update_btn.setStyleSheet(self._btn_qss())
+        self._update_btn.clicked.connect(self._on_run_update_commit)
+        self._update_btn.setEnabled(False)
+        self._update_btn.hide()
+        pl.addWidget(self._update_btn)
         self._plan_grp.setLayout(pl)
         self._plan_grp.show()
         rs.addWidget(self._plan_grp)
@@ -645,9 +678,10 @@ class ProductImportPreviewDialog(QDialog):
             return
         from infrastructure.product_import_plan import (
             build_import_plan, ImportReviewPolicy, ChangedPolicy)
+        skip_policy = self._plan_policy.currentIndex() == 1
         policy = ImportReviewPolicy(
             changed=ChangedPolicy.REQUIRE_MANUAL_REVIEW
-            if self._plan_policy.currentIndex() == 0
+            if not skip_policy
             else ChangedPolicy.SKIP_CHANGES)
         try:
             plan = build_import_plan(self._last_conflict_result, policy)
@@ -677,10 +711,28 @@ class ProductImportPreviewDialog(QDialog):
         self._commit_btn.show()
         self._commit_btn.setEnabled(False)
 
+        # ── C3: show update controls only when manual_review > 0,
+        #     skipped_changed == 0, and policy is not skip ────────────
+        show_c3 = (plan.manual_review > 0
+                   and plan.skipped_changed == 0
+                   and not skip_policy)
+        self._update_check.setVisible(show_c3)
+        self._update_check.setChecked(False)
+        self._update_btn.setVisible(show_c3)
+        self._update_btn.setEnabled(False)
+
     def _on_commit_check_toggled(self, checked):
         self._commit_btn.setEnabled(
             checked and self._current_plan is not None
             and self._current_plan.planned_new > 0
+            and not self.is_busy())
+
+    def _on_update_check_toggled(self, checked):
+        """C3 update button: requires checkbox + valid plan + not busy."""
+        plan = self._current_plan
+        self._update_btn.setEnabled(
+            checked and plan is not None
+            and plan.manual_review > 0
             and not self.is_busy())
 
     def _on_run_commit(self):
@@ -716,6 +768,43 @@ class ProductImportPreviewDialog(QDialog):
                           self._db_path, self._cancel_event),
             self._on_commit_done)
 
+    def _on_run_update_commit(self):
+        """C3: atomic update of changed existing products."""
+        if self.is_busy() or self._current_plan is None:
+            return
+        plan = self._current_plan
+        if plan.manual_review == 0:
+            return
+        # Second explicit confirmation QMessageBox
+        reply = QMessageBox.question(
+            self, "Επιβεβαίωση ενημέρωσης υπαρχόντων",
+            f"Θα ενημερωθούν {plan.manual_review} υπάρχοντα προϊόντα "
+            f"με βάση αυτό το ακριβές αρχείο Excel και την "
+            f"τρέχουσα κατάσταση της βάσης δεδομένων.\n\n"
+            f"Η λειτουργία θα ακυρωθεί αν το αρχείο ή η βάση "
+            f"έχουν αλλάξει.\n\nΣυνέχεια;",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        mapping = self._get_mapping()
+        if mapping is None:
+            return
+        self._set_controls_enabled(False)
+        self._preview_btn.hide()
+        self._conflict_btn.hide()
+        self._plan_btn.hide()
+        self._commit_btn.hide()
+        self._update_btn.hide()
+        self._cancel_btn.show()
+        self._progress.show()
+        self._status_lbl.setText("🔄 Εκτέλεση εγκεκριμένης ενημέρωσης…")
+        self._operation = "commit"
+        self._cancel_event = threading.Event()
+        self._start_worker(
+            _UpdateCommitWorker(self._file_path, mapping, plan,
+                                self._db_path, self._cancel_event),
+            self._on_update_commit_done)
+
     def _on_commit_done(self, result):
         self._progress.hide()
         self._cancel_btn.hide()
@@ -743,6 +832,43 @@ class ProductImportPreviewDialog(QDialog):
         self._commit_check.hide()
         self._commit_btn.hide()
         self._commit_btn.setEnabled(False)
+        self._update_check.hide()
+        self._update_btn.hide()
+        self._update_btn.setEnabled(False)
+        self._plan_btn.setEnabled(False)
+        self._last_conflict_result = None
+
+    def _on_update_commit_done(self, result):
+        """C3 update completion handler."""
+        self._progress.hide()
+        self._cancel_btn.hide()
+        self._operation = ""
+        self._plan_summary_lbl.hide()
+        if result.cancelled:
+            self._status_lbl.setText(
+                "⚠ Η ενημέρωση ακυρώθηκε. Δεν έγιναν αλλαγές.")
+            self._no_write_lbl.show()
+        elif not result.ok:
+            self._status_lbl.setText(
+                f"❌ Αποτυχία ενημέρωσης: {result.error_message}")
+            self._no_write_lbl.show()
+        else:
+            self._status_lbl.setText(
+                f"✅ Ενημερώθηκαν {result.updated_rows} υπάρχοντα προϊόντα. "
+                f"(Ονόματα: {result.updated_name}, "
+                f"Απόθεμα: {result.updated_stock}, "
+                f"Τιμή: {result.updated_price}, "
+                f"Ημ. Λήξης: {result.updated_expiry})")
+            self._no_write_lbl.hide()
+            self.import_completed.emit(result.updated_rows)
+        # Invalidate plan after any C3 attempt
+        self._current_plan = None
+        self._commit_check.hide()
+        self._commit_btn.hide()
+        self._commit_btn.setEnabled(False)
+        self._update_check.hide()
+        self._update_btn.hide()
+        self._update_btn.setEnabled(False)
         self._plan_btn.setEnabled(False)
         self._last_conflict_result = None
 
@@ -846,6 +972,8 @@ class ProductImportPreviewDialog(QDialog):
         self._current_plan = None
         self._commit_check.hide()
         self._commit_btn.hide()
+        self._update_check.hide()
+        self._update_btn.hide()
         self._plan_btn.setEnabled(False)
 
     def _reset_state(self):

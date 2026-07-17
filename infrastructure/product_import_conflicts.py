@@ -7,6 +7,7 @@ memory.  No database writes.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import date as dt_date, datetime as dt_datetime
@@ -89,12 +90,14 @@ class ImportConflictResult:
     # ── C2 fields (appended; never inserted between legacy fields) ───
     conflict_details: Tuple[ConflictDetail, ...] = ()
     conflict_details_truncated: bool = False
+    # ── C3 fields (appended; never inserted between legacy fields) ───
+    review_db_signature: str | None = None
 
     @classmethod
     def _make(cls, ok, cancelled, msg, fn, sn, scanned, valid, invalid,
               dupes, classified, new, unchanged, changed,
               conflicts, errors, samples, signature=None,
-              details=(), truncated=False):
+              details=(), truncated=False, *, review_db_signature=None):
         return cls(
             ok=ok, cancelled=cancelled, error_message=msg,
             file_name=fn, sheet_name=sn,
@@ -109,16 +112,19 @@ class ImportConflictResult:
             source_signature=signature,
             conflict_details=tuple(details),
             conflict_details_truncated=truncated,
+            review_db_signature=review_db_signature,
         )
 
     @classmethod
     def success(cls, fn, sn, scanned, valid, invalid, dupes, classified,
                 new, unchanged, changed, conflicts, errors, samples,
-                signature=None, *, details=(), truncated=False):
+                signature=None, *, details=(), truncated=False,
+                review_db_signature=None):
         return cls._make(True, False, "", fn, sn, scanned, valid, invalid,
                          dupes, classified, new, unchanged, changed,
                          conflicts, errors, samples, signature=signature,
-                         details=details, truncated=truncated)
+                         details=details, truncated=truncated,
+                         review_db_signature=review_db_signature)
 
     @classmethod
     def cancelled(cls, fn, sn, scanned, valid, invalid, dupes, classified,
@@ -147,6 +153,41 @@ class ImportConflictResult:
 
 
 # ── Internal helpers ──────────────────────────────────────────────────
+
+
+def _compute_review_db_signature(conn: sqlite3.Connection,
+                                 seen_barcodes: Set[str]) -> str | None:
+    """Compute a deterministic SHA-256 signature of the current DB state.
+
+    Only for barcodes that exist in both the XLSX and ProductMaster.
+    Canonical fields: Barcode, Name, Stock, Price (Decimal), ExpiryDate.
+    Returns None for empty or invalid inputs.
+    """
+    if not seen_barcodes:
+        return None
+    barcode_list = sorted(seen_barcodes)
+    rows = []
+    for i in range(0, len(barcode_list), 500):
+        chunk = barcode_list[i:i + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        chunk_rows = conn.execute(
+            f"SELECT Barcode, Name, Stock, Price, ExpiryDate "
+            f"FROM ProductMaster WHERE Barcode IN ({placeholders})",
+            chunk).fetchall()
+        rows.extend(chunk_rows)
+    if not rows:
+        return None
+    # Build canonical string sorted by barcode
+    parts = []
+    for r in sorted(rows, key=lambda r: r["Barcode"]):
+        b = r["Barcode"] or ""
+        n = r["Name"] or ""
+        s = r["Stock"] or 0
+        p = str(Decimal(str(r["Price"] or 0.0)))
+        e = r["ExpiryDate"] or ""
+        parts.append(f"{b}|{n}|{s}|{p}|{e}")
+    canonical = "\n".join(parts)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _connect_ro(db_path: str) -> sqlite3.Connection:
@@ -551,8 +592,21 @@ def analyze_import_conflicts(
             file_path, active_sheet,
             "Αδυναμία επαλήθευσης ταυτότητας αρχείου.")
 
+    # Compute DB review signature (need fresh read-only connection)
+    review_sig = None
+    review_conn = None
+    try:
+        review_conn = _connect_ro(db_path)
+        review_sig = _compute_review_db_signature(review_conn, seen_barcodes)
+    except Exception:
+        pass
+    finally:
+        if review_conn:
+            review_conn.close()
+
     return ImportConflictResult.success(
         file_path, active_sheet, scanned, valid, invalid, dupes,
         classified, new_count, unchanged_count, changed_count,
         conflicts, errors, samples, signature=sig_before,
-        details=details, truncated=details_truncated)
+        details=details, truncated=details_truncated,
+        review_db_signature=review_sig)
