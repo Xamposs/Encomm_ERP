@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from infrastructure.backup_service import BackupService, VerifyBackupResult
+from infrastructure.backup_service import BackupService, BackupResult, VerifyBackupResult
 from infrastructure.restore_service import (
     RestoreService,
     RestorePreparation,
@@ -682,49 +682,96 @@ class TestHelperCore:
 
 class TestWindowsPIDDetection:
     """_pid_exists_windows must treat access-denied and unknown errors
-    as 'possibly still running' (fail-closed)."""
+    as 'possibly still running' (fail-closed).
 
+    These tests mock ``ctypes.windll.kernel32`` — NOT ``_pid_exists_windows`` —
+    so the production function is exercised directly through its Windows
+    API dependency.
+    """
+
+    # ── helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_fake_kernel32(
+        open_process_rv=None,
+        get_last_error_rv=87,
+        close_handle_rv=True,
+        wait_for_single_object_rv=0,
+    ):
+        """Build a fake kernel32 whose functions accept ``.restype`` /
+        ``.argtypes`` assignment (the production code sets these)."""
+
+        class _FakeWinFunc:
+            def __init__(self, return_value):
+                self._rv = return_value
+                self.restype = None
+                self.argtypes = None
+
+            def __call__(self, *args, **kwargs):
+                return self._rv
+
+        return type(
+            "_FakeKernel32",
+            (),
+            {
+                "OpenProcess": _FakeWinFunc(open_process_rv),
+                "GetLastError": _FakeWinFunc(get_last_error_rv),
+                "CloseHandle": _FakeWinFunc(close_handle_rv),
+                "WaitForSingleObject": _FakeWinFunc(wait_for_single_object_rv),
+            },
+        )()
+
+    @staticmethod
+    def _install_fake_kernel32(monkeypatch, fake_kernel32):
+        """Replace ``ctypes.windll`` so ``ctypes.windll.kernel32``
+        resolves to *fake_kernel32*."""
+        import ctypes
+
+        class _FakeWinDLL:
+            pass
+
+        fake_windll = _FakeWinDLL()
+        fake_windll.kernel32 = fake_kernel32
+        monkeypatch.setattr(ctypes, "windll", fake_windll)
+
+    # ── tests ──────────────────────────────────────────────────────
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows-only ctypes test")
     def test_invalid_pid_returns_not_running(self, monkeypatch):
-        """ERROR_INVALID_PARAMETER → PID does not exist → return False."""
+        """OpenProcess→NULL, GetLastError→87 (ERROR_INVALID_PARAMETER)
+        ⇒ function returns False."""
+        fake_k32 = self._make_fake_kernel32(
+            open_process_rv=None,  # NULL → None via restype=HANDLE
+            get_last_error_rv=87,
+        )
+        self._install_fake_kernel32(monkeypatch, fake_k32)
+
         from infrastructure.restore_helper import _pid_exists_windows
-
-        # Simulate OpenProcess failing with ERROR_INVALID_PARAMETER
-        import infrastructure.restore_helper as rh_mod
-        original = rh_mod._pid_exists_windows
-
-        def _fake(pid):
-            # Directly simulate the error-path: OpenProcess returns
-            # None, GetLastError returns 87 → not running
-            if pid == 99999:
-                return False
-            return original(pid)
-
-        monkeypatch.setattr(rh_mod, "_pid_exists_windows", _fake)
         assert not _pid_exists_windows(99999)
 
+    @pytest.mark.skipif(os.name != "nt", reason="Windows-only ctypes test")
     def test_access_denied_returns_running(self, monkeypatch):
-        """ERROR_ACCESS_DENIED → maybe a privileged process → return True."""
-        import infrastructure.restore_helper as rh_mod
+        """OpenProcess→NULL, GetLastError→5 (ERROR_ACCESS_DENIED)
+        ⇒ function returns True (fail-closed)."""
+        fake_k32 = self._make_fake_kernel32(
+            open_process_rv=None,
+            get_last_error_rv=5,
+        )
+        self._install_fake_kernel32(monkeypatch, fake_k32)
 
-        def _fake(pid):
-            if pid == 12345:
-                return True  # access denied → fail closed
-            return rh_mod._pid_exists_windows(pid)
-
-        monkeypatch.setattr(rh_mod, "_pid_exists_windows", _fake)
         from infrastructure.restore_helper import _pid_exists_windows
         assert _pid_exists_windows(12345)
 
+    @pytest.mark.skipif(os.name != "nt", reason="Windows-only ctypes test")
     def test_unknown_error_returns_running(self, monkeypatch):
-        """Any unknown Windows error → fail closed → return True."""
-        import infrastructure.restore_helper as rh_mod
+        """OpenProcess→NULL, GetLastError→999 (unknown)
+        ⇒ function returns True (fail-closed)."""
+        fake_k32 = self._make_fake_kernel32(
+            open_process_rv=None,
+            get_last_error_rv=999,
+        )
+        self._install_fake_kernel32(monkeypatch, fake_k32)
 
-        def _fake(pid):
-            if pid == 99999:
-                return True  # unknown error → fail closed
-            return rh_mod._pid_exists_windows(pid)
-
-        monkeypatch.setattr(rh_mod, "_pid_exists_windows", _fake)
         from infrastructure.restore_helper import _pid_exists_windows
         assert _pid_exists_windows(99999)
 
@@ -739,78 +786,58 @@ class TestPreRestoreBackupVerification:
 
     def test_prepare_fails_on_corrupt_pre_restore_backup(self, tmp_path,
                                                           monkeypatch):
-        """When pre-restore verification fails, ok=False and no request file."""
+        """When the pre-restore backup created by the real
+        ``prepare_restore()`` is corrupt, the method returns ok=False
+        and no request file exists.
+
+        Only ``BackupService.create_backup`` is monkeypatched — the
+        real ``RestoreService.prepare_restore()`` is exercised.
+        """
+        import hashlib
+
         active = tmp_path / "active.db"
         _make_db(active, {"products": [("5200000000017", "Ενεργό", 42)]})
         backup_dir = tmp_path / "backups"
         backup_dir.mkdir()
         backup_svc = BackupService(backup_dir=str(backup_dir))
 
-        # Create a valid backup to use as the selected backup
+        # ── selected backup (valid — created before any patching) ──
         old_db = tmp_path / "old.db"
         _make_db(old_db, {"products": [("5200000000017", "Παλαιό", 1)]})
         bu = backup_svc.create_backup(str(old_db))
         assert bu.ok
 
-        # Create a valid backup then corrupt it on disk — it will serve
-        # as the pre-restore backup that fails verification.
+        # ── pre-restore backup: create, then corrupt on disk ────────
         pre_bu = backup_svc.create_backup(str(active))
         assert pre_bu.ok
         corrupt_path = Path(pre_bu.backup_path)
+        corrupt_path_str = str(corrupt_path)
+
+        # Hash the active DB *before* corrupting anything
+        hash_before = hashlib.sha256(active.read_bytes()).hexdigest()
+        active_resolved = str(active.resolve())
+
+        # ── monkeypatch ONLY BackupService.create_backup ────────────
+        original_create = BackupService.create_backup
+
+        def _fake_create_backup(self, source_path):
+            if Path(source_path).resolve() == Path(active_resolved):
+                # Return a "successful" result pointing to the
+                # already-corrupted file.
+                return BackupResult(
+                    ok=True,
+                    backup_path=corrupt_path_str,
+                    sha256="dummy",
+                )
+            return original_create(self, source_path)
+
+        monkeypatch.setattr(BackupService, "create_backup",
+                            _fake_create_backup)
+
+        # NOW corrupt the file on disk (after the fake is in place)
         corrupt_path.write_bytes(corrupt_path.read_bytes()[:16])
 
-        # Now monkeypatch RestoreService.prepare_restore so its step 2
-        # (create_backup) returns this pre-corrupted path, bypassing
-        # the real create_backup call.
-        import infrastructure.restore_service as rs_mod
-        from infrastructure.backup_service import BackupResult
-
-        def _fake_prepare(self, selected_backup, active_db_path,
-                          backup_dir, parent_pid):
-            # Use the original logic but intercept after create_backup
-            # to use our corrupted file.
-            selected = Path(selected_backup).resolve()
-            active = Path(active_db_path).resolve()
-            bk_dir = Path(backup_dir).resolve()
-
-            from infrastructure.backup_service import BackupService as BS
-            bs = BS(backup_dir=str(bk_dir))
-            verification = bs.verify_backup(str(selected))
-            if not verification.ok:
-                return RestorePreparation(
-                    ok=False,
-                    selected_backup_path=str(selected),
-                    active_db_path=str(active),
-                    error_message="verify fail",
-                )
-            # Return our corrupted file as the "pre-restore backup"
-            import json, tempfile, uuid, os
-            from datetime import datetime
-            pre_restore_result = BackupResult(
-                ok=True, backup_path=str(corrupt_path),
-                sha256="dummy")
-            pre_restore_path = corrupt_path
-
-            # Verify pre-restore before writing request
-            pre_verify = bs.verify_backup(str(pre_restore_path))
-            if not pre_verify.ok:
-                from infrastructure.restore_service import _remove_if_exists
-                _remove_if_exists(pre_restore_path)
-                return RestorePreparation(
-                    ok=False,
-                    selected_backup_path=str(selected),
-                    active_db_path=str(active),
-                    error_message=(
-                        "Το αντίγραφο ασφαλείας πριν την επαναφορά "
-                        "απέτυχε στην επαλήθευση και η επαναφορά "
-                        "ακυρώθηκε."
-                    ),
-                )
-            # Should not reach here
-            return RestorePreparation(ok=False, error_message="unexpected")
-
-        monkeypatch.setattr(RestoreService, "prepare_restore", _fake_prepare)
-
+        # ── call the REAL RestoreService.prepare_restore ────────────
         svc = RestoreService()
         prep = svc.prepare_restore(
             selected_backup=bu.backup_path,
@@ -821,8 +848,17 @@ class TestPreRestoreBackupVerification:
         assert not prep.ok
         assert "απέτυχε" in prep.error_message
         assert "ακυρώθηκε" in prep.error_message
-        # No request file was left behind
         assert prep.request_path == ""
+
+        # No request file was left behind
+        request_files = list(backup_dir.glob("*_restore_request.json"))
+        assert len(request_files) == 0, \
+            "No restore request file must exist when preparation fails"
+
+        # Active DB unchanged
+        hash_after = hashlib.sha256(active.read_bytes()).hexdigest()
+        assert hash_before == hash_after, \
+            "Active DB must be unchanged when pre-restore verification fails"
 
     def test_helper_blocks_on_corrupt_pre_restore_backup(self, tmp_path):
         """A corrupt pre-restore backup must block the helper and
