@@ -334,6 +334,17 @@ class MainWindow(QMainWindow):
         self._status_lbl.setText(
             f"{PAGE_TITLES.get(key, key)}  —  Έτοιμο")
 
+    def open_inventory_with_barcode(self, barcode: str) -> None:
+        """Navigate to Inventory and focus the given barcode for inspection.
+
+        Uses a narrow public API — does not access another page's private
+        widgets directly.
+        """
+        self.navigate_to("inventory")
+        inv = self._pages.get("inventory")
+        if inv is not None and hasattr(inv, "focus_barcode"):
+            inv.focus_barcode(barcode)
+
     def _ensure_page(self, key: str) -> QWidget:
         """Return the page widget, creating it on first access."""
         if key in self._pages:

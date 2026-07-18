@@ -744,6 +744,17 @@ class InventoryPage(BasePage):
         self._adj_worker = None
         self._adj_thread = None
 
+    # ── Public API for cross-page navigation ──────────────────────────
+    def focus_barcode(self, barcode: str) -> None:
+        """Set the search field to *barcode* and trigger a refresh.
+
+        This is the narrow public entry point used by MainWindow when
+        another page requests \"open in Inventory\".
+        """
+        self._search_entry.setText(barcode)
+        self._page = 1
+        self.refresh()
+
     # ── Refresh ──────────────────────────────────────────────────────
     def refresh(self):
         self._debounce_timer.stop()
