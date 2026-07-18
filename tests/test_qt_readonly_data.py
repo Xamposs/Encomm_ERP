@@ -558,6 +558,99 @@ class TestSupplierReorderCandidates:
 
     # ── read-only safety ──────────────────────────────────────────────
 
+    # ── legacy / partial supplier schema ─────────────────────────────
+
+    def test_suppliers_table_missing_id_column(self, tmp_path):
+        """suppliers table with no 'id' column → all orphaned, no crash."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE ProductMaster (
+                Barcode TEXT, Name TEXT, Stock INT,
+                ExpiryDate TEXT, Price REAL, supplier_id INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE suppliers (name TEXT)
+        """)
+        conn.execute("INSERT INTO suppliers (name) VALUES ('Ghost')")
+        conn.execute("INSERT INTO ProductMaster VALUES ('A','Alpha',3,'2027-01-01',5.0,1)")
+        conn.commit()
+        conn.close()
+        r = self._load(db_path=db, threshold=10)
+        assert r.ok, r.error_message
+        assert len(r.groups) == 0
+        assert len(r.unassigned) == 1
+        assert r.unassigned[0].barcode == "A"
+        assert r.unassigned[0].reason == "Ο προμηθευτής δεν υπάρχει"
+
+    def test_suppliers_table_missing_name_column(self, tmp_path):
+        """suppliers table with no 'name' column → all orphaned, no crash."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE ProductMaster (
+                Barcode TEXT, Name TEXT, Stock INT,
+                ExpiryDate TEXT, Price REAL, supplier_id INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE suppliers (id INTEGER PRIMARY KEY)
+        """)
+        conn.execute("INSERT INTO suppliers (id) VALUES (1)")
+        conn.execute("INSERT INTO ProductMaster VALUES ('B','Beta',2,'2027-02-01',10.0,1)")
+        conn.commit()
+        conn.close()
+        r = self._load(db_path=db, threshold=10)
+        assert r.ok, r.error_message
+        assert len(r.groups) == 0
+        assert len(r.unassigned) == 1
+        assert r.unassigned[0].barcode == "B"
+        assert r.unassigned[0].reason == "Ο προμηθευτής δεν υπάρχει"
+
+    def test_suppliers_table_missing_both_id_and_name(self, tmp_path):
+        """suppliers table with neither id nor name → all orphaned, no crash."""
+        db = str(tmp_path / "t.db")
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE ProductMaster (
+                Barcode TEXT, Name TEXT, Stock INT,
+                ExpiryDate TEXT, Price REAL, supplier_id INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE suppliers (phone TEXT)
+        """)
+        conn.execute("INSERT INTO suppliers (phone) VALUES ('2105551000')")
+        conn.execute("INSERT INTO ProductMaster VALUES ('C','Gamma',4,'2027-03-01',15.0,1)")
+        conn.commit()
+        conn.close()
+        r = self._load(db_path=db, threshold=10)
+        assert r.ok, r.error_message
+        assert len(r.groups) == 0
+        assert len(r.unassigned) == 1
+        assert r.unassigned[0].barcode == "C"
+        assert r.unassigned[0].reason == "Ο προμηθευτής δεν υπάρχει"
+
+    def test_full_schema_grouping_still_works(self, tmp_path):
+        """Valid suppliers table with id+name → grouping still functions."""
+        db = str(tmp_path / "t.db")
+        _make_reorder_db(db, [
+            ("A", "Alpha", 3, "2027-06-01", 10.0, 1),
+            ("B", "Beta",  5, "2027-08-01", 20.0, 2),
+        ], suppliers=[(1, "Φάρμακο ΑΕ"), (2, "MediCorp")])
+        r = self._load(db_path=db, threshold=10)
+        assert r.ok, r.error_message
+        assert len(r.groups) == 2
+        assert r.groups[0].supplier_name == "MediCorp"
+        assert r.groups[0].supplier_id == 2
+        assert r.groups[1].supplier_name == "Φάρμακο ΑΕ"
+        assert r.groups[1].supplier_id == 1
+        assert len(r.unassigned) == 0
+
     def test_no_write_sql(self):
         """load_supplier_reorder_candidates contains no DML/DDL."""
         import inspect, os

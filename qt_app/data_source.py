@@ -1819,20 +1819,27 @@ def load_supplier_reorder_candidates(
         cur = conn.cursor()
 
         # ── Schema detection ──────────────────────────────────────────
-        has_suppliers = _has_table(cur, "suppliers")
-        has_supplier_id = _has_column(cur, "ProductMaster", "supplier_id")
+        has_supplier_id_on_pm = _has_column(cur, "ProductMaster", "supplier_id")
+
+        # Usable suppliers table = exists AND has both id + name columns
+        has_suppliers_table = _has_table(cur, "suppliers")
+        has_usable_suppliers = (
+            has_suppliers_table
+            and _has_column(cur, "suppliers", "id")
+            and _has_column(cur, "suppliers", "name")
+        )
 
         # ── Build the dynamic SELECT + JOIN ───────────────────────────
-        if has_supplier_id:
+        if has_supplier_id_on_pm:
             sid_col = "p.supplier_id"
         else:
             sid_col = "NULL"
 
-        if has_suppliers and has_supplier_id:
+        if has_usable_suppliers and has_supplier_id_on_pm:
             supplier_join = "LEFT JOIN suppliers s ON p.supplier_id = s.id"
             supplier_name_col = "COALESCE(s.name, NULL) AS supplier_name"
-        elif has_supplier_id:
-            # suppliers table missing but supplier_id column exists
+        elif has_supplier_id_on_pm:
+            # suppliers table missing or incomplete — can't join
             supplier_join = ""
             supplier_name_col = "NULL AS supplier_name"
         else:
