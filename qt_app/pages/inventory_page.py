@@ -26,6 +26,10 @@ from infrastructure.inventory_command_service import (
     CreateProductRequest, UpdateProductRequest, ProductSnapshot,
     CommandResult, create_product, update_product,
 )
+from infrastructure.stock_adjustment_service import (
+    StockAdjustmentRequest, StockAdjustmentResult,
+    REASON_CHOICES, adjust_stock,
+)
 
 
 # ── Filters ────────────────────────────────────────────────────────────
@@ -165,6 +169,125 @@ class ProductDialog(QDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Stock Adjustment dialog — φαρμακοποιός καταμέτρηση
+# ═══════════════════════════════════════════════════════════════════════
+
+class StockAdjustmentDialog(QDialog):
+    """Compact modal dialog for pharmacist-operated stock adjustment."""
+
+    def __init__(self, barcode: str, name: str, current_stock: int,
+                 parent=None):
+        super().__init__(parent)
+        self._barcode = barcode
+        self._current_stock = current_stock
+        self.setWindowTitle("⚖️ Διόρθωση Αποθέματος")
+        self.setMinimumWidth(440)
+
+        lay = QFormLayout(self)
+        lay.setSpacing(10)
+
+        # Read-only product info
+        barcode_lbl = QLabel(barcode)
+        barcode_lbl.setStyleSheet(
+            f"color: {styles.TEXT_PRIMARY}; font-weight: bold;")
+        lay.addRow("Barcode:", barcode_lbl)
+
+        name_lbl = QLabel(name)
+        name_lbl.setWordWrap(True)
+        name_lbl.setStyleSheet(f"color: {styles.TEXT_PRIMARY};")
+        lay.addRow("Προϊόν:", name_lbl)
+
+        stock_lbl = QLabel(str(current_stock))
+        stock_lbl.setStyleSheet(
+            f"color: {styles.TEXT_PRIMARY}; font-weight: bold;")
+        lay.addRow("Καταγεγραμμένο απόθεμα:", stock_lbl)
+
+        # Counted stock input
+        self._counted_spin = QSpinBox()
+        self._counted_spin.setRange(0, 999999)
+        self._counted_spin.setValue(current_stock)
+        self._counted_spin.valueChanged.connect(self._update_diff)
+        lay.addRow("Καταμετρημένο απόθεμα:", self._counted_spin)
+
+        # Live difference preview
+        self._diff_lbl = QLabel("(0)")
+        self._diff_lbl.setStyleSheet(
+            f"color: {styles.TEXT_MUTED}; font-size: 13px;")
+        lay.addRow("Διαφορά:", self._diff_lbl)
+
+        # Reason selector
+        self._reason_combo = QComboBox()
+        for r in REASON_CHOICES:
+            self._reason_combo.addItem(r)
+        self._reason_combo.currentTextChanged.connect(self._on_reason_changed)
+        lay.addRow("Αιτία:", self._reason_combo)
+
+        # Free-text explanation (only for "Άλλη αιτία")
+        self._other_edit = QLineEdit()
+        self._other_edit.setPlaceholderText("Περιγράψτε την αιτία...")
+        self._other_edit.setVisible(False)
+        lay.addRow("", self._other_edit)  # empty label row
+
+        # Buttons
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_btn = btns.button(QDialogButtonBox.Ok)
+        ok_btn.setText("✔  Διόρθωση")
+        ok_btn.setEnabled(True)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        lay.addRow(btns)
+
+        self._update_diff()
+
+    def _update_diff(self):
+        diff = self._counted_spin.value() - self._current_stock
+        sign = "+" if diff >= 0 else ""
+        color = styles.GREEN if diff >= 0 else styles.RED
+        self._diff_lbl.setText(f"{sign}{diff}")
+        self._diff_lbl.setStyleSheet(
+            f"color: {color}; font-size: 14px; font-weight: bold;")
+
+    def _on_reason_changed(self, text: str):
+        self._other_edit.setVisible(text == "Άλλη αιτία")
+        self._other_edit.clear()
+
+    def _on_accept(self):
+        if self._reason_combo.currentText() == "Άλλη αιτία":
+            if not self._other_edit.text().strip():
+                QMessageBox.warning(
+                    self, "Σφάλμα",
+                    "Πρέπει να περιγράψετε την αιτία για 'Άλλη αιτία'.")
+                return
+        self.accept()
+
+    def result(self) -> dict:
+        reason = self._reason_combo.currentText()
+        if reason == "Άλλη αιτία":
+            reason = f"Άλλη αιτία: {self._other_edit.text().strip()}"
+        return {
+            "barcode": self._barcode,
+            "expected_stock": self._current_stock,
+            "counted_stock": self._counted_spin.value(),
+            "reason": reason,
+        }
+
+
+# ── Adjustment worker ──────────────────────────────────────────────────
+class _AdjustWorker(QObject):
+    finished = Signal(StockAdjustmentResult)
+
+    def __init__(self, db_path: str, req: StockAdjustmentRequest,
+                 parent=None):
+        super().__init__(parent)
+        self._db_path = db_path
+        self._req = req
+
+    def run(self):
+        self.finished.emit(adjust_stock(self._db_path, self._req))
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Inventory page
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -197,6 +320,9 @@ class InventoryPage(BasePage):
         self._write_thread = None
         self._write_loading = False
         self._preview_dlg = None
+        self._adj_worker = None
+        self._adj_thread = None
+        self._adj_loading = False
         super().__init__(db_service, config, parent)
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
@@ -247,6 +373,12 @@ class InventoryPage(BasePage):
         self._preview_btn.setStyleSheet(self._accent_btn_qss())
         self._preview_btn.clicked.connect(self._on_preview_xlsx)
         act_row.addWidget(self._preview_btn)
+        self._adj_btn = QPushButton("⚖️  Διόρθωση Αποθέματος")
+        self._adj_btn.setCursor(Qt.PointingHandCursor)
+        self._adj_btn.setStyleSheet(self._accent_btn_qss())
+        self._adj_btn.setEnabled(False)
+        self._adj_btn.clicked.connect(self._on_adjust_stock)
+        act_row.addWidget(self._adj_btn)
         act_row.addStretch()
         self.root_layout.addLayout(act_row)
 
@@ -324,7 +456,13 @@ class InventoryPage(BasePage):
         self._do_refresh()
 
     def _on_selection_changed(self):
-        self._edit_btn.setEnabled(len(self._table.selectedItems()) > 0)
+        has_selection = len(self._table.selectedItems()) > 0
+        self._edit_btn.setEnabled(has_selection)
+        # Adjust button needs exactly one row selected
+        rows = set()
+        for item in self._table.selectedItems():
+            rows.add(item.row())
+        self._adj_btn.setEnabled(len(rows) == 1)
 
     def _on_double_click(self, row, col):
         self._edit_row(row)
@@ -494,6 +632,107 @@ class InventoryPage(BasePage):
             if dash and hasattr(dash, "refresh"):
                 dash.refresh()
 
+    # ── Stock adjustment ─────────────────────────────────────────────
+    def _on_adjust_stock(self):
+        """Open the adjustment dialog for the selected product row."""
+        rows = set()
+        for item in self._table.selectedItems():
+            rows.add(item.row())
+        if len(rows) != 1:
+            return
+        row = list(rows)[0]
+        barcode = self._table.item(row, 0).text()
+        name = self._table.item(row, 1).text()
+        current_stock = int(self._table.item(row, 2).text())
+
+        dlg = StockAdjustmentDialog(barcode, name, current_stock,
+                                    parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        data = dlg.result()
+
+        # Confirmation message
+        diff = data["counted_stock"] - data["expected_stock"]
+        sign = "+" if diff >= 0 else ""
+        confirm_text = (
+            f"Προϊόν: {name}\n"
+            f"Barcode: {barcode}\n\n"
+            f"Καταγεγραμμένο απόθεμα: {data['expected_stock']}\n"
+            f"Νέο απόθεμα: {data['counted_stock']}\n"
+            f"Διαφορά: {sign}{diff}\n\n"
+            f"Αιτία: {data['reason']}\n\n"
+            f"Είστε βέβαιοι για τη διόρθωση;"
+        )
+        btn = QMessageBox.question(
+            self, "Επιβεβαίωση Διόρθωσης Αποθέματος",
+            confirm_text,
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if btn != QMessageBox.Yes:
+            return
+
+        self._run_adjustment(data)
+
+    def _run_adjustment(self, data: dict):
+        if self._adj_loading or self._write_loading:
+            return
+        self._adj_loading = True
+        self._create_btn.setEnabled(False)
+        self._edit_btn.setEnabled(False)
+        self._adj_btn.setEnabled(False)
+        self._refresh_btn.setEnabled(False)
+        self._preview_btn.setEnabled(False)
+
+        req = StockAdjustmentRequest(
+            barcode=data["barcode"],
+            expected_current_stock=data["expected_stock"],
+            counted_stock=data["counted_stock"],
+            reason=data["reason"],
+        )
+        self._cleanup_adjustment_worker()
+
+        self._adj_thread = QThread(self)
+        self._adj_worker = _AdjustWorker(self._db_path, req)
+        self._adj_worker.moveToThread(self._adj_thread)
+        self._adj_thread.started.connect(self._adj_worker.run)
+        self._adj_worker.finished.connect(self._on_adjust_done)
+        self._adj_worker.finished.connect(self._adj_thread.quit)
+        self._adj_thread.finished.connect(self._adj_worker.deleteLater)
+        self._adj_thread.finished.connect(self._adj_thread.deleteLater)
+        self._adj_thread.finished.connect(self._on_adjust_thread_done)
+        self._adj_thread.start()
+
+    def _on_adjust_done(self, result: StockAdjustmentResult):
+        if self._close_pending:
+            return
+        if result.ok:
+            QMessageBox.information(self, "Επιτυχία", result.message)
+            self.refresh()
+            self._refresh_dashboard()
+        else:
+            QMessageBox.warning(self, "Σφάλμα", result.message)
+
+    def _on_adjust_thread_done(self):
+        self._adj_loading = False
+        self._adj_worker = None
+        self._adj_thread = None
+        if self._close_pending:
+            self._maybe_finish_shutdown()
+            return
+        self._create_btn.setEnabled(True)
+        self._edit_btn.setEnabled(True)
+        self._preview_btn.setEnabled(True)
+        self._refresh_btn.setEnabled(True)
+        # Re-check selection to re-gate adjust button
+        self._on_selection_changed()
+
+    def _cleanup_adjustment_worker(self):
+        if self._adj_thread and self._adj_thread.isRunning():
+            self._adj_thread.quit()
+            self._adj_thread.wait(2000)
+        self._adj_worker = None
+        self._adj_thread = None
+
     # ── Refresh ──────────────────────────────────────────────────────
     def refresh(self):
         self._debounce_timer.stop()
@@ -595,9 +834,10 @@ class InventoryPage(BasePage):
             return
         read_running = self._thread is not None and self._thread.isRunning()
         write_running = self._write_thread is not None and self._write_thread.isRunning()
+        adjust_running = self._adj_thread is not None and self._adj_thread.isRunning()
         preview_busy = (self._preview_dlg is not None
                         and self._preview_dlg.is_busy())
-        if not read_running and not write_running and not preview_busy:
+        if not read_running and not write_running and not adjust_running and not preview_busy:
             self._close_pending = False
             self.shutdown_ready.emit()
 
@@ -629,6 +869,21 @@ class InventoryPage(BasePage):
             self._preview_dlg = None
 
         all_stopped = True
+
+        # Attempt adjust worker shutdown
+        if self._adj_thread and self._adj_thread.isRunning():
+            try:
+                self._adj_worker.finished.disconnect(self._on_adjust_done)
+            except (RuntimeError, TypeError):
+                pass
+            self._close_pending = True
+            self._adj_thread.quit()
+            if self._adj_thread.wait(2000):
+                self._adj_worker = None
+                self._adj_thread = None
+                self._adj_loading = False
+            else:
+                all_stopped = False
 
         # Attempt write worker shutdown
         if self._write_thread and self._write_thread.isRunning():
