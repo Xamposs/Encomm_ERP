@@ -373,6 +373,11 @@ def _replace_active_database(active: Path, temp_restored: Path) -> None:
         _remove_if_exists(Path(str(active) + "-wal"))
         _remove_if_exists(Path(str(active) + "-shm"))
 
+        # The temp file that was renamed into place may have left WAL/SHM
+        # companions at its original path — clean those too.
+        _remove_if_exists(Path(str(temp_restored) + "-wal"))
+        _remove_if_exists(Path(str(temp_restored) + "-shm"))
+
         # Clean up the aside DB (we have the pre-restore backup for safety)
         _remove_if_exists(aside_path)
         for _, aside_c in companions_moved:
