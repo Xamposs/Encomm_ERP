@@ -1731,3 +1731,198 @@ def load_daily_alerts(
     finally:
         if conn:
             conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Supplier Reorder Candidates — read-only data foundation (P3.1)
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class ReorderCandidate:
+    """Single low-stock product row (immutable snapshot)."""
+    barcode: str
+    name: str
+    stock: int
+    threshold: int
+    expiry_date: str
+    price: float
+
+
+@dataclass(frozen=True)
+class SupplierReorderGroup:
+    """One supplier and its low-stock products, deterministically ordered."""
+    supplier_id: int
+    supplier_name: str
+    products: Tuple[ReorderCandidate, ...]
+
+
+@dataclass(frozen=True)
+class UnassignedReorderProduct:
+    """Low-stock product without a valid supplier assignment.
+
+    ``reason`` is a Greek label explaining why it is unassigned
+    (e.g. 'Χωρίς προμηθευτή' or 'Ο προμηθευτής δεν υπάρχει').
+    """
+    barcode: str
+    name: str
+    stock: int
+    threshold: int
+    expiry_date: str
+    price: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class SupplierReorderResult:
+    """Carries either a successful snapshot or a Greek error message."""
+    ok: bool
+    groups: Tuple[SupplierReorderGroup, ...] = ()
+    unassigned: Tuple[UnassignedReorderProduct, ...] = ()
+    error_message: str = ""
+
+    @classmethod
+    def success(
+        cls,
+        groups: Tuple[SupplierReorderGroup, ...],
+        unassigned: Tuple[UnassignedReorderProduct, ...],
+    ) -> "SupplierReorderResult":
+        return cls(ok=True, groups=groups, unassigned=unassigned)
+
+    @classmethod
+    def failure(cls, message: str) -> "SupplierReorderResult":
+        return cls(ok=False, error_message=message)
+
+
+def load_supplier_reorder_candidates(
+    db_path: str,
+    threshold: int = 10,
+) -> SupplierReorderResult:
+    """Identify low-stock products grouped by supplier for reorder review.
+
+    Opens **one** read-only (``mode=ro``) connection.  NO writes,
+    NO schema changes, NO reorder-quantity calculation.
+
+    Returns
+    -------
+    SupplierReorderResult
+        - ``.groups`` — one entry per supplier with at least one
+          low-stock product; suppliers sorted by name, products within
+          each group sorted by name then barcode.
+        - ``.unassigned`` — low-stock products that cannot be assigned
+          to a supplier (missing ``supplier_id``, missing ``suppliers``
+          table, or supplier FK pointing to a non-existent row).  Each
+          carries a Greek ``reason`` label.
+    """
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        cur = conn.cursor()
+
+        # ── Schema detection ──────────────────────────────────────────
+        has_suppliers = _has_table(cur, "suppliers")
+        has_supplier_id = _has_column(cur, "ProductMaster", "supplier_id")
+
+        # ── Build the dynamic SELECT + JOIN ───────────────────────────
+        if has_supplier_id:
+            sid_col = "p.supplier_id"
+        else:
+            sid_col = "NULL"
+
+        if has_suppliers and has_supplier_id:
+            supplier_join = "LEFT JOIN suppliers s ON p.supplier_id = s.id"
+            supplier_name_col = "COALESCE(s.name, NULL) AS supplier_name"
+        elif has_supplier_id:
+            # suppliers table missing but supplier_id column exists
+            supplier_join = ""
+            supplier_name_col = "NULL AS supplier_name"
+        else:
+            # no supplier_id column at all
+            supplier_join = ""
+            supplier_name_col = "NULL AS supplier_name"
+
+        # ── Fetch low-stock products ──────────────────────────────────
+        sql = f"""
+            SELECT p.Barcode, p.Name, p.Stock,
+                   COALESCE(NULLIF(p.ExpiryDate, ''), '—') AS ExpiryDate,
+                   p.Price,
+                   {sid_col} AS supplier_id,
+                   {supplier_name_col}
+            FROM ProductMaster p
+            {supplier_join}
+            WHERE p.Stock <= ?
+            ORDER BY p.Name ASC, p.Barcode ASC
+        """
+        cur.execute(sql, (threshold,))
+        rows = cur.fetchall()
+
+        # ── Partition into groups and unassigned ──────────────────────
+        by_supplier: dict[tuple, list[ReorderCandidate]] = {}
+        unassigned: list[UnassignedReorderProduct] = []
+
+        for row in rows:
+            barcode = row["Barcode"]
+            name = row["Name"]
+            stock = row["Stock"]
+            exp = row["ExpiryDate"]
+            price = float(row["Price"])
+            sid = row["supplier_id"]
+            sname = row["supplier_name"]
+
+            # Determine assignment
+            if sid is None:
+                # No supplier_id column or NULL supplier_id value
+                unassigned.append(UnassignedReorderProduct(
+                    barcode=barcode, name=name, stock=stock,
+                    threshold=threshold, expiry_date=exp, price=price,
+                    reason="Χωρίς προμηθευτή",
+                ))
+            elif sname is None:
+                # supplier_id set but no matching row in suppliers table
+                unassigned.append(UnassignedReorderProduct(
+                    barcode=barcode, name=name, stock=stock,
+                    threshold=threshold, expiry_date=exp, price=price,
+                    reason="Ο προμηθευτής δεν υπάρχει",
+                ))
+            else:
+                key = (sid, sname)
+                by_supplier.setdefault(key, []).append(ReorderCandidate(
+                    barcode=barcode, name=name, stock=stock,
+                    threshold=threshold, expiry_date=exp, price=price,
+                ))
+
+        # ── Build deterministic groups (suppliers by name, id as tie-break) ──
+        sorted_keys = sorted(by_supplier.keys(), key=lambda k: (k[1], k[0]))
+        groups = tuple(
+            SupplierReorderGroup(
+                supplier_id=sid,
+                supplier_name=sname,
+                products=tuple(prods),
+            )
+            for sid, sname in sorted_keys
+            for prods in [by_supplier[(sid, sname)]]
+        )
+
+        return SupplierReorderResult.success(groups, tuple(unassigned))
+
+    except FileNotFoundError:
+        return SupplierReorderResult.failure(
+            "Αδυναμία φόρτωσης υποψηφίων αναπαραγγελίας: "
+            f"το αρχείο βάσης δεν βρέθηκε ({db_path})")
+    except sqlite3.OperationalError as e:
+        msg = str(e)
+        if "unable to open" in msg.lower() or "no such" in msg.lower():
+            return SupplierReorderResult.failure(
+                "Αδυναμία φόρτωσης υποψηφίων αναπαραγγελίας: "
+                f"αδυναμία ανοίγματος της βάσης ({db_path})")
+        return SupplierReorderResult.failure(
+            f"Αδυναμία φόρτωσης υποψηφίων αναπαραγγελίας: σφάλμα SQLite — {msg}")
+    except sqlite3.DatabaseError as e:
+        return SupplierReorderResult.failure(
+            "Αδυναμία φόρτωσης υποψηφίων αναπαραγγελίας: "
+            f"σφάλμα βάσης — {e}")
+    except Exception as e:
+        return SupplierReorderResult.failure(
+            f"Αδυναμία φόρτωσης υποψηφίων αναπαραγγελίας: {e}")
+    finally:
+        if conn:
+            conn.close()
