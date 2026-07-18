@@ -1466,3 +1466,263 @@ def _isfinite(val) -> bool:
         return isfinite(float(val))
     except (TypeError, ValueError):
         return False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Daily Alerts — read-only typed contract for future Action Center
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class AlertItem:
+    """Single daily alert row (immutable snapshot)."""
+    barcode: str
+    name: str
+    stock: int
+    expiry_date: str          # "—" when blank
+    price: float
+    reasons: Tuple[str, ...]  # Greek labels — may be empty only on error
+
+
+@dataclass(frozen=True)
+class DailyAlertsSnapshot:
+    """Immutable page of daily alerts."""
+    low_stock_count: int
+    expiring_soon_count: int
+    expired_count: int
+    total_alerts: int
+    page: int
+    page_size: int
+    items: Tuple[AlertItem, ...]
+
+
+@dataclass(frozen=True)
+class DailyAlertsResult:
+    """Carries either a successful snapshot or a Greek error message."""
+    ok: bool
+    snapshot: DailyAlertsSnapshot | None = None
+    error_message: str = ""
+
+    @classmethod
+    def success(cls, snapshot: DailyAlertsSnapshot) -> "DailyAlertsResult":
+        return cls(ok=True, snapshot=snapshot)
+
+    @classmethod
+    def failure(cls, message: str) -> "DailyAlertsResult":
+        return cls(ok=False, error_message=message)
+
+
+# ── Alert reason builder ─────────────────────────────────────────────────
+
+def _build_alert_reasons(
+    is_expired: int,
+    is_near_expiry: int,
+    stock: int,
+    threshold: int,
+    expiry_date: str,
+) -> Tuple[str, ...]:
+    """Pure-Python — NO SQLite calls.  Produces Greek reason labels."""
+    reasons: List[str] = []
+    if is_expired:
+        reasons.append("Ληγμένο")
+    elif is_near_expiry:
+        reasons.append(f"Λήγει σύντομα ({expiry_date})")
+    if stock <= threshold:
+        reasons.append("Χαμηλό απόθεμα")
+    if not reasons:
+        reasons.append("—")
+    return tuple(reasons)
+
+
+# ── Public query entry point ─────────────────────────────────────────────
+
+def load_daily_alerts(
+    db_path: str,
+    alert_filter: str = "all",
+    threshold: int = 10,
+    alert_days: int = 30,
+    page: int = 1,
+    page_size: int = 50,
+) -> DailyAlertsResult:
+    """Return a paginated, filtered view of products needing attention.
+
+    Filters: ``all``, ``expired``, ``expiring_soon``, ``low_stock``.
+
+    Ordering (deterministic): expired first, then expiring soon,
+    then low-stock-only; within each tier: expiry_date ASC, name ASC.
+
+    Blank/empty expiry dates never count as expiry alerts.
+    """
+    valid_filters = frozenset({"all", "expired", "expiring_soon", "low_stock"})
+    if alert_filter not in valid_filters:
+        return DailyAlertsResult.failure(
+            f"Μη έγκυρο φίλτρο ειδοποιήσεων: '{alert_filter}'. "
+            f"Έγκυρα: {', '.join(sorted(valid_filters))}")
+
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+
+    conn = None
+    try:
+        conn = _connect_ro(db_path)
+        cur = conn.cursor()
+
+        # ── Computed severity ──────────────────────────────────────────
+        # 1 = expired (may also be low stock)
+        # 2 = expiring soon (may also be low stock)
+        # 3 = low stock only (not expired, not near-expiry)
+        severity_sql = (
+            "CASE "
+            "  WHEN p.ExpiryDate != '' AND date(p.ExpiryDate) < date('now') "
+            "    THEN 1 "
+            "  WHEN p.ExpiryDate != '' "
+            "       AND date(p.ExpiryDate) >= date('now') "
+            "       AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days') "
+            "    THEN 2 "
+            "  WHEN p.Stock <= ? THEN 3 "
+            "END"
+        )
+
+        is_expired_sql = (
+            "CASE WHEN p.ExpiryDate != '' "
+            "     AND date(p.ExpiryDate) < date('now') "
+            "THEN 1 ELSE 0 END"
+        )
+        is_near_sql = (
+            "CASE WHEN p.ExpiryDate != '' "
+            "     AND date(p.ExpiryDate) >= date('now') "
+            "     AND date(p.ExpiryDate) <= "
+            "         date('now', '+' || ? || ' days') "
+            "THEN 1 ELSE 0 END"
+        )
+        is_low_sql = "CASE WHEN p.Stock <= ? THEN 1 ELSE 0 END"
+
+        # ── Filter clause ───────────────────────────────────────────────
+        filter_clause: str
+        filter_parms: list
+        if alert_filter == "all":
+            filter_clause = (
+                "(p.ExpiryDate != '' AND date(p.ExpiryDate) < date('now')) "
+                "OR (p.ExpiryDate != '' "
+                "    AND date(p.ExpiryDate) >= date('now') "
+                "    AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')) "
+                "OR (p.Stock <= ?)"
+            )
+            filter_parms = [alert_days, threshold]
+        elif alert_filter == "expired":
+            filter_clause = (
+                "p.ExpiryDate != '' AND date(p.ExpiryDate) < date('now')"
+            )
+            filter_parms = []
+        elif alert_filter == "expiring_soon":
+            filter_clause = (
+                "p.ExpiryDate != '' "
+                "AND date(p.ExpiryDate) >= date('now') "
+                "AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')"
+            )
+            filter_parms = [alert_days]
+        else:  # low_stock
+            filter_clause = "p.Stock <= ?"
+            filter_parms = [threshold]
+
+        # ── Counts (three separate queries for distinct tallies) ────────
+        low_cnt = cur.execute(
+            "SELECT COUNT(*) FROM ProductMaster p WHERE p.Stock <= ?",
+            (threshold,),
+        ).fetchone()[0]
+
+        near_cnt = cur.execute(
+            "SELECT COUNT(*) FROM ProductMaster p "
+            "WHERE p.ExpiryDate != '' "
+            "AND date(p.ExpiryDate) >= date('now') "
+            "AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')",
+            (alert_days,),
+        ).fetchone()[0]
+
+        expired_cnt = cur.execute(
+            "SELECT COUNT(*) FROM ProductMaster p "
+            "WHERE p.ExpiryDate != '' "
+            "AND date(p.ExpiryDate) < date('now')",
+        ).fetchone()[0]
+
+        # ── Filtered total ──────────────────────────────────────────────
+        total = cur.execute(
+            f"SELECT COUNT(*) FROM ProductMaster p WHERE {filter_clause}",
+            filter_parms,
+        ).fetchone()[0]
+
+        if total == 0:
+            page = 1
+        else:
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(page, total_pages))
+        offset = (page - 1) * page_size
+
+        # ── Paginated items ─────────────────────────────────────────────
+        cur.execute(
+            f"""
+            SELECT p.Barcode, p.Name, p.Stock,
+                   COALESCE(NULLIF(p.ExpiryDate, ''), '—') AS ExpiryDate,
+                   p.Price,
+                   ({is_expired_sql}) AS is_expired,
+                   ({is_near_sql})  AS is_near_expiry,
+                   ({is_low_sql})   AS is_low_stock,
+                   ({severity_sql}) AS severity
+            FROM ProductMaster p
+            WHERE {filter_clause}
+            ORDER BY severity ASC, p.ExpiryDate ASC, p.Name ASC
+            LIMIT ? OFFSET ?
+            """,
+            [alert_days, threshold, alert_days, threshold]
+            + filter_parms + [page_size, offset],
+        )
+
+        items: List[AlertItem] = []
+        for row in cur.fetchall():
+            reasons = _build_alert_reasons(
+                is_expired=row["is_expired"],
+                is_near_expiry=row["is_near_expiry"],
+                stock=row["Stock"],
+                threshold=threshold,
+                expiry_date=row["ExpiryDate"],
+            )
+            items.append(AlertItem(
+                barcode=row["Barcode"],
+                name=row["Name"],
+                stock=row["Stock"],
+                expiry_date=row["ExpiryDate"],
+                price=row["Price"],
+                reasons=reasons,
+            ))
+
+        return DailyAlertsResult.success(DailyAlertsSnapshot(
+            low_stock_count=low_cnt,
+            expiring_soon_count=near_cnt,
+            expired_count=expired_cnt,
+            total_alerts=total,
+            page=page,
+            page_size=page_size,
+            items=tuple(items),
+        ))
+
+    except FileNotFoundError:
+        return DailyAlertsResult.failure(
+            "Αδυναμία φόρτωσης ειδοποιήσεων: "
+            f"το αρχείο βάσης δεν βρέθηκε ({db_path})")
+    except sqlite3.OperationalError as e:
+        msg = str(e)
+        if "unable to open" in msg.lower() or "no such" in msg.lower():
+            return DailyAlertsResult.failure(
+                "Αδυναμία φόρτωσης ειδοποιήσεων: "
+                f"αδυναμία ανοίγματος της βάσης ({db_path})")
+        return DailyAlertsResult.failure(
+            f"Αδυναμία φόρτωσης ειδοποιήσεων: σφάλμα SQLite — {msg}")
+    except sqlite3.DatabaseError as e:
+        return DailyAlertsResult.failure(
+            "Αδυναμία φόρτωσης ειδοποιήσεων: "
+            f"σφάλμα βάσης — {e}")
+    except Exception as e:
+        return DailyAlertsResult.failure(
+            f"Αδυναμία φόρτωσης ειδοποιήσεων: {e}")
+    finally:
+        if conn:
+            conn.close()
