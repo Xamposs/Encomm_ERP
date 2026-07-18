@@ -1583,80 +1583,23 @@ class DatabaseService:
 
     # ── Backup & Restore ──────────────────────────────────────────────
 
-    def backup_database(self, backup_dir: str = None) -> str:
-        """Create a timestamped backup of the SQLite database.
+    def backup_database(self, backup_dir: str | None = None) -> str:
+        """Create a verified timestamped backup via BackupService.
 
-        Copies the main DB file plus WAL and SHM companion files.
-        Runs a WAL checkpoint first to minimise companion file sizes.
-        Returns the absolute path to the backup file.
+        Delegates to ``BackupService`` which uses ``sqlite3.Connection.backup()``
+        and validates the backup before publishing it.
+
+        Returns the absolute path to the verified backup file.
+        Raises ``RuntimeError`` if backup creation or validation fails.
         """
-        import shutil
-        from datetime import datetime
+        from infrastructure.backup_service import BackupService
 
-        if backup_dir is None:
-            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-            backup_dir = os.path.join(desktop, "ENCOMM_Backups")
-
-        os.makedirs(backup_dir, exist_ok=True)
-
-        # Flush WAL to main DB before copying
-        conn = None
-        try:
-            conn = self._get_connection()
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception as e:
-            logging.warning("WAL checkpoint before backup failed (non-fatal): %s", e)
-        finally:
-            if conn:
-                conn.close()
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = os.path.join(backup_dir, f"encomm_erp_backup_{ts}.db")
-
-        shutil.copy2(self.db_path, backup_path)
-        logging.info("Database backed up to: %s", backup_path)
-
-        # Copy WAL and SHM companions if they exist
-        for suffix in ("-wal", "-shm"):
-            companion = self.db_path + suffix
-            if os.path.exists(companion):
-                shutil.copy2(companion, backup_path + suffix)
-
-        return backup_path
-
-    def restore_database(self, backup_path: str) -> bool:
-        """Restore database from a backup file.
-
-        Overwrites the current database and companion files.
-        The application should be restarted after restore.
-        Returns True on success.
-        """
-        import shutil
-
-        if not os.path.exists(backup_path):
-            logging.error("Backup file not found: %s", backup_path)
-            return False
-
-        if not backup_path.endswith(".db"):
-            logging.error("Invalid backup file (must be .db): %s", backup_path)
-            return False
-
-        try:
-            shutil.copy2(backup_path, self.db_path)
-            logging.info("Database restored from: %s", backup_path)
-
-            for suffix in ("-wal", "-shm"):
-                companion_backup = backup_path + suffix
-                companion_current = self.db_path + suffix
-                if os.path.exists(companion_backup):
-                    shutil.copy2(companion_backup, companion_current)
-                elif os.path.exists(companion_current):
-                    os.remove(companion_current)
-
-            return True
-        except Exception as e:
-            logging.error("Database restore failed: %s", e)
-            return False
+        svc = BackupService(backup_dir=backup_dir)
+        result = svc.create_backup(self.db_path)
+        if not result.ok:
+            raise RuntimeError(
+                f"Backup failed: {result.error_message}")
+        return result.backup_path
 
     # ── Stock Movement Audit Trail ───────────────────────────────────
 
