@@ -253,10 +253,11 @@ class SettingsPage(BasePage):
             size_kb = bi.size_bytes / 1024 if bi.size_bytes else 0
             size_str = f"{size_kb:.0f} KB" if size_kb < 1024 else f"{size_kb / 1024:.1f} MB"
             self._table.setItem(r, 2, QTableWidgetItem(size_str))
-            # Verification status — verified at creation time
-            verified = "✅  Επαληθευμένο" if bi.sha256 else "✅  Επαληθευμένο"
-            item = QTableWidgetItem(verified)
-            item.setForeground(QColor(styles.GREEN))
+            # Verification status — truthful: listed backups have not
+            # been re-verified in this UI session.
+            status = "⚪  Θα ελεγχθεί πριν από επαναφορά"
+            item = QTableWidgetItem(status)
+            item.setForeground(QColor(styles.TEXT_MUTED))
             self._table.setItem(r, 3, item)
 
     # ── Shutdown contract ────────────────────────────────────────────

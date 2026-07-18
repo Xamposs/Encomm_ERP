@@ -87,6 +87,19 @@ class BackupService:
         Returns a ``BackupResult`` — check ``.ok``.
         """
         source = Path(source_db_path)
+
+        # ── Validate source BEFORE creating any temp files ────────────
+        if not source.exists():
+            return BackupResult(
+                ok=False,
+                error_message=f"Source database does not exist: {source}",
+            )
+        if not source.is_file():
+            return BackupResult(
+                ok=False,
+                error_message=f"Source path is not a regular file: {source}",
+            )
+
         created_at = datetime.now()
         ts = created_at.strftime("%Y%m%d_%H%M%S_%f")  # µs avoids same-second collision
         final_name = _FILENAME_FMT.format(timestamp=ts)
@@ -149,15 +162,18 @@ class BackupService:
             if not entry.is_file():
                 continue
             name = entry.name
-            # Only include *.db files that match our naming pattern
+            # Only include *.db files (never .tmp)
             if not name.endswith(".db"):
                 continue
             if name.endswith(".tmp"):
                 continue
-            if not name.startswith("encomm_backup_"):
+
+            # Strict timestamp match — skip malformed names even if they
+            # look similar.
+            ts = self._parse_timestamp(name)
+            if ts is None:
                 continue
 
-            ts = self._parse_timestamp(name) or ""
             results.append(BackupInfo(
                 filename=name,
                 path=str(entry),
@@ -176,8 +192,13 @@ class BackupService:
 
     @staticmethod
     def _sqlite_backup(source: Path, dest: Path) -> None:
-        """Copy *source* into *dest* via ``Connection.backup()``."""
-        src_conn = sqlite3.connect(str(source))
+        """Copy *source* into *dest* via ``Connection.backup()``.
+
+        Opens *source* in read-only mode so SQLite never creates a
+        database file at the source path.
+        """
+        uri = f"file:{source.as_posix()}?mode=ro"
+        src_conn = sqlite3.connect(uri, uri=True)
         try:
             dst_conn = sqlite3.connect(str(dest))
             try:

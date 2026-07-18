@@ -173,6 +173,45 @@ class TestBackupServiceFailureModes:
         result = svc.create_backup(str(tmp_path / "nonexistent.db"))
         assert not result.ok
 
+    def test_missing_source_never_creates_source_file(self, tmp_path):
+        """A failed backup for a nonexistent source must NOT create the source file."""
+        nonexistent = tmp_path / "nonexistent.db"
+        assert not nonexistent.exists(), "Source must not exist before test"
+
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir()
+        svc = BackupService(backup_dir=str(backup_dir))
+        result = svc.create_backup(str(nonexistent))
+
+        assert not result.ok
+        assert "does not exist" in result.error_message.lower()
+        # Source file must NOT have been created
+        assert not nonexistent.exists(), \
+            "Source file was created — sqlite3.connect() must use mode=ro"
+        # No .db backup published
+        db_files = list(backup_dir.glob("encomm_backup_*.db"))
+        assert len(db_files) == 0, \
+            f"Backup published for missing source: {[f.name for f in db_files]}"
+        # No .tmp files left behind
+        tmp_files = list(backup_dir.glob("*.tmp"))
+        assert len(tmp_files) == 0, \
+            f"Temporary files left behind: {[f.name for f in tmp_files]}"
+
+    def test_source_is_directory_fails(self, tmp_path):
+        """A directory passed as source must fail without creating files."""
+        dir_path = tmp_path / "a_directory"
+        dir_path.mkdir()
+
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir()
+        svc = BackupService(backup_dir=str(backup_dir))
+        result = svc.create_backup(str(dir_path))
+
+        assert not result.ok
+        assert "not a regular file" in result.error_message.lower()
+        db_files = list(backup_dir.glob("encomm_backup_*.db"))
+        assert len(db_files) == 0
+
     def test_invalid_source_corrupt_db_fails(self, tmp_path):
         """A file that is not a valid SQLite database fails."""
         src = tmp_path / "not_a_db.db"
@@ -378,7 +417,7 @@ class TestListBackups:
             f"Not newest-first: {timestamps}"
 
     def test_skips_non_matching_files(self, tmp_path):
-        """Only encomm_backup_*.db files are listed."""
+        """Only properly timestamped files are listed."""
         backup_dir = tmp_path / "backups"
         backup_dir.mkdir()
 
@@ -397,6 +436,35 @@ class TestListBackups:
         names = {b.filename for b in backups}
         assert "notes.txt" not in names
         assert "random.db" not in names
+
+    def test_malformed_timestamp_filename_excluded(self, tmp_path):
+        """Files that look like backups but have malformed timestamps are excluded."""
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir()
+
+        # Create a real backup (valid timestamp)
+        src = str(tmp_path / "source.db")
+        _init_db(src)
+        svc = BackupService(backup_dir=str(backup_dir))
+        result = svc.create_backup(src)
+        assert result.ok
+        valid_name = Path(result.backup_path).name
+
+        # Create files with malformed timestamps
+        (backup_dir / "encomm_backup_badformat.db").write_text("bad")
+        (backup_dir / "encomm_backup_20260718_123456.db").write_text("no-micros")
+        (backup_dir / "encomm_backup_20260718.db").write_text("too-short")
+        (backup_dir / "encomm_backup_20260718_123456_12x456.db").write_text("nan")
+
+        backups = svc.list_backups()
+        names = {b.filename for b in backups}
+
+        # Only the real backup should be listed
+        assert valid_name in names, f"Real backup '{valid_name}' not listed"
+        assert "encomm_backup_badformat.db" not in names
+        assert "encomm_backup_20260718_123456.db" not in names
+        assert "encomm_backup_20260718.db" not in names
+        assert "encomm_backup_20260718_123456_12x456.db" not in names
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -148,6 +148,42 @@ class TestSettingsPageStructure:
         assert "placeholder" not in src.lower()
         assert "Αντίγραφα" in src, "Page must have Greek backup section"
 
+    def test_listed_backups_show_pending_verification_status(self, qapp, tmp_path):
+        """Table must show 'Θα ελεγχθεί' — NOT 'Επαληθευμένο' for listed backups."""
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        # Create a real backup file so the table has at least one row
+        from infrastructure.backup_service import BackupService
+        svc = BackupService(backup_dir=backup_dir)
+        result = svc.create_backup(db_path)
+        assert result.ok
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            # Table should have rows after _refresh_list is called in build_ui
+            rows = page._table.rowCount()
+            assert rows >= 1, "Table should show the backup we created"
+
+            # Check every row's status column
+            for r in range(rows):
+                item = page._table.item(r, 3)  # column 3 is status
+                assert item is not None, f"Row {r} missing status"
+                text = item.text()
+                # Must use the pending-verification text, NOT false "Επαληθευμένο"
+                assert "Θα ελεγχθεί" in text, \
+                    f"Row {r}: expected 'Θα ελεγχθεί' but got '{text}'"
+                assert "Επαληθευμένο" not in text, \
+                    f"Row {r}: must not falsely claim 'Επαληθευμένο'"
+        finally:
+            page.shutdown()
+            page.deleteLater()
+
 
 # ══════════════════════════════════════════════════════════════════════
 # Worker lifecycle (structural — no event loop)
