@@ -16,6 +16,7 @@ from __future__ import annotations
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import List, Tuple
 
 
@@ -1561,6 +1562,11 @@ def load_daily_alerts(
     page = max(1, page)
     page_size = min(max(1, page_size), 100)
 
+    # ── One deterministic local business date for EVERY comparison ────
+    today = date.today()
+    today_str = today.isoformat()
+    cutoff_str = (today + timedelta(days=alert_days)).isoformat()
+
     conn = None
     try:
         conn = _connect_ro(db_path)
@@ -1577,11 +1583,11 @@ def load_daily_alerts(
         # 3 = low stock only (not expired, not near-expiry)
         severity_sql = (
             "CASE "
-            f"  WHEN {_valid_exp} AND date(p.ExpiryDate) < date('now') "
+            f"  WHEN {_valid_exp} AND date(p.ExpiryDate) < ? "
             "    THEN 1 "
             f"  WHEN {_valid_exp} "
-            "       AND date(p.ExpiryDate) >= date('now') "
-            "       AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days') "
+            "       AND date(p.ExpiryDate) >= ? "
+            "       AND date(p.ExpiryDate) <= ? "
             "    THEN 2 "
             "  WHEN p.Stock <= ? THEN 3 "
             "END"
@@ -1589,14 +1595,13 @@ def load_daily_alerts(
 
         is_expired_sql = (
             f"CASE WHEN {_valid_exp} "
-            "     AND date(p.ExpiryDate) < date('now') "
+            "     AND date(p.ExpiryDate) < ? "
             "THEN 1 ELSE 0 END"
         )
         is_near_sql = (
             f"CASE WHEN {_valid_exp} "
-            "     AND date(p.ExpiryDate) >= date('now') "
-            "     AND date(p.ExpiryDate) <= "
-            "         date('now', '+' || ? || ' days') "
+            "     AND date(p.ExpiryDate) >= ? "
+            "     AND date(p.ExpiryDate) <= ? "
             "THEN 1 ELSE 0 END"
         )
         is_low_sql = "CASE WHEN p.Stock <= ? THEN 1 ELSE 0 END"
@@ -1606,25 +1611,25 @@ def load_daily_alerts(
         filter_parms: list
         if alert_filter == "all":
             filter_clause = (
-                f"({_valid_exp} AND date(p.ExpiryDate) < date('now')) "
+                f"({_valid_exp} AND date(p.ExpiryDate) < ?) "
                 f"OR ({_valid_exp} "
-                "    AND date(p.ExpiryDate) >= date('now') "
-                "    AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')) "
+                "    AND date(p.ExpiryDate) >= ? "
+                "    AND date(p.ExpiryDate) <= ?) "
                 "OR (p.Stock <= ?)"
             )
-            filter_parms = [alert_days, threshold]
+            filter_parms = [today_str, today_str, cutoff_str, threshold]
         elif alert_filter == "expired":
             filter_clause = (
-                f"{_valid_exp} AND date(p.ExpiryDate) < date('now')"
+                f"{_valid_exp} AND date(p.ExpiryDate) < ?"
             )
-            filter_parms = []
+            filter_parms = [today_str]
         elif alert_filter == "expiring_soon":
             filter_clause = (
                 f"{_valid_exp} "
-                "AND date(p.ExpiryDate) >= date('now') "
-                "AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')"
+                "AND date(p.ExpiryDate) >= ? "
+                "AND date(p.ExpiryDate) <= ?"
             )
-            filter_parms = [alert_days]
+            filter_parms = [today_str, cutoff_str]
         else:  # low_stock
             filter_clause = "p.Stock <= ?"
             filter_parms = [threshold]
@@ -1638,15 +1643,16 @@ def load_daily_alerts(
         near_cnt = cur.execute(
             f"SELECT COUNT(*) FROM ProductMaster p "
             f"WHERE {_valid_exp} "
-            "AND date(p.ExpiryDate) >= date('now') "
-            "AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')",
-            (alert_days,),
+            "AND date(p.ExpiryDate) >= ? "
+            "AND date(p.ExpiryDate) <= ?",
+            (today_str, cutoff_str),
         ).fetchone()[0]
 
         expired_cnt = cur.execute(
             f"SELECT COUNT(*) FROM ProductMaster p "
             f"WHERE {_valid_exp} "
-            "AND date(p.ExpiryDate) < date('now')",
+            "AND date(p.ExpiryDate) < ?",
+            (today_str,),
         ).fetchone()[0]
 
         # ── Filtered total ──────────────────────────────────────────────
@@ -1677,7 +1683,7 @@ def load_daily_alerts(
             ORDER BY severity ASC, p.ExpiryDate ASC, p.Name ASC, p.Barcode ASC
             LIMIT ? OFFSET ?
             """,
-            [alert_days, threshold, alert_days, threshold]
+            [today_str, today_str, cutoff_str, threshold, today_str, today_str, cutoff_str, threshold]
             + filter_parms + [page_size, offset],
         )
 

@@ -372,3 +372,127 @@ class TestDailyAlertsLoad:
         count = conn.execute("SELECT COUNT(*) FROM ProductMaster").fetchone()[0]
         conn.close()
         assert count == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# P2.1 regression: local business date boundary (not SQLite date('now'))
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestLocalBusinessDateBoundary:
+    """Prove that load_daily_alerts uses Python date.today() as the
+    single authoritative business date — never SQLite date('now').
+
+    These tests mock ``qt_app.data_source.date`` to a frozen date so
+    boundary classifications are deterministic regardless of the actual
+    system clock or UTC/local offset.
+    """
+
+    FROZEN_TODAY = date(2026, 7, 19)
+
+    @staticmethod
+    def _frozen_today() -> date:
+        return TestLocalBusinessDateBoundary.FROZEN_TODAY
+
+    @staticmethod
+    def _d(offset: int) -> str:
+        return (TestLocalBusinessDateBoundary.FROZEN_TODAY
+                + timedelta(days=offset)).isoformat()
+
+    @staticmethod
+    def _freeze(monkeypatch):
+        """Replace qt_app.data_source.date with a stub whose .today()
+        returns FROZEN_TODAY."""
+        import qt_app.data_source as ds
+        frozen = TestLocalBusinessDateBoundary.FROZEN_TODAY
+
+        class _FrozenDate:
+            @staticmethod
+            def today() -> date:
+                return frozen
+
+        monkeypatch.setattr(ds, "date", _FrozenDate)
+
+    def test_local_today_is_authoritative_for_expired(self, monkeypatch, tmp_path):
+        """A product with expiry = yesterday (local) always classified as
+        expired, even if SQLite's internal clock returns a different day."""
+        self._freeze(monkeypatch)
+
+        db = str(tmp_path / "test.db")
+        _make_db(db, [
+            ("A", "Yesterday", 50, self._d(-1), 1.0),
+            ("B", "Today",     50, self._d(0),  1.0),
+        ])
+        r = load_daily_alerts(db, threshold=10, alert_days=30)
+        assert r.snapshot.expired_count == 1
+        assert r.snapshot.expiring_soon_count == 1  # today IS expiring soon
+        assert r.snapshot.total_alerts == 2
+
+        # Yesterday = expired + 'Ληγμένο', Today = expiring soon
+        items = {i.barcode: i for i in r.snapshot.items}
+        assert "Ληγμένο" in _reason_set(items["A"])
+        assert any("Λήγει σύντομα" in s for s in items["B"].reasons)
+
+    def test_alert_days_boundary_uses_local_today(self, monkeypatch, tmp_path):
+        """Expiry exactly alert_days from frozen today IS expiring soon."""
+        self._freeze(monkeypatch)
+
+        db = str(tmp_path / "test.db")
+        _make_db(db, [
+            ("A", "Boundary", 50, self._d(30), 1.0),
+            ("B", "Beyond",   50, self._d(31), 1.0),
+        ])
+        r = load_daily_alerts(db, threshold=10, alert_days=30)
+        assert r.snapshot.expiring_soon_count == 1
+        assert r.snapshot.total_alerts == 1
+        assert r.snapshot.items[0].barcode == "A"
+
+    def test_filter_expired_uses_local_today(self, monkeypatch, tmp_path):
+        """Expired filter matches only products with expiry < local today."""
+        self._freeze(monkeypatch)
+
+        db = str(tmp_path / "test.db")
+        _make_db(db, [
+            ("E", "Exp",  50, self._d(-5), 1.0),
+            ("T", "Today", 50, self._d(0), 1.0),
+            ("N", "Near", 50, self._d(10), 1.0),
+        ])
+        r = load_daily_alerts(db, alert_filter="expired",
+                              threshold=10, alert_days=30)
+        assert r.snapshot.total_alerts == 1
+        assert r.snapshot.items[0].barcode == "E"
+
+    def test_filter_expiring_soon_uses_local_today(self, monkeypatch, tmp_path):
+        """Expiring-soon filter uses the local window [today, today+alert_days]."""
+        self._freeze(monkeypatch)
+
+        db = str(tmp_path / "test.db")
+        _make_db(db, [
+            ("Y", "Yesterday", 50, self._d(-1), 1.0),
+            ("T", "Today",     50, self._d(0),  1.0),
+            ("B", "Boundary",  50, self._d(30), 1.0),
+            ("F", "Far",       50, self._d(31), 1.0),
+        ])
+        r = load_daily_alerts(db, alert_filter="expiring_soon",
+                              threshold=10, alert_days=30)
+        # Only Today and Boundary are in [today, today+30]
+        assert r.snapshot.total_alerts == 2
+        barcodes = {i.barcode for i in r.snapshot.items}
+        assert barcodes == {"T", "B"}
+
+    def test_counts_stable_across_sqlite_clock_divergence(self, monkeypatch, tmp_path):
+        """The three global counts (expired, near, low) are all computed
+        against the same local business date, never SQLite date('now')."""
+        self._freeze(monkeypatch)
+
+        db = str(tmp_path / "test.db")
+        _make_db(db, [
+            ("E1", "Exp1", 50, self._d(-10), 1.0),  # expired
+            ("E2", "Exp2",  5, self._d(-3),  1.0),  # expired + low stock
+            ("N1", "Near", 50, self._d(15),  1.0),  # expiring soon
+            ("L1", "Low",   3, self._d(365), 1.0),  # low stock only
+        ])
+        r = load_daily_alerts(db, threshold=10, alert_days=30)
+        assert r.snapshot.expired_count == 2
+        assert r.snapshot.expiring_soon_count == 1
+        assert r.snapshot.low_stock_count == 2  # E2 + L1
+        assert r.snapshot.total_alerts == 4
