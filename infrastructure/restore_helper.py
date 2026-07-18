@@ -165,6 +165,17 @@ def execute_request(request: Dict[str, Any], wait_timeout: int = _DEFAULT_WAIT_T
         )
     logger.info("Backup verified — SHA-256: %s", verification.sha256[:16])
 
+    # ── 2b. Re-verify pre-restore backup — last recovery safety net ─
+    logger.info("Re-verifying pre-restore backup: %s", pre_restore)
+    pre_verify = backup_svc.verify_backup(str(pre_restore))
+    if not pre_verify.ok:
+        return _fail(
+            "Το αντίγραφο ασφαλείας πριν την επαναφορά "
+            "απέτυχε στην επανεπαλήθευση. Η επαναφορά "
+            "ακυρώθηκε για την προστασία των δεδομένων."
+        )
+    logger.info("Pre-restore backup verified — SHA-256: %s", pre_verify.sha256[:16])
+
     # ── 3. Restore via sqlite3 backup() into temp file ───────────
     tmp_fd, tmp_path_str = tempfile.mkstemp(
         suffix=".db", prefix="restored_", dir=str(active.parent)
@@ -244,24 +255,56 @@ def _pid_exists(pid: int) -> bool:
 
 
 def _pid_exists_windows(pid: int) -> bool:
-    """Check process existence on Windows via WaitForSingleObject."""
+    """Check process existence on Windows — fail-closed for safety.
+
+    Only ``ERROR_INVALID_PARAMETER`` (87) is treated as \"not running\".
+    ``ERROR_ACCESS_DENIED`` (5) and any unknown error are treated as
+    \"possibly still running\" to prevent the helper from replacing the
+    database while the ERP could still be alive.
+    """
     import ctypes
     from ctypes import wintypes
 
     SYNCHRONIZE = 0x00100000
     WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    ERROR_INVALID_PARAMETER = 87
+    ERROR_ACCESS_DENIED = 5
+
     kernel32 = ctypes.windll.kernel32
 
-    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-    if handle == 0:
-        # Access denied or invalid PID — assume not running
-        return False
+    # Explicit signatures to prevent handle truncation on 64-bit
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD,    # dwDesiredAccess
+        wintypes.BOOL,     # bInheritHandle
+        wintypes.DWORD,    # dwProcessId
+    ]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [
+        wintypes.HANDLE,   # hHandle
+        wintypes.DWORD,    # dwMilliseconds
+    ]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.GetLastError.restype = wintypes.DWORD
+    kernel32.GetLastError.argtypes = []
+
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, wintypes.DWORD(pid))
+    # When restype=HANDLE, a NULL return is converted to None, not 0.
+    if handle is None or handle == 0:
+        err = kernel32.GetLastError()
+        if err == ERROR_INVALID_PARAMETER:
+            # PID does not exist — safe to conclude \"not running\".
+            return False
+        # ERROR_ACCESS_DENIED or any other failure → possibly still
+        # running.  Fail closed so the helper waits and eventually
+        # times out rather than replacing the DB prematurely.
+        return True
 
     try:
         result = kernel32.WaitForSingleObject(handle, 0)
-        # If the process is still running, WaitForSingleObject
-        # returns WAIT_TIMEOUT (0x00000102).  If it has exited,
-        # it returns WAIT_OBJECT_0.
+        # WAIT_TIMEOUT → still running.  WAIT_OBJECT_0 → process exited.
         return result != WAIT_OBJECT_0
     finally:
         kernel32.CloseHandle(handle)

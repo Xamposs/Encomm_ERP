@@ -838,3 +838,160 @@ class TestRestoreStatusBanner:
             assert not banner.isVisible()
         finally:
             page.deleteLater()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# E4.1 — _launch_restore_helper correctness
+# ══════════════════════════════════════════════════════════════════════
+
+class TestLaunchRestoreHelper:
+    """_launch_restore_helper must handle QProcess tuple return and use
+    the project root as working directory."""
+
+    def test_returns_true_when_detached_succeeds(self, monkeypatch):
+        """QProcess.startDetached returns (True, pid) → helper returns True."""
+        import sys
+        from pathlib import Path
+        import qt_app.pages.settings_page as sp
+
+        captured = {}
+
+        def _fake_start_detached(program, args, workdir):
+            captured["program"] = program
+            captured["args"] = args
+            captured["workdir"] = workdir
+            return (True, 4242)
+
+        from PySide6.QtCore import QProcess
+        monkeypatch.setattr(QProcess, "startDetached",
+                            staticmethod(_fake_start_detached))
+
+        result = sp._launch_restore_helper(
+            "C:\\backups\\test_restore_request.json")
+        assert result is True
+
+    def test_captures_correct_program_args_workdir(self, monkeypatch):
+        """Assert program is sys.executable, args contain -m and the
+        module name plus --request, workdir is the project root."""
+        import sys
+        from pathlib import Path
+        import qt_app.pages.settings_page as sp
+
+        captured = {}
+
+        def _fake_start_detached(program, args, workdir):
+            captured["program"] = program
+            captured["args"] = args
+            captured["workdir"] = workdir
+            return (True, 9999)
+
+        from PySide6.QtCore import QProcess
+        monkeypatch.setattr(QProcess, "startDetached",
+                            staticmethod(_fake_start_detached))
+
+        request_path = "C:\\backups\\test_req.json"
+        result = sp._launch_restore_helper(request_path)
+
+        assert captured["program"] == sys.executable, \
+            "Must use sys.executable"
+        assert "-m" in captured["args"]
+        assert "infrastructure.restore_helper" in captured["args"]
+        assert "--request" in captured["args"]
+        assert request_path in captured["args"]
+        # Workdir is the project root = parents[2] from settings_page.py
+        expected_root = str(
+            Path(sp.__file__).resolve().parents[2])
+        assert captured["workdir"] == expected_root, \
+            f"Workdir must be project root, got {captured['workdir']}"
+        assert result is True
+
+    def test_returns_false_when_detached_fails(self, monkeypatch):
+        """QProcess.startDetached returns (False, 0) → helper returns False."""
+        import qt_app.pages.settings_page as sp
+
+        def _fake_start_detached(program, args, workdir):
+            return (False, 0)
+
+        from PySide6.QtCore import QProcess
+        monkeypatch.setattr(QProcess, "startDetached",
+                            staticmethod(_fake_start_detached))
+
+        result = sp._launch_restore_helper(
+            "C:\\backups\\test_req.json")
+        assert result is False
+
+    def test_returns_false_on_exception(self, monkeypatch):
+        """If startDetached raises, helper returns False safely."""
+        import qt_app.pages.settings_page as sp
+
+        def _fake_start_detached(program, args, workdir):
+            raise RuntimeError("Simulated crash")
+
+        from PySide6.QtCore import QProcess
+        monkeypatch.setattr(QProcess, "startDetached",
+                            staticmethod(_fake_start_detached))
+
+        result = sp._launch_restore_helper(
+            "C:\\backups\\test_req.json")
+        assert result is False
+
+    def test_launch_failure_does_not_request_window_close(self, qapp,
+                                                            tmp_path,
+                                                            monkeypatch):
+        """When _launch_restore_helper returns False, _on_restore_done
+        must NOT request window close and must re-enable buttons."""
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        request_path = str(
+            Path(backup_dir) / "test_fail_launch_restore_request.json")
+        # Create a dummy request file so _clean_request_file can remove it
+        Path(request_path).write_text("{}")
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            from infrastructure.restore_service import RestorePreparation
+            success_result = RestorePreparation(
+                ok=True,
+                request_path=request_path,
+                request_id="test_fail_launch",
+                selected_backup_path=str(tmp_path / "some.db"),
+                active_db_path=db_path,
+                pre_restore_backup_path=str(tmp_path / "pre.db"),
+            )
+
+            # Mock _launch_restore_helper to fail
+            import qt_app.pages.settings_page as sp
+            monkeypatch.setattr(
+                sp, "_launch_restore_helper",
+                lambda request_path: False,
+            )
+            monkeypatch.setattr(sp, "QMessageBox", _FakeMessageBox)
+
+            close_called = []
+
+            class FakeWindow:
+                def close(self):
+                    close_called.append(True)
+
+            monkeypatch.setattr(page, "window", lambda: FakeWindow())
+
+            page._restore_loading = True
+            page._restore_btn.setEnabled(False)
+            page._on_restore_done(success_result)
+
+            # Window close NOT requested
+            assert len(close_called) == 0, \
+                "Window close must NOT be requested when helper launch fails"
+            # Error shown
+            assert "Αδυναμία" in page._status_lbl.text()
+            # Buttons re-enabled
+            assert page._backup_btn.isEnabled()
+        finally:
+            page.shutdown()
+            page.deleteLater()

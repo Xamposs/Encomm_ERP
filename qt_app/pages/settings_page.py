@@ -817,8 +817,11 @@ def _launch_restore_helper(request_path: str) -> bool:
     """Launch the restore helper as a detached process.
 
     Returns True if the process was launched successfully.
+
+    QProcess.startDetached returns ``tuple[bool, int]``, not a plain bool.
     """
     import sys
+    from pathlib import Path
     from PySide6.QtCore import QProcess
 
     python_exe = sys.executable
@@ -826,12 +829,14 @@ def _launch_restore_helper(request_path: str) -> bool:
         "-m", "infrastructure.restore_helper",
         "--request", request_path,
     ]
-    # Use the project root as working directory so module imports resolve
-    import os as _os
-    workdir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    # Project root = parents[2] from qt_app/pages/settings_page.py
+    project_root = str(Path(__file__).resolve().parents[2])
 
-    success = QProcess.startDetached(python_exe, args, workdir)
-    return success
+    try:
+        started, pid = QProcess.startDetached(python_exe, args, project_root)
+        return bool(started)
+    except Exception:
+        return False
 
 
 def _clean_request_file(request_path: str) -> None:

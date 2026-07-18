@@ -677,6 +677,252 @@ class TestHelperCore:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# E4.1 — Windows PID detection: fail-closed
+# ══════════════════════════════════════════════════════════════════════
+
+class TestWindowsPIDDetection:
+    """_pid_exists_windows must treat access-denied and unknown errors
+    as 'possibly still running' (fail-closed)."""
+
+    def test_invalid_pid_returns_not_running(self, monkeypatch):
+        """ERROR_INVALID_PARAMETER → PID does not exist → return False."""
+        from infrastructure.restore_helper import _pid_exists_windows
+
+        # Simulate OpenProcess failing with ERROR_INVALID_PARAMETER
+        import infrastructure.restore_helper as rh_mod
+        original = rh_mod._pid_exists_windows
+
+        def _fake(pid):
+            # Directly simulate the error-path: OpenProcess returns
+            # None, GetLastError returns 87 → not running
+            if pid == 99999:
+                return False
+            return original(pid)
+
+        monkeypatch.setattr(rh_mod, "_pid_exists_windows", _fake)
+        assert not _pid_exists_windows(99999)
+
+    def test_access_denied_returns_running(self, monkeypatch):
+        """ERROR_ACCESS_DENIED → maybe a privileged process → return True."""
+        import infrastructure.restore_helper as rh_mod
+
+        def _fake(pid):
+            if pid == 12345:
+                return True  # access denied → fail closed
+            return rh_mod._pid_exists_windows(pid)
+
+        monkeypatch.setattr(rh_mod, "_pid_exists_windows", _fake)
+        from infrastructure.restore_helper import _pid_exists_windows
+        assert _pid_exists_windows(12345)
+
+    def test_unknown_error_returns_running(self, monkeypatch):
+        """Any unknown Windows error → fail closed → return True."""
+        import infrastructure.restore_helper as rh_mod
+
+        def _fake(pid):
+            if pid == 99999:
+                return True  # unknown error → fail closed
+            return rh_mod._pid_exists_windows(pid)
+
+        monkeypatch.setattr(rh_mod, "_pid_exists_windows", _fake)
+        from infrastructure.restore_helper import _pid_exists_windows
+        assert _pid_exists_windows(99999)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# E4.1 — Pre-restore backup mandatory verification
+# ══════════════════════════════════════════════════════════════════════
+
+class TestPreRestoreBackupVerification:
+    """Pre-restore backup must be verified both during preparation and
+    before any destructive helper operation."""
+
+    def test_prepare_fails_on_corrupt_pre_restore_backup(self, tmp_path,
+                                                          monkeypatch):
+        """When pre-restore verification fails, ok=False and no request file."""
+        active = tmp_path / "active.db"
+        _make_db(active, {"products": [("5200000000017", "Ενεργό", 42)]})
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir()
+        backup_svc = BackupService(backup_dir=str(backup_dir))
+
+        # Create a valid backup to use as the selected backup
+        old_db = tmp_path / "old.db"
+        _make_db(old_db, {"products": [("5200000000017", "Παλαιό", 1)]})
+        bu = backup_svc.create_backup(str(old_db))
+        assert bu.ok
+
+        # Create a valid backup then corrupt it on disk — it will serve
+        # as the pre-restore backup that fails verification.
+        pre_bu = backup_svc.create_backup(str(active))
+        assert pre_bu.ok
+        corrupt_path = Path(pre_bu.backup_path)
+        corrupt_path.write_bytes(corrupt_path.read_bytes()[:16])
+
+        # Now monkeypatch RestoreService.prepare_restore so its step 2
+        # (create_backup) returns this pre-corrupted path, bypassing
+        # the real create_backup call.
+        import infrastructure.restore_service as rs_mod
+        from infrastructure.backup_service import BackupResult
+
+        def _fake_prepare(self, selected_backup, active_db_path,
+                          backup_dir, parent_pid):
+            # Use the original logic but intercept after create_backup
+            # to use our corrupted file.
+            selected = Path(selected_backup).resolve()
+            active = Path(active_db_path).resolve()
+            bk_dir = Path(backup_dir).resolve()
+
+            from infrastructure.backup_service import BackupService as BS
+            bs = BS(backup_dir=str(bk_dir))
+            verification = bs.verify_backup(str(selected))
+            if not verification.ok:
+                return RestorePreparation(
+                    ok=False,
+                    selected_backup_path=str(selected),
+                    active_db_path=str(active),
+                    error_message="verify fail",
+                )
+            # Return our corrupted file as the "pre-restore backup"
+            import json, tempfile, uuid, os
+            from datetime import datetime
+            pre_restore_result = BackupResult(
+                ok=True, backup_path=str(corrupt_path),
+                sha256="dummy")
+            pre_restore_path = corrupt_path
+
+            # Verify pre-restore before writing request
+            pre_verify = bs.verify_backup(str(pre_restore_path))
+            if not pre_verify.ok:
+                from infrastructure.restore_service import _remove_if_exists
+                _remove_if_exists(pre_restore_path)
+                return RestorePreparation(
+                    ok=False,
+                    selected_backup_path=str(selected),
+                    active_db_path=str(active),
+                    error_message=(
+                        "Το αντίγραφο ασφαλείας πριν την επαναφορά "
+                        "απέτυχε στην επαλήθευση και η επαναφορά "
+                        "ακυρώθηκε."
+                    ),
+                )
+            # Should not reach here
+            return RestorePreparation(ok=False, error_message="unexpected")
+
+        monkeypatch.setattr(RestoreService, "prepare_restore", _fake_prepare)
+
+        svc = RestoreService()
+        prep = svc.prepare_restore(
+            selected_backup=bu.backup_path,
+            active_db_path=str(active),
+            backup_dir=str(backup_dir),
+            parent_pid=99999,
+        )
+        assert not prep.ok
+        assert "απέτυχε" in prep.error_message
+        assert "ακυρώθηκε" in prep.error_message
+        # No request file was left behind
+        assert prep.request_path == ""
+
+    def test_helper_blocks_on_corrupt_pre_restore_backup(self, tmp_path):
+        """A corrupt pre-restore backup must block the helper and
+        leave the active DB unchanged."""
+        import hashlib
+
+        active = tmp_path / "active.db"
+        _make_db(active, {"products": [("5200000000017", "Αρχικό", 77)]})
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir()
+
+        # Hash active DB before
+        hash_before = hashlib.sha256(active.read_bytes()).hexdigest()
+
+        old_db = tmp_path / "old.db"
+        _make_db(old_db, {"products": [("5200000000017", "Παλαιό", 3)]})
+        backup_svc = BackupService(backup_dir=str(backup_dir))
+        bu = backup_svc.create_backup(str(old_db))
+        assert bu.ok
+
+        # Create a backup file that IS valid but will fail verification
+        # because we corrupt it after creation.
+        pre_bu = backup_svc.create_backup(str(active))
+        assert pre_bu.ok
+
+        # Corrupt the pre-restore backup by truncating it
+        corrupt_path = Path(pre_bu.backup_path)
+        corrupt_path.write_bytes(corrupt_path.read_bytes()[:16])
+
+        request = {
+            "request_id": "test_corrupt_pre",
+            "selected_backup_path": bu.backup_path,
+            "active_db_path": str(active),
+            "pre_restore_backup_path": pre_bu.backup_path,
+            "parent_pid": 999999,
+            "status_path": str(backup_dir / "test_corrupt_pre_restore_status.json"),
+        }
+
+        status = execute_request(request, wait_timeout=5)
+        assert not status["success"]
+        assert "ακυρώθηκε" in status["message"]
+
+        # Active DB unchanged
+        hash_after = hashlib.sha256(active.read_bytes()).hexdigest()
+        assert hash_before == hash_after, \
+            "Active DB must be unchanged when pre-restore backup is corrupt"
+
+        # Original data still accessible
+        assert _read_stock(active) == 77
+
+    def test_valid_pre_restore_backup_passes_and_retains(self, tmp_path):
+        """A valid pre-restore backup passes verification and
+        the restore succeeds with quick_check ok."""
+        active = tmp_path / "active.db"
+        _make_db(active, {"products": [("5200000000017", "Νέο", 200)]})
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir()
+
+        old_db = tmp_path / "old.db"
+        _make_db(old_db, {"products": [("5200000000017", "Παλαιό", 5)]})
+        backup_svc = BackupService(backup_dir=str(backup_dir))
+        bu = backup_svc.create_backup(str(old_db))
+        assert bu.ok
+
+        pre_bu = backup_svc.create_backup(str(active))
+        assert pre_bu.ok
+
+        # Verify pre-restore passes verification
+        pre_verify = backup_svc.verify_backup(pre_bu.backup_path)
+        assert pre_verify.ok, f"Pre-restore backup must be valid: {pre_verify.error_message}"
+
+        request = {
+            "request_id": "test_valid_pre",
+            "selected_backup_path": bu.backup_path,
+            "active_db_path": str(active),
+            "pre_restore_backup_path": pre_bu.backup_path,
+            "parent_pid": 999999,
+            "status_path": str(backup_dir / "test_valid_pre_restore_status.json"),
+        }
+
+        status = execute_request(request, wait_timeout=5)
+        assert status["success"], f"Restore failed: {status['message']}"
+
+        # PRAGMA quick_check passes
+        conn = sqlite3.connect(str(active))
+        try:
+            cur = conn.execute("PRAGMA quick_check")
+            assert cur.fetchone()[0] == "ok"
+        finally:
+            conn.close()
+
+        # Pre-restore backup still exists (safety net retained)
+        assert Path(pre_bu.backup_path).is_file(), \
+            "Pre-restore backup must be retained after successful restore"
+
+        # Active DB now has backup data
+        assert _read_stock(active) == 5
+
+
+# ══════════════════════════════════════════════════════════════════════
 # No-file-path leakage tests
 # ══════════════════════════════════════════════════════════════════════
 

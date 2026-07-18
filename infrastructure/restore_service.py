@@ -125,7 +125,25 @@ class RestoreService:
             )
         pre_restore_path = Path(pre_restore_result.backup_path)
 
-        # ── 3. Write restore request ────────────────────────────
+        # ── 3. Verify pre-restore backup BEFORE writing request ──
+        # This is the last safety net — it must be verified before we
+        # schedule anything.
+        pre_verify = backup_svc.verify_backup(str(pre_restore_path))
+        if not pre_verify.ok:
+            # Remove the pre-restore backup file — it's not usable.
+            _remove_if_exists(pre_restore_path)
+            return RestorePreparation(
+                ok=False,
+                selected_backup_path=str(selected),
+                active_db_path=str(active),
+                error_message=(
+                    "Το αντίγραφο ασφαλείας πριν την επαναφορά "
+                    "απέτυχε στην επαλήθευση και η επαναφορά "
+                    "ακυρώθηκε."
+                ),
+            )
+
+        # ── 4. Write restore request ────────────────────────────
         request_id = f"restore_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}"
         request_name = f"{request_id}{_REQUEST_SUFFIX}"
         request_path = bk_dir / request_name
@@ -162,15 +180,6 @@ class RestoreService:
             "Restore request written: %s (backup=%s, active=%s, pre_restore=%s)",
             request_path, selected, active, pre_restore_path,
         )
-
-        # ── 4. Verify pre-restore backup (safety double-check) ──
-        pre_verify = backup_svc.verify_backup(str(pre_restore_path))
-        if not pre_verify.ok:
-            # Don't fail — the pre-restore backup exists. Log and continue.
-            logger.warning(
-                "Pre-restore backup verification warning: %s",
-                pre_verify.error_message,
-            )
 
         return RestorePreparation(
             ok=True,
