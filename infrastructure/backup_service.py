@@ -51,6 +51,17 @@ class BackupResult:
 
 
 @dataclass
+class VerifyBackupResult:
+    """Typed result from ``verify_backup()``."""
+
+    ok: bool
+    path: str = ""
+    size_bytes: int = 0
+    sha256: str = ""
+    error_message: str = ""
+
+
+@dataclass
 class BackupInfo:
     """Lightweight entry for list_backups()."""
 
@@ -77,6 +88,96 @@ class BackupService:
         os.makedirs(str(self._backup_dir), exist_ok=True)
 
     # ── Public API ───────────────────────────────────────────────────────
+
+    def verify_backup(self, backup_path: str | Path) -> VerifyBackupResult:
+        """Verify a backup file read-only — never modifies the file.
+
+        Checks:
+        - path exists and is a regular file
+        - SQLite opens read-only
+        - PRAGMA quick_check returns ok
+        - ProductMaster and SystemConfig exist
+        - SHA-256 calculated
+
+        Returns a ``VerifyBackupResult`` — check ``.ok``.
+        """
+        path = Path(backup_path)
+
+        # ── File-level checks ─────────────────────────────────
+        if not path.exists():
+            return VerifyBackupResult(
+                ok=False,
+                path=str(path),
+                error_message=f"Το αρχείο δεν υπάρχει: {path}",
+            )
+        if not path.is_file():
+            return VerifyBackupResult(
+                ok=False,
+                path=str(path),
+                error_message=f"Η διαδρομή δεν είναι κανονικό αρχείο: {path}",
+            )
+
+        sha256: str = ""
+        try:
+            # ── SQLite integrity ───────────────────────────────
+            uri = f"file:{path.as_posix()}?mode=ro"
+            try:
+                conn = sqlite3.connect(uri, uri=True)
+            except sqlite3.Error as e:
+                return VerifyBackupResult(
+                    ok=False,
+                    path=str(path),
+                    error_message=f"Αδυναμία ανοίγματος SQLite (mode=ro): {e}",
+                )
+
+            try:
+                cur = conn.execute("PRAGMA quick_check")
+                row = cur.fetchone()
+                if row is None or row[0] != "ok":
+                    detail = row[0] if row else "no result"
+                    return VerifyBackupResult(
+                        ok=False,
+                        path=str(path),
+                        error_message=f"PRAGMA quick_check απέτυχε: {detail}",
+                    )
+
+                # Required tables
+                tables = {
+                    r[0] for r in
+                    conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                missing = _REQUIRED_TABLES - tables
+                if missing:
+                    return VerifyBackupResult(
+                        ok=False,
+                        path=str(path),
+                        error_message=(
+                            "Λείπουν απαιτούμενοι πίνακες: "
+                            f"{', '.join(sorted(missing))}"
+                        ),
+                    )
+            finally:
+                conn.close()
+
+            # ── SHA-256 ────────────────────────────────────────
+            sha256 = self._sha256_file(path)
+            size = path.stat().st_size
+
+            return VerifyBackupResult(
+                ok=True,
+                path=str(path),
+                size_bytes=size,
+                sha256=sha256,
+            )
+
+        except Exception as exc:
+            return VerifyBackupResult(
+                ok=False,
+                path=str(path),
+                error_message=str(exc),
+            )
 
     def create_backup(
         self,

@@ -42,6 +42,24 @@ def _make_db(path: str) -> None:
     conn.close()
 
 
+class _FakeMessageBox:
+    """Fake QMessageBox that always returns No without blocking."""
+    Yes = 16384
+    No = 65536
+
+    @staticmethod
+    def warning(*args, **kw):
+        return _FakeMessageBox.No
+
+    @staticmethod
+    def critical(*args, **kw):
+        return _FakeMessageBox.No
+
+    @staticmethod
+    def information(*args, **kw):
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Page structure
 # ══════════════════════════════════════════════════════════════════════
@@ -468,3 +486,355 @@ class TestSettingsShell:
         src = inspect.getsource(sp)
         assert "ΦΠΑ" not in src, "No VAT UI allowed in Settings"
         assert "vat" not in src.lower(), "No VAT references allowed in Settings"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# E4: Restore UI tests
+# ══════════════════════════════════════════════════════════════════════
+
+class TestRestoreButtonState:
+    """Restore button is disabled by default, enabled on single selection."""
+
+    def test_restore_button_exists_and_disabled_initially(self, qapp, tmp_path):
+        page = _make_page(tmp_path)
+        try:
+            btn = getattr(page, "_restore_btn", None)
+            assert btn is not None, "Missing restore button"
+            assert "Επαναφορά" in btn.text()
+            assert not btn.isEnabled(), \
+                "Restore button must be disabled initially"
+        finally:
+            page.deleteLater()
+
+    def test_restore_button_enabled_on_single_selection(self, qapp, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        # Create a backup so the table has a row
+        from infrastructure.backup_service import BackupService
+        svc = BackupService(backup_dir=backup_dir)
+        result = svc.create_backup(db_path)
+        assert result.ok
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            assert page._table.rowCount() >= 1
+            assert not page._restore_btn.isEnabled(), \
+                "Restore button disabled with no selection"
+
+            # Select the first row
+            page._table.selectRow(0)
+            page._update_restore_button_state()
+            assert page._restore_btn.isEnabled(), \
+                "Restore button should be enabled when one row selected"
+        finally:
+            page.shutdown()
+            page.deleteLater()
+
+    def test_restore_button_disabled_during_loading(self, qapp, tmp_path):
+        page = _make_page(tmp_path)
+        try:
+            page._loading = True
+            page._update_restore_button_state()
+            assert not page._restore_btn.isEnabled()
+        finally:
+            page.deleteLater()
+
+
+class TestRestoreDoesNotModifyActiveDB:
+    """Clicking restore in Qt never directly modifies the active DB."""
+
+    def test_restore_clicked_does_not_write_db(self, qapp, tmp_path,
+                                                monkeypatch):
+        """The restore handler itself spawns a worker and never writes
+        directly to the active DB. We verify by running the full flow
+        with QMessageBox patched to return No."""
+        import hashlib
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        from infrastructure.backup_service import BackupService
+        svc = BackupService(backup_dir=backup_dir)
+        result = svc.create_backup(db_path)
+        assert result.ok
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            # Select the first row
+            page._table.selectRow(0)
+            page._update_restore_button_state()
+            assert page._restore_btn.isEnabled()
+
+            # Patch the module-level QMessageBox so dialogs don't block
+            import qt_app.pages.settings_page as sp_mod
+            monkeypatch.setattr(
+                sp_mod, "QMessageBox", _FakeMessageBox)
+
+            # Hash active DB before
+            with open(db_path, "rb") as f:
+                hash_before = hashlib.sha256(f.read()).hexdigest()
+
+            # Simulate clicking restore
+            page._on_restore_clicked()
+
+            # Wait for worker thread to finish
+            if page._restore_thread is not None:
+                page._restore_thread.wait(5000)
+            # Call thread_done directly (no event loop)
+            page._on_restore_thread_done()
+
+            # Hash after
+            with open(db_path, "rb") as f:
+                hash_after = hashlib.sha256(f.read()).hexdigest()
+
+            assert hash_before == hash_after, \
+                "Active DB must never be modified by Qt restore flow"
+        finally:
+            page.shutdown()
+            page.deleteLater()
+
+
+class TestRestorePreparationFailure:
+    """Preparation failure keeps app open and reports error."""
+
+    def test_preparation_failure_keeps_app_open(self, qapp, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            from infrastructure.restore_service import RestorePreparation
+            fail_result = RestorePreparation(
+                ok=False,
+                error_message="Test prep failure",
+            )
+            # Simulate restore worker finishing with failure
+            page._restore_loading = True
+            page._restore_btn.setEnabled(False)
+            page._on_restore_done(fail_result)
+
+            assert "απέτυχε" in page._status_lbl.text()
+            # Buttons re-enabled — app stays open
+            assert page._backup_btn.isEnabled()
+            assert page._refresh_list_btn.isEnabled()
+            assert page._restore_btn.isEnabled()
+        finally:
+            page.shutdown()
+            page.deleteLater()
+
+
+class TestRestorePreparationSuccess:
+    """Successful preparation launches helper and requests shutdown."""
+
+    def test_preparation_success_launches_helper(self, qapp, tmp_path,
+                                                  monkeypatch):
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        request_path = str(
+            Path(backup_dir) / "test_req_restore_request.json")
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            from infrastructure.restore_service import RestorePreparation
+            success_result = RestorePreparation(
+                ok=True,
+                request_path=request_path,
+                request_id="test_req",
+                selected_backup_path=str(tmp_path / "some.db"),
+                active_db_path=db_path,
+                pre_restore_backup_path=str(tmp_path / "pre.db"),
+            )
+
+            # Mock _launch_restore_helper to succeed
+            import qt_app.pages.settings_page as sp
+            monkeypatch.setattr(
+                sp, "_launch_restore_helper",
+                lambda request_path: True,
+            )
+            # Patch QMessageBox to avoid blocking modal
+            monkeypatch.setattr(sp, "QMessageBox", _FakeMessageBox)
+
+            # Track if close was requested
+            close_called = []
+
+            class FakeWindow:
+                def close(self):
+                    close_called.append(True)
+
+            monkeypatch.setattr(page, "window", lambda: FakeWindow())
+
+            page._restore_loading = True
+            page._on_restore_done(success_result)
+
+            # Helper should have been launched, close requested
+            assert len(close_called) == 1, "Window close must be requested"
+        finally:
+            page.shutdown()
+            page.deleteLater()
+
+    def test_helper_launch_failure_keeps_app_open(self, qapp, tmp_path,
+                                                   monkeypatch):
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        request_path = str(
+            Path(backup_dir) / "test_fail_req_restore_request.json")
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            from infrastructure.restore_service import RestorePreparation
+            success_result = RestorePreparation(
+                ok=True,
+                request_path=request_path,
+                request_id="test_fail_req",
+                selected_backup_path=str(tmp_path / "some.db"),
+                active_db_path=db_path,
+                pre_restore_backup_path=str(tmp_path / "pre.db"),
+            )
+
+            # Mock _launch_restore_helper to fail
+            import qt_app.pages.settings_page as sp
+            monkeypatch.setattr(
+                sp, "_launch_restore_helper",
+                lambda request_path: False,
+            )
+            # Patch QMessageBox to avoid blocking modal
+            monkeypatch.setattr(sp, "QMessageBox", _FakeMessageBox)
+
+            page._restore_loading = True
+            page._restore_btn.setEnabled(False)
+            page._on_restore_done(success_result)
+
+            # App stays open — error shown, buttons re-enabled
+            assert "Αδυναμία" in page._status_lbl.text()
+            assert page._backup_btn.isEnabled()
+        finally:
+            page.shutdown()
+            page.deleteLater()
+
+
+class TestRestoreWorkerShutdown:
+    """No worker thread survives shutdown."""
+
+    def test_shutdown_stops_restore_worker(self, qapp, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            # Structural test: verify the restore worker refs exist
+            # and shutdown() returns True when no worker is running.
+            assert page._restore_thread is None
+            assert page._restore_worker is None
+            assert not page._restore_loading
+            assert page.shutdown()
+        finally:
+            page.deleteLater()
+
+
+class TestRestoreStatusBanner:
+    """On init, Settings shows the latest restore status if applicable."""
+
+    def test_banner_shows_success_status(self, qapp, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        # Write a success status file for this DB
+        import json
+        status_data = {
+            "request_id": "test_banner_001",
+            "success": True,
+            "timestamp": "2026-07-18T12:00:00",
+            "message": "Η επαναφορά ολοκληρώθηκε με επιτυχία.",
+            "active_db_path": str(Path(db_path).resolve()),
+        }
+        status_path = Path(backup_dir) / "test_banner_restore_status.json"
+        status_path.write_text(
+            json.dumps(status_data), encoding="utf-8")
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            banner = page._restore_status_banner
+            assert banner is not None
+            # In headless tests isVisible() may return False for
+            # widgets that were never shown on screen; check content.
+            assert "ολοκληρώθηκε" in banner.text()
+        finally:
+            page.shutdown()
+            page.deleteLater()
+
+    def test_banner_shows_failure_status(self, qapp, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        _make_db(db_path)
+        backup_dir = str(tmp_path / "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        import json
+        status_data = {
+            "request_id": "test_banner_002",
+            "success": False,
+            "timestamp": "2026-07-18T12:00:00",
+            "message": "Η επαναφορά απέτυχε.",
+            "active_db_path": str(Path(db_path).resolve()),
+        }
+        status_path = Path(backup_dir) / "test_banner_restore_status.json"
+        status_path.write_text(
+            json.dumps(status_data), encoding="utf-8")
+
+        page = SettingsPage(
+            db_service=None,
+            config={"db_path": db_path, "backup_dir": backup_dir},
+        )
+        try:
+            banner = page._restore_status_banner
+            assert banner is not None
+            # In headless tests isVisible() may return False
+            assert "απέτυχε" in banner.text()
+        finally:
+            page.shutdown()
+            page.deleteLater()
+
+    def test_banner_hidden_when_no_status(self, qapp, tmp_path):
+        page = _make_page(tmp_path)
+        try:
+            banner = page._restore_status_banner
+            assert banner is not None
+            assert not banner.isVisible()
+        finally:
+            page.deleteLater()

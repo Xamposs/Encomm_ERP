@@ -13,16 +13,16 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QThread, Signal, QObject
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QWidget, QFrame, QScrollArea,
+    QMessageBox,
 )
 
 from qt_app.pages.base_page import BasePage
 from qt_app import styles
-from PySide6.QtGui import QColor
 
 
 # ── Pilot metadata (read-only shell information) ─────────────────────────
@@ -54,6 +54,37 @@ class _BackupWorker(QObject):
         self.finished.emit(result)
 
 
+class _RestoreWorker(QObject):
+    """Runs ``RestoreService.prepare_restore`` on a background thread."""
+
+    finished = Signal(object)  # RestorePreparation
+
+    def __init__(
+        self,
+        selected_backup: str,
+        active_db_path: str,
+        backup_dir: str,
+        parent_pid: int,
+        parent: QObject | None = None,
+    ):
+        super().__init__(parent)
+        self._selected_backup = selected_backup
+        self._active_db_path = active_db_path
+        self._backup_dir = backup_dir
+        self._parent_pid = parent_pid
+
+    def run(self) -> None:
+        from infrastructure.restore_service import RestoreService
+        svc = RestoreService()
+        result = svc.prepare_restore(
+            selected_backup=self._selected_backup,
+            active_db_path=self._active_db_path,
+            backup_dir=self._backup_dir,
+            parent_pid=self._parent_pid,
+        )
+        self.finished.emit(result)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Settings page
 # ═══════════════════════════════════════════════════════════════════════
@@ -76,6 +107,11 @@ class SettingsPage(BasePage):
         self._thread: QThread | None = None
         self._loading = False
         self._close_pending = False
+        # Restore-specific state
+        self._restore_worker: _RestoreWorker | None = None
+        self._restore_thread: QThread | None = None
+        self._restore_loading = False
+        self._restore_status_banner: QLabel | None = None
         super().__init__(db_service, config, parent)
 
     # ── UI construction ──────────────────────────────────────────────
@@ -107,6 +143,7 @@ class SettingsPage(BasePage):
 
         self._built = True
         self._refresh_list()
+        self._check_restore_status()
 
     # ── «Γενικά» — read-only pilot & database information ────────────
 
@@ -239,6 +276,34 @@ class SettingsPage(BasePage):
 
         btn_row.addStretch()
         lay.addLayout(btn_row)
+
+        # Restore button row
+        restore_row = QHBoxLayout()
+        restore_row.setSpacing(10)
+        self._restore_btn = QPushButton(
+            "♻️  Επαναφορά επιλεγμένου αντιγράφου"
+        )
+        self._restore_btn.setCursor(Qt.PointingHandCursor)
+        self._restore_btn.setEnabled(False)
+        self._restore_btn.setStyleSheet(
+            f"QPushButton {{ background: {styles.RED}; color: white; "
+            f"border-radius: 6px; padding: 10px 22px; "
+            f"font-size: 13px; font-weight: bold; border: none; }}"
+            f"QPushButton:hover {{ background: #DC2626; }}"
+            f"QPushButton:disabled {{ background: #3b3f48; color: #6b7280; }}"
+        )
+        self._restore_btn.clicked.connect(self._on_restore_clicked)
+        restore_row.addWidget(self._restore_btn)
+        restore_row.addStretch()
+        lay.addLayout(restore_row)
+
+        # Restore status banner (hidden by default)
+        self._restore_status_banner = QLabel("")
+        self._restore_status_banner.setWordWrap(True)
+        self._restore_status_banner.setVisible(False)
+        self._restore_status_banner.setStyleSheet(
+            "font-size: 13px; padding: 8px 12px; border-radius: 6px;")
+        lay.addWidget(self._restore_status_banner)
 
         # Status / result label
         self._status_lbl = QLabel("")
@@ -454,6 +519,186 @@ class SettingsPage(BasePage):
             self._close_pending = False
             self.shutdown_ready.emit()
 
+    def _on_restore_thread_done(self) -> None:
+        self._restore_loading = False
+        self._restore_worker = None
+        self._restore_thread = None
+        self._update_restore_button_state()
+        if self._close_pending:
+            self._maybe_finish_shutdown()
+
+    def _update_restore_button_state(self) -> None:
+        """Enable restore button only when exactly one row is selected
+        and no worker is active."""
+        if self._loading or self._restore_loading:
+            self._restore_btn.setEnabled(False)
+            return
+        selected = self._table.selectionModel().selectedRows()
+        self._restore_btn.setEnabled(len(selected) == 1)
+
+    # ── Restore flow ────────────────────────────────────────────────
+
+    def _on_restore_clicked(self) -> None:
+        if self._loading or self._restore_loading:
+            return
+        selected_rows = self._table.selectionModel().selectedRows()
+        if len(selected_rows) != 1:
+            return
+
+        row = selected_rows[0].row()
+        backup_path = self._table.item(row, 0).data(Qt.UserRole)
+        if not backup_path:
+            return
+
+        backup_name = self._table.item(row, 0).text()
+
+        # ── First confirmation ─────────────────────────────────
+        reply1 = QMessageBox.warning(
+            self,
+            "Επαναφορά Αντιγράφου Ασφαλείας",
+            f"Πρόκειται να επαναφέρετε το αντίγραφο:\n\n"
+            f"📁 {backup_name}\n\n"
+            "⚠️  Τα τρέχοντα τοπικά δεδομένα θα αντικατασταθούν.\n"
+            "Ένα νέο αντίγραφο ασφαλείας θα δημιουργηθεί αυτόματα\n"
+            "πριν από την επαναφορά.\n\n"
+            "Θέλετε να συνεχίσετε;",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply1 != QMessageBox.Yes:
+            return
+
+        # ── Second confirmation ────────────────────────────────
+        reply2 = QMessageBox.critical(
+            self,
+            "Επιβεβαίωση Επαναφοράς",
+            "Η εφαρμογή θα κλείσει και τα δεδομένα σας θα\n"
+            "αντικατασταθούν από το επιλεγμένο αντίγραφο.\n\n"
+            "Αυτή η ενέργεια ΔΕΝ μπορεί να αναιρεθεί από\n"
+            "την εφαρμογή (διατηρείται το αντίγραφο ασφαλείας).\n\n"
+            "Είστε απολύτως βέβαιοι;",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply2 != QMessageBox.Yes:
+            return
+
+        # ── Run preparation in background thread ────────────────
+        self._restore_loading = True
+        self._backup_btn.setEnabled(False)
+        self._refresh_list_btn.setEnabled(False)
+        self._restore_btn.setEnabled(False)
+        self._set_status(
+            "🔄 Προετοιμασία επαναφοράς — επαλήθευση αντιγράφου...",
+            styles.TEXT_MUTED,
+        )
+
+        self._cleanup_restore_worker()
+
+        import os as _os
+
+        self._restore_thread = QThread(self)
+        self._restore_worker = _RestoreWorker(
+            selected_backup=backup_path,
+            active_db_path=self._db_path,
+            backup_dir=self._resolve_backup_dir(),
+            parent_pid=_os.getpid(),
+        )
+        self._restore_worker.moveToThread(self._restore_thread)
+
+        self._restore_thread.started.connect(self._restore_worker.run)
+        self._restore_worker.finished.connect(self._on_restore_done)
+        self._restore_worker.finished.connect(self._restore_thread.quit)
+        self._restore_thread.finished.connect(
+            self._restore_worker.deleteLater)
+        self._restore_thread.finished.connect(
+            self._restore_thread.deleteLater)
+        self._restore_thread.finished.connect(self._on_restore_thread_done)
+
+        self._restore_thread.start()
+
+    def _on_restore_done(self, result) -> None:
+        if self._close_pending:
+            return
+        from infrastructure.restore_service import RestorePreparation
+        if not result.ok:
+            self._set_status(
+                f"❌ Η προετοιμασία επαναφοράς απέτυχε: {result.error_message}",
+                styles.RED,
+            )
+            self._backup_btn.setEnabled(True)
+            self._refresh_list_btn.setEnabled(True)
+            self._restore_btn.setEnabled(True)
+            return
+
+        # ── Launch helper process detached ──────────────────────
+        import sys
+
+        success = _launch_restore_helper(
+            request_path=result.request_path,
+        )
+
+        if not success:
+            self._set_status(
+                "❌ Αδυναμία εκκίνησης της βοηθητικής διαδικασίας "
+                "επαναφοράς. Η εφαρμογή παραμένει ανοιχτή.",
+                styles.RED,
+            )
+            self._backup_btn.setEnabled(True)
+            self._refresh_list_btn.setEnabled(True)
+            self._restore_btn.setEnabled(True)
+            # Clean up stale request file so it doesn't confuse later
+            _clean_request_file(result.request_path)
+            return
+
+        # ── Warn and close ──────────────────────────────────────
+        QMessageBox.information(
+            self,
+            "Επαναφορά σε εξέλιξη",
+            "Η βοηθητική διαδικασία επαναφοράς ξεκίνησε.\n\n"
+            "Η εφαρμογή θα κλείσει τώρα.\n"
+            "Ανοίξτε την ξανά χειροκίνητα μετά από λίγα δευτερόλεπτα.",
+        )
+        self._close_pending = True
+        # Request the MainWindow to close
+        if self.window():
+            self.window().close()
+
+    def _check_restore_status(self) -> None:
+        """Read the latest restore status for the current DB and show a banner."""
+        if self._restore_status_banner is None:
+            return
+        try:
+            from infrastructure.restore_service import read_latest_status
+            status = read_latest_status(
+                db_path=self._db_path,
+                backup_dir=self._resolve_backup_dir(),
+            )
+        except Exception:
+            return
+        if status is None:
+            return
+
+        if status.success:
+            bg = "#1B3A1B"
+            fg = styles.GREEN
+            icon = "✅"
+        else:
+            bg = "#3A1B1B"
+            fg = styles.RED
+            icon = "❌"
+
+        self._restore_status_banner.setText(
+            f"{icon}  Τελευταία επαναφορά ({status.timestamp}):\n"
+            f"{status.message}"
+        )
+        self._restore_status_banner.setStyleSheet(
+            f"background: {bg}; color: {fg}; font-size: 13px; "
+            f"padding: 8px 12px; border: 1px solid {fg}; "
+            f"border-radius: 6px;"
+        )
+        self._restore_status_banner.setVisible(True)
+
     # ── Helpers ─────────────────────────────────────────────────────
 
     def _set_status(self, text: str, color: str) -> None:
@@ -471,8 +716,10 @@ class SettingsPage(BasePage):
         from infrastructure.backup_service import BackupInfo
         self._table.setRowCount(len(backups))
         for r, bi in enumerate(backups):
-            # Filename
-            self._table.setItem(r, 0, QTableWidgetItem(bi.filename))
+            # Filename — store the full path as UserRole data
+            name_item = QTableWidgetItem(bi.filename)
+            name_item.setData(Qt.UserRole, bi.path)
+            self._table.setItem(r, 0, name_item)
             # Date / time
             dt = bi.created_at.replace("T", "  ") if bi.created_at else "—"
             self._table.setItem(r, 1, QTableWidgetItem(dt))
@@ -487,21 +734,110 @@ class SettingsPage(BasePage):
             item.setForeground(QColor(styles.TEXT_MUTED))
             self._table.setItem(r, 3, item)
 
+        # Enable single-row selection
+        self._table.setSelectionMode(
+            self._table.selectionMode().__class__.SingleSelection
+        )
+        # Connect selection changes to button state
+        if self._table.selectionModel() is not None:
+            self._table.selectionModel().selectionChanged.connect(
+                self._update_restore_button_state
+            )
+
     # ── Shutdown contract ────────────────────────────────────────────
 
     def shutdown(self) -> bool:
-        if self._thread is None or not self._thread.isRunning():
-            return True
-        try:
-            self._worker.finished.disconnect(self._on_backup_done)
-        except (RuntimeError, TypeError):
-            pass
-        self._close_pending = True
-        self._thread.quit()
-        if self._thread.wait(2000):
-            self._loading = False
-            self._worker = None
-            self._thread = None
+        all_stopped = True
+
+        # Backup worker
+        if self._thread is not None and self._thread.isRunning():
+            try:
+                self._worker.finished.disconnect(self._on_backup_done)
+            except (RuntimeError, TypeError):
+                pass
+            self._close_pending = True
+            self._thread.quit()
+            if self._thread.wait(2000):
+                self._loading = False
+                self._worker = None
+                self._thread = None
+            else:
+                all_stopped = False
+
+        # Restore worker
+        if (self._restore_thread is not None
+                and self._restore_thread.isRunning()):
+            try:
+                self._restore_worker.finished.disconnect(
+                    self._on_restore_done)
+            except (RuntimeError, TypeError):
+                pass
+            self._close_pending = True
+            self._restore_thread.quit()
+            if self._restore_thread.wait(2000):
+                self._restore_loading = False
+                self._restore_worker = None
+                self._restore_thread = None
+            else:
+                all_stopped = False
+
+        if all_stopped:
             self._close_pending = False
             return True
         return False
+
+    def _maybe_finish_shutdown(self) -> None:
+        if not self._close_pending:
+            return
+        backup_running = (
+            self._thread is not None and self._thread.isRunning()
+        )
+        restore_running = (
+            self._restore_thread is not None
+            and self._restore_thread.isRunning()
+        )
+        if not backup_running and not restore_running:
+            self._close_pending = False
+            self.shutdown_ready.emit()
+
+    def _cleanup_restore_worker(self) -> None:
+        if (self._restore_thread is not None
+                and self._restore_thread.isRunning()):
+            self._restore_thread.quit()
+            self._restore_thread.wait(2000)
+        self._restore_worker = None
+        self._restore_thread = None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Module-level helper — used by SettingsPage for process launch
+# ═══════════════════════════════════════════════════════════════════════
+
+def _launch_restore_helper(request_path: str) -> bool:
+    """Launch the restore helper as a detached process.
+
+    Returns True if the process was launched successfully.
+    """
+    import sys
+    from PySide6.QtCore import QProcess
+
+    python_exe = sys.executable
+    args = [
+        "-m", "infrastructure.restore_helper",
+        "--request", request_path,
+    ]
+    # Use the project root as working directory so module imports resolve
+    import os as _os
+    workdir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+
+    success = QProcess.startDetached(python_exe, args, workdir)
+    return success
+
+
+def _clean_request_file(request_path: str) -> None:
+    """Remove a stale restore request file."""
+    from pathlib import Path
+    try:
+        Path(request_path).unlink(missing_ok=True)
+    except OSError:
+        pass
