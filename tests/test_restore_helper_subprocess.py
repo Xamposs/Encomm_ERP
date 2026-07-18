@@ -10,13 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 # ── Project root (for subprocess cwd) ────────────────────────────────────
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -108,6 +105,23 @@ def _run_helper(request_path: str, timeout: int = 30) -> subprocess.CompletedPro
     )
 
 
+def _finished_child_pid() -> int:
+    """Return the PID of a short-lived child process that has already exited.
+
+    Spawns ``python -c \"pass\"``, waits for it to finish, and returns its
+    PID.  The helper's parent-exit guard sees this as a dead process and
+    proceeds immediately — no magic PID, no race.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pid = proc.pid
+    proc.wait(timeout=10)
+    return pid
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Success path
 # ══════════════════════════════════════════════════════════════════════════
@@ -137,7 +151,7 @@ def test_helper_subprocess_success(tmp_path):
         "selected_backup_path": str(selected.resolve()),
         "active_db_path": str(active.resolve()),
         "pre_restore_backup_path": str(pre_restore.resolve()),
-        "parent_pid": 999999,  # non-existent → helper proceeds immediately
+        "parent_pid": _finished_child_pid(),
         "status_path": str(status_path.resolve()),
     }
     request_path.write_text(
@@ -220,7 +234,7 @@ def test_helper_subprocess_fails_on_corrupt_pre_restore(tmp_path):
         "selected_backup_path": str(selected.resolve()),
         "active_db_path": str(active.resolve()),
         "pre_restore_backup_path": str(pre_restore.resolve()),
-        "parent_pid": 999999,
+        "parent_pid": _finished_child_pid(),
         "status_path": str(status_path.resolve()),
     }
     request_path.write_text(
