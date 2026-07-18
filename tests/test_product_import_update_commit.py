@@ -772,7 +772,11 @@ class TestDialogC3Gating:
             return dlg
         yield _make
         for dlg in dialogs:
-            dlg.close()
+            if dlg.is_busy():
+                dlg.request_shutdown()
+                dlg.await_shutdown(timeout_ms=5000)
+            if not dlg.is_busy():
+                dlg.close()
             dlg.deleteLater()
 
     def _plan(self):

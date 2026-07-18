@@ -31,7 +31,11 @@ def dialog_factory(request, qapp):
     yield _make
 
     for dlg in dialogs:
-        dlg.close()
+        if dlg.is_busy():
+            dlg.request_shutdown()
+            dlg.await_shutdown(timeout_ms=5000)
+        if not dlg.is_busy():
+            dlg.close()
         dlg.deleteLater()
 
 
@@ -437,3 +441,53 @@ class TestInventoryRefresh:
         ip_mod.InventoryPage._on_import_completed(page, 3)
         assert "refresh" in calls
         assert "dashboard" in calls
+
+
+class TestShutdownRegression:
+    """Real worker shutdown while dialog is closing — no stale callback or crash."""
+
+    def test_shutdown_while_inspect_worker_active_no_crash(
+            self, dialog_factory, tmp_path):
+        """Close dialog while a real inspect worker runs on a real .xlsx.
+        Verifies bounded wait, safe thread completion, and no crash from
+        stale queued callbacks on later event processing.
+        """
+        import openpyxl
+        from PySide6.QtCore import QCoreApplication
+
+        # Create a minimal real .xlsx for the worker to scan
+        xlsx = tmp_path / "regression.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "TestSheet"
+        ws.append(["Barcode", "Name", "Stock", "Price", "Expiry"])
+        ws.append(["ABC001", "Widget", "100", "9.99", "2026-12-31"])
+        wb.save(str(xlsx))
+
+        d = dialog_factory()
+        # Set up file state and start a real inspect worker on the real xlsx
+        d._file_path = str(xlsx)
+        d._file_gen = 1
+        d._current_file_path = str(xlsx)
+        d._inspect_file()  # starts real _InspectWorker QThread
+
+        assert d.is_busy(), "Inspect worker QThread should be running"
+
+        # Close dialog while worker is active — reject() sets _closing=True
+        # and sets the cancel event, but does NOT reject the dialog yet
+        d.reject()
+        assert d._closing, "Dialog should be in closing state"
+
+        # Bounded wait for the worker thread to finish naturally
+        finished = d.await_shutdown(timeout_ms=8000)
+        assert finished, (
+            "Inspect worker thread must complete within 8s timeout")
+
+        # Thread is done, _on_thread_done has called super().reject()
+        assert not d.is_busy(), "Dialog must report not busy after shutdown"
+
+        # Process events — must not deliver stale callbacks or crash
+        QCoreApplication.processEvents()
+        QCoreApplication.processEvents()
+
+        # Reaching here means no crash from stale queued callback

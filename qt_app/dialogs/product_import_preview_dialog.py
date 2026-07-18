@@ -174,6 +174,33 @@ class ProductImportPreviewDialog(QDialog):
         self._status_lbl.setText("Ακύρωση προεπισκόπησης…")
         self._status_lbl.setStyleSheet(f"color: {styles.AMBER}; font-size: 12px;")
 
+    def await_shutdown(self, timeout_ms: int = 5000) -> bool:
+        """Block bounded until the worker thread stops.
+
+        Returns True if the thread stopped within timeout_ms, False on timeout.
+        Never blocks indefinitely. Active thread refs are preserved on timeout.
+
+        After the thread stops, pending events are processed to drain
+        cross-thread signal deliveries (thread.finished → _on_thread_done).
+        """
+        if not self.is_busy():
+            return True
+        if isinstance(self._thread, QThread) and self._thread.isRunning():
+            # Call quit() directly — the queued connection from worker.finished
+            # may be stuck in the main-thread event queue when the main thread
+            # is about to block on wait(), causing a cross-thread deadlock.
+            self._thread.quit()
+            if not self._thread.wait(timeout_ms):
+                # timeout — refs preserved
+                return False
+        if isinstance(self._thread, QThread) and self._thread.isFinished():
+            # Drain queued thread.finished signal handlers (_on_thread_done
+            # and deleteLater calls) that were posted back to the main thread.
+            from PySide6.QtCore import QCoreApplication
+            QCoreApplication.processEvents()
+            QCoreApplication.processEvents()
+        return True
+
     # ── UI ────────────────────────────────────────────────────────────
     def _build_ui(self):
         lay = QVBoxLayout(self)
@@ -459,6 +486,8 @@ class ProductImportPreviewDialog(QDialog):
             self._on_inspect_done)
 
     def _on_inspect_done(self, result: _InspectResult):
+        if self._closing:
+            return
         if (result.token != self._inspect_token
                 or result.file_path != self._current_file_path):
             return
@@ -563,6 +592,8 @@ class ProductImportPreviewDialog(QDialog):
             self._on_conflict_done)
 
     def _on_conflict_done(self, result):
+        if self._closing:
+            return
         self._progress.hide()
         self._cancel_btn.hide()
         self._no_write_lbl.show()
@@ -808,6 +839,8 @@ class ProductImportPreviewDialog(QDialog):
             self._on_update_commit_done)
 
     def _on_commit_done(self, result):
+        if self._closing:
+            return
         self._progress.hide()
         self._cancel_btn.hide()
         self._operation = ""
@@ -842,6 +875,8 @@ class ProductImportPreviewDialog(QDialog):
 
     def _on_update_commit_done(self, result):
         """C3 update completion handler."""
+        if self._closing:
+            return
         self._progress.hide()
         self._cancel_btn.hide()
         self._operation = ""
@@ -890,6 +925,8 @@ class ProductImportPreviewDialog(QDialog):
 
     # ── Render results (called from worker finished, before thread done)
     def _on_preview_done(self, result: ProductImportPreview):
+        if self._closing:
+            return
         self._progress.hide()
         self._cancel_btn.hide()
         self._no_write_lbl.show()
