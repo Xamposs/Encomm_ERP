@@ -33,10 +33,16 @@ def dialog_factory(request, qapp):
     for dlg in dialogs:
         if dlg.is_busy():
             dlg.request_shutdown()
-            dlg.await_shutdown(timeout_ms=5000)
+            finished = dlg.await_shutdown(timeout_ms=5000)
+            if not finished:
+                # Timeout — preserve thread refs, fail teardown clearly
+                pytest.fail(
+                    f"ProductImportPreviewDialog shutdown timed out "
+                    f"(thread still running)")
+                continue
         if not dlg.is_busy():
             dlg.close()
-        dlg.deleteLater()
+            dlg.deleteLater()
 
 
 class TestBusyLifecycle:

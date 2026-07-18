@@ -409,6 +409,12 @@ class TestRealLifecycle:
         # (finished → _on_adjust_done → quit → _on_adjust_thread_done)
         _pump_until(lambda: inventory_page._adj_thread is None)
 
+        # _on_adjust_done calls refresh() which starts a new read worker.
+        # Wait for that inventory refresh chain to finish as well before
+        # asserting final control state.
+        _pump_until(lambda: not inventory_page._loading
+                    and inventory_page._thread is None)
+
         # Production callbacks must have restored state
         assert not inventory_page._adj_loading
         assert inventory_page._adj_worker is None
