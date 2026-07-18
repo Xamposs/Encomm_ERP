@@ -9,10 +9,10 @@ Navigation is via sidebar button clicks.  The active button is highlighted.
 Pages are created lazily on first access and cached.
 """
 
-from PySide6.QtCore import Qt, QTimer, QDateTime, QLocale
+from PySide6.QtCore import Qt, QEvent, QObject, QTimer, QDateTime, QLocale
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QLineEdit, QButtonGroup,
     QStackedWidget, QStatusBar, QSizePolicy,
 )
@@ -59,6 +59,47 @@ NAV_QSS = (
     "  background: #252b36; color: #3B82F6; "
     "  font-weight: bold; }"
 )
+
+
+class _ClickToBlurFilter(QObject):
+    """Window-level filter: clears QLineEdit focus on outside clicks.
+
+    Installed on the MainWindow's QWindow handle (not on the whole
+    QApplication), so it sees every mouse press inside THIS window and
+    nothing else — dialogs, popups and other top-level windows have
+    their own QWindow and are never affected, and no application-wide
+    event wrapping takes place.
+
+    It NEVER consumes the event (always returns False), so the click
+    still reaches its intended target: buttons keep firing, tables keep
+    selecting, other inputs keep receiving focus.  Clearing focus does
+    not touch the line-edit text or any page state.
+
+    Lifetime: the filter is a child QObject of its MainWindow, so it is
+    destroyed together with the window; Qt automatically removes a
+    destroyed filter from the objects it monitors — closed test windows
+    cannot leak an event filter.
+    """
+
+    def __init__(self, window: QMainWindow):
+        super().__init__(window)
+        self._window = window
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonPress:
+            focused = QApplication.focusWidget()
+            if (isinstance(focused, QLineEdit)
+                    and focused.window() is self._window):
+                # Window-local coordinates → widget under the click.
+                pos = event.position().toPoint()
+                target = self._window.childAt(pos)
+                inside = (target is focused
+                          or (target is not None
+                              and focused.isAncestorOf(target)))
+                if not inside:
+                    # Outside click: drop the caret, keep text and state.
+                    focused.clearFocus()
+        return False  # never swallow — the target still gets the click
 
 
 class MainWindow(QMainWindow):
@@ -193,12 +234,31 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._status_lbl)
         self.setStatusBar(sb)
 
+        # ── Click-to-blur: outside clicks drop QLineEdit focus ───────
+        # The filter attaches to this window's QWindow handle on show
+        # (see showEvent) and dies with the window — strictly scoped,
+        # no application-global event filtering.
+        self._blur_filter = _ClickToBlurFilter(self)
+
         # ── Start on dashboard + start clock ─────────────────────────
         self.navigate_to("dashboard")
         self._update_clock()
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._update_clock)
         self._clock_timer.start(1000)
+
+    # ── Click-to-blur installation ────────────────────────────────────
+    def showEvent(self, event) -> None:
+        """Attach the blur filter to this window's native handle.
+
+        The QWindow handle only exists once the widget is shown; it can
+        also be recreated, so (re)install on every show.  Installing an
+        already-installed filter is a documented no-op reorder in Qt.
+        """
+        super().showEvent(event)
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.installEventFilter(self._blur_filter)
 
     # ── Clock ─────────────────────────────────────────────────────────
     def _update_clock(self):

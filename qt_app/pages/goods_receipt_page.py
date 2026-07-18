@@ -6,14 +6,14 @@ import sqlite3
 from datetime import date
 from typing import Any
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QCheckBox, QStackedWidget,
     QWidget, QFrame, QFormLayout, QSpinBox, QDoubleSpinBox,
-    QDateEdit, QSplitter, QGroupBox, QSizePolicy,
+    QDateEdit, QSplitter, QGroupBox, QSizePolicy, QScrollArea,
 )
 
 from qt_app.pages.base_page import BasePage
@@ -132,8 +132,14 @@ class GoodsReceiptPage(BasePage):
         self._draft_lines: list[dict] = []  # in-memory lines for new draft
         self._supplier_map: dict[int, str] = {}  # id → name for combo
         self._pending_list_refresh = False   # deferred refresh after worker completes
+        self._detail_active = False          # detail/editor pane visible?
 
         super().__init__(db_service, config, parent)
+
+        # Deferred splitter re-proportioning (dies with the page)
+        self._split_timer = QTimer(self)
+        self._split_timer.setSingleShot(True)
+        self._split_timer.timeout.connect(self._apply_detail_split)
 
     # ── UI construction ───────────────────────────────────────────────
 
@@ -155,7 +161,8 @@ class GoodsReceiptPage(BasePage):
         self._search.returnPressed.connect(self._on_search)
         tb.addWidget(self._search, 2)
 
-        self._refresh_btn = QPushButton("🔄  Ανανέωση")
+        self._refresh_btn = QPushButton("🔄")
+        self._refresh_btn.setToolTip("Ανανέωση λίστας")
         self._refresh_btn.setCursor(Qt.PointingHandCursor)
         self._refresh_btn.setStyleSheet(self._btn_qss())
         self._refresh_btn.clicked.connect(self._do_list_refresh)
@@ -180,8 +187,12 @@ class GoodsReceiptPage(BasePage):
         self._list_table = QTableWidget(0, len(self.LIST_COLS))
         self._list_table.setHorizontalHeaderLabels(self.LIST_COLS)
         h = self._list_table.horizontalHeader()
-        h.setStretchLastSection(True)
-        for i in range(len(self.LIST_COLS)):
+        # Responsive columns: supplier stretches to absorb spare width,
+        # data columns fit content — no fixed widths, no needless
+        # horizontal scrollbar at normal desktop sizes.
+        h.setStretchLastSection(False)
+        h.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, len(self.LIST_COLS)):
             h.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         self._list_table.verticalHeader().setVisible(False)
         self._list_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -191,7 +202,8 @@ class GoodsReceiptPage(BasePage):
 
         # Pagination
         pg = QHBoxLayout()
-        self._prev_btn = QPushButton("◀  Προηγούμενη")
+        self._prev_btn = QPushButton("◀")
+        self._prev_btn.setToolTip("Προηγούμενη σελίδα")
         self._prev_btn.clicked.connect(lambda: self._go_page(-1))
         pg.addWidget(self._prev_btn)
         pg.addStretch()
@@ -200,12 +212,13 @@ class GoodsReceiptPage(BasePage):
             f"color: {styles.TEXT_PRIMARY}; font-size: 13px;")
         pg.addWidget(self._page_lbl)
         pg.addStretch()
-        self._next_btn = QPushButton("Επόμενη  ▶")
+        self._next_btn = QPushButton("▶")
+        self._next_btn.setToolTip("Επόμενη σελίδα")
         self._next_btn.clicked.connect(lambda: self._go_page(1))
         pg.addWidget(self._next_btn)
         left_lay.addLayout(pg)
 
-        # ── RIGHT panel: detail/editor stack ─────────────────────────
+        # ── RIGHT panel: detail/editor stack (hidden in list mode) ───
         right = QWidget()
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
@@ -213,32 +226,72 @@ class GoodsReceiptPage(BasePage):
 
         self._right_stack = QStackedWidget()
 
-        # Page 0 — empty placeholder
-        place = QLabel("Επιλέξτε παραλαβή από τη λίστα ή δημιουργήστε νέα.")
-        place.setAlignment(Qt.AlignCenter)
-        place.setStyleSheet(f"color: {styles.TEXT_MUTED}; font-size: 15px;")
-        place.setWordWrap(True)
-        self._right_stack.addWidget(place)
-
-        # Page 1 — review panel
+        # Index 0 — review panel (scrolls at reduced window sizes)
         self._review_panel = self._build_review_panel()
-        self._right_stack.addWidget(self._review_panel)
+        self._right_stack.addWidget(self._wrap_scroll(self._review_panel))
 
-        # Page 2 — editor panel
+        # Index 1 — editor panel (scrolls at reduced window sizes)
         self._editor_panel = self._build_editor_panel()
-        self._right_stack.addWidget(self._editor_panel)
+        self._right_stack.addWidget(self._wrap_scroll(self._editor_panel))
 
         right_lay.addWidget(self._right_stack, 1)
 
         # ── Add to splitter ───────────────────────────────────────────
+        # No fixed pane widths: in list mode the right pane is hidden so
+        # the receipt list uses the full page width; in detail mode the
+        # splitter allocates ~42% list / ~58% detail (user-adjustable).
         splitter.addWidget(left)
         splitter.addWidget(right)
-        splitter.setSizes([400, 650])
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        self._splitter = splitter
+        self._right_panel = right
+        self._right_panel.hide()
         self.root_layout.addWidget(splitter, 1)
 
         # Kick off first load
         self._mode = "list"
         self._do_list_refresh()
+
+    @staticmethod
+    def _wrap_scroll(panel: QWidget) -> QScrollArea:
+        """Wrap a detail panel so reduced window sizes scroll, never clip."""
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setStyleSheet("QScrollArea { background: transparent; }")
+        area.viewport().setAutoFillBackground(False)
+        area.setWidget(panel)
+        return area
+
+    # ── List/detail mode switching ────────────────────────────────────
+
+    def _set_detail_visible(self, visible: bool) -> None:
+        """Toggle the detail/editor pane.
+
+        List mode (False): the pane is hidden and the receipt list takes
+        the full page width.  Detail mode (True): the pane is revealed
+        and the splitter allocates ~42% list / ~58% detail.
+        """
+        if self._detail_active == visible:
+            return
+        self._detail_active = visible
+        self._right_panel.setVisible(visible)
+        if visible:
+            self._apply_detail_split()
+            # Re-apply once the pane's show/layout pass has settled —
+            # QSplitter redistributes on child-show and would otherwise
+            # override the requested proportions.  Parented single-shot
+            # timer: auto-cancelled if the page is destroyed first.
+            self._split_timer.start(0)
+
+    def _apply_detail_split(self) -> None:
+        """Allocate ~42% list / ~58% detail of the current splitter width."""
+        if not self._detail_active:
+            return
+        total = max(self._splitter.width(), 200)
+        left_w = int(total * 0.42)
+        self._splitter.setSizes([left_w, total - left_w])
 
     # ── Review panel ─────────────────────────────────────────────────
 
@@ -259,22 +312,26 @@ class GoodsReceiptPage(BasePage):
         self._review_lines = QTableWidget(0, len(self.LINE_COLS))
         self._review_lines.setHorizontalHeaderLabels(self.LINE_COLS)
         rh = self._review_lines.horizontalHeader()
-        rh.setStretchLastSection(True)
+        rh.setStretchLastSection(False)
         for i in range(len(self.LINE_COLS)):
             rh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        rh.setSectionResizeMode(2, QHeaderView.Stretch)  # Προϊόν absorbs width
         self._review_lines.verticalHeader().setVisible(False)
         self._review_lines.setEditTriggers(QTableWidget.NoEditTriggers)
         self._review_lines.setSelectionBehavior(QTableWidget.SelectRows)
         lay.addWidget(self._review_lines, 1)
 
-        # Controls
-        ctrl = QHBoxLayout()
+        # Controls — checkbox on its own row so narrow detail panes
+        # never clip the action buttons below it.
         self._confirm_cb = QCheckBox(
             "✅  Επιβεβαιώνω ότι έχω ελέγξει όλες τις γραμμές και τα προϊόντα")
         self._confirm_cb.setStyleSheet(
             f"color: {styles.TEXT_PRIMARY}; font-size: 13px;")
         self._confirm_cb.toggled.connect(self._on_confirm_toggled)
+        lay.addWidget(self._confirm_cb)
 
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(8)
         self._approve_btn = QPushButton("✔  Έγκριση Παραλαβής")
         self._approve_btn.setCursor(Qt.PointingHandCursor)
         self._approve_btn.setStyleSheet(self._approve_btn_qss())
@@ -292,9 +349,9 @@ class GoodsReceiptPage(BasePage):
         self._back_btn.setStyleSheet(self._btn_qss())
         self._back_btn.clicked.connect(self._back_to_list)
 
-        ctrl.addWidget(self._confirm_cb, 1)
         ctrl.addWidget(self._approve_btn)
         ctrl.addWidget(self._cancel_btn)
+        ctrl.addStretch()
         ctrl.addWidget(self._back_btn)
         lay.addLayout(ctrl)
 
@@ -360,9 +417,10 @@ class GoodsReceiptPage(BasePage):
         self._edit_lines_table = QTableWidget(0, len(self.LINE_COLS))
         self._edit_lines_table.setHorizontalHeaderLabels(self.LINE_COLS)
         eh = self._edit_lines_table.horizontalHeader()
-        eh.setStretchLastSection(True)
+        eh.setStretchLastSection(False)
         for i in range(len(self.LINE_COLS)):
             eh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        eh.setSectionResizeMode(2, QHeaderView.Stretch)  # Προϊόν absorbs width
         self._edit_lines_table.verticalHeader().setVisible(False)
         self._edit_lines_table.setSelectionBehavior(QTableWidget.SelectRows)
         lay.addWidget(self._edit_lines_table, 1)
@@ -479,7 +537,8 @@ class GoodsReceiptPage(BasePage):
         self._edit_notes.clear()
         self._draft_lines = []
         self._rebuild_edit_lines_table()
-        self._right_stack.setCurrentIndex(2)  # editor
+        self._right_stack.setCurrentIndex(1)  # editor
+        self._set_detail_visible(True)
 
     def _on_add_line(self) -> None:
         self._draft_lines.append({
@@ -629,10 +688,12 @@ class GoodsReceiptPage(BasePage):
         })
 
     def _back_to_list(self) -> None:
-        self._right_stack.setCurrentIndex(0)  # placeholder
+        self._set_detail_visible(False)  # full-width list again
         self._selected_receipt_id = None
         self._confirm_cb.setChecked(False)
         self._draft_lines = []
+        # Drop row selection so re-selecting the same receipt re-opens it
+        self._list_table.clearSelection()
 
     def _request_list_refresh(self) -> None:
         """Schedule a list refresh.  If a worker is active, defer until it finishes.
@@ -709,7 +770,7 @@ class GoodsReceiptPage(BasePage):
     def _on_detail_result(self, result: GetReceiptResult) -> None:
         if not result.ok:
             self._set_status(result.error_message, styles.RED)
-            self._right_stack.setCurrentIndex(0)
+            self._set_detail_visible(False)
             return
 
         rec = result.receipt
@@ -745,7 +806,8 @@ class GoodsReceiptPage(BasePage):
         self._approve_btn.setEnabled(False)  # requires confirm checkbox
         self._cancel_btn.setEnabled(is_draft)
 
-        self._right_stack.setCurrentIndex(1)  # review panel
+        self._right_stack.setCurrentIndex(0)  # review panel
+        self._set_detail_visible(True)
         self._set_status(f"Παραλαβή {rec.id} — {st_label}", styles.TEXT_MUTED)
 
     def _on_suppliers_result(self, result: list) -> None:
