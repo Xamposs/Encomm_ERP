@@ -157,6 +157,7 @@ class DashboardPage(BasePage):
         self._thread: QThread | None = None
         self._loading = False
         self._close_pending = False
+        self._pending_req = False    # queued refresh while worker active
         self._alert_filter = "all"
         self._alert_page = 1
         self._alert_page_size = 20
@@ -296,7 +297,9 @@ class DashboardPage(BasePage):
 
     def refresh(self) -> None:
         if self._loading:
+            self._pending_req = True   # coalesce — run after current worker
             return
+        self._pending_req = False
         self._loading = True
         self._refresh_btn.setEnabled(False)
         self._set_state("🔄 Φόρτωση δεδομένων...", styles.TEXT_MUTED)
@@ -334,6 +337,7 @@ class DashboardPage(BasePage):
             self._reset_values_dash()
             self._reset_alert_badges()
             self._page_lbl.setText("")
+            self._safety_disable_actions()
             return
         ds = combined.dash_snapshot
         self._lbl_total.setText(str(ds.total_products))
@@ -348,6 +352,7 @@ class DashboardPage(BasePage):
             self._alerts_table.setRowCount(0)
             self._reset_alert_badges()
             self._page_lbl.setText("")
+            self._safety_disable_actions()
             # Don't clobber the dashboard stats; show error below
             self._set_state(combined.alerts_error, styles.RED)
             return
@@ -362,6 +367,7 @@ class DashboardPage(BasePage):
             self._set_state("✅ Καμία ειδοποίηση.", styles.GREEN)
             self._alerts_table.setRowCount(0)
             self._page_lbl.setText("")
+            self._safety_disable_actions()
             return
 
         self._state_lbl.hide()
@@ -397,6 +403,9 @@ class DashboardPage(BasePage):
         if self._close_pending:
             self._close_pending = False
             self.shutdown_ready.emit()
+            return
+        if self._pending_req:
+            self.refresh()  # uses the latest _alert_filter / _alert_page
 
     def _cleanup_worker(self) -> None:
         if self._thread is not None and self._thread.isRunning():
@@ -413,6 +422,7 @@ class DashboardPage(BasePage):
         except (RuntimeError, TypeError):
             pass
         self._close_pending = True
+        self._pending_req = False   # discard queued request
         self._thread.quit()
         if self._thread.wait(2000):
             self._loading = False
@@ -467,6 +477,13 @@ class DashboardPage(BasePage):
             mw.open_inventory_with_barcode(barcode)
 
     # ── Helpers ─────────────────────────────────────────────────────
+
+    def _safety_disable_actions(self) -> None:
+        """Clear selection and disable action/pagination on error/empty."""
+        self._alerts_table.clearSelection()
+        self._open_inv_btn.setEnabled(False)
+        self._prev_btn.setEnabled(False)
+        self._next_btn.setEnabled(False)
 
     def _set_state(self, text: str, color: str) -> None:
         self._state_lbl.setText(text)

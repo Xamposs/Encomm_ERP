@@ -268,6 +268,99 @@ class TestDashboardDailyAlerts:
         assert opened[0] == expected_bc
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Test: coalesced refresh — pending request during active worker
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestCoalescedRefresh:
+
+    def test_filter_change_during_worker_respects_latest_request(
+            self, dash_with_products, monkeypatch):
+        """Block the first worker, change filter, release, assert the
+        queued refresh runs with the latest filter state."""
+        import threading
+        import qt_app.pages.dashboard_page as dp
+
+        # Ensure the initial refresh from the fixture is done
+        _pump_until(lambda: not dash_with_products._loading)
+
+        _block = threading.Event()
+        _started = threading.Event()
+        _orig = dp.load_daily_alerts
+        _calls = []
+
+        def _blocking_alerts(db_path, alert_filter="all", threshold=10,
+                              alert_days=30, page=1, page_size=50):
+            _started.set()
+            _block.wait(timeout=5.0)
+            _calls.append(alert_filter)
+            return _orig(db_path, alert_filter, threshold,
+                         alert_days, page, page_size)
+
+        monkeypatch.setattr(dp, "load_daily_alerts", _blocking_alerts)
+
+        # Start a fresh refresh with the blocked worker
+        dash_with_products.refresh()
+        _started.wait(timeout=3.0)
+        assert _started.is_set(), "Blocked worker never started"
+
+        # Change filter while worker is still blocked
+        for i in range(dash_with_products._filter_combo.count()):
+            if dash_with_products._filter_combo.itemText(i) == "Ληγμένα":
+                dash_with_products._filter_combo.setCurrentIndex(i)
+                break
+
+        # Release the blocked worker
+        _block.set()
+
+        # Pump events until the queued refresh completes
+        _pump_until(lambda: not dash_with_products._loading)
+
+        # The latest filter ("expired") must be rendered
+        assert len(_calls) >= 2  # initial + queued
+        assert _calls[-1] == "expired"
+        rows = dash_with_products._alerts_table.rowCount()
+        assert rows == 1
+        bc = dash_with_products._alerts_table.item(0, 0).text()
+        assert bc == "EXP"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: action/pagination controls disabled on error/empty
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestSafetyDisabledControls:
+
+    def test_empty_alerts_disables_actions(self, dash_page):
+        """Empty DB: 'Άνοιγμα', prev, next all disabled."""
+        _pump_until(lambda: not dash_page._loading)
+        assert not dash_page._open_inv_btn.isEnabled()
+        assert not dash_page._prev_btn.isEnabled()
+        assert not dash_page._next_btn.isEnabled()
+
+    def test_alerts_load_error_disables_actions(self, dash_with_products,
+                                                 monkeypatch):
+        """When load_daily_alerts fails, action/pagination disabled."""
+        import qt_app.pages.dashboard_page as dp
+        from qt_app.data_source import DailyAlertsResult
+
+        # Wait for the initial fixture refresh to finish
+        _pump_until(lambda: not dash_with_products._loading)
+
+        def _failing_alerts(*args, **kw):
+            return DailyAlertsResult.failure("Προσομοίωση σφάλματος")
+
+        monkeypatch.setattr(dp, "load_daily_alerts", _failing_alerts)
+        dash_with_products.refresh()
+
+        _pump_until(lambda: not dash_with_products._loading)
+
+        assert "σφάλματος" in dash_with_products._state_lbl.text().lower()
+        assert not dash_with_products._open_inv_btn.isEnabled()
+        assert not dash_with_products._prev_btn.isEnabled()
+        assert not dash_with_products._next_btn.isEnabled()
+
+
 class TestDashboardNavigationToInventory:
 
     def test_mainwindow_opens_inventory_with_barcode(self, qapp, tmp_path,
