@@ -109,7 +109,18 @@ class ProductDialog(QDialog):
         self._stock_spin.setRange(0, 999999)
         if existing:
             self._stock_spin.setValue(existing["stock"])
+            self._stock_spin.setReadOnly(True)
+            self._stock_spin.setStyleSheet(
+                f"color: {styles.TEXT_MUTED}; background: {styles.SURFACE_ALT};")
         lay.addRow("Απόθεμα:", self._stock_spin)
+
+        if existing:
+            self._stock_hint = QLabel(
+                "Για μεταβολή αποθέματος χρησιμοποιήστε «Διόρθωση Αποθέματος».")
+            self._stock_hint.setStyleSheet(
+                f"color: {styles.TEXT_MUTED}; font-size: 11px; "
+                f"font-style: italic; padding-left: 2px;")
+            lay.addRow("", self._stock_hint)
 
         # Expiry date
         self._expiry_edit = QDateEdit()
