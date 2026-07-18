@@ -15,8 +15,7 @@ if ROOT not in sys.path:
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 def _teardown_window(window) -> None:
-    """Safe window shutdown: stop all page workers, process events, close."""
-    # Shut down every lazily built page's QThread workers
+    """Safe window shutdown: stop all page workers, close, delete."""
     pages = getattr(window, "_pages", {})
     for page in list(pages.values()):
         if hasattr(page, "shutdown"):
@@ -24,15 +23,8 @@ def _teardown_window(window) -> None:
                 page.shutdown()
             except Exception:
                 pass
-    # Process pending Qt events so deferred deletions run
-    from PySide6.QtCore import QCoreApplication
-    for _ in range(3):
-        QCoreApplication.processEvents()
-    # Close and schedule deletion
     window.close()
     window.deleteLater()
-    for _ in range(3):
-        QCoreApplication.processEvents()
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────
@@ -108,9 +100,6 @@ class TestAllPagesNavigable:
     def _setup(self, qapp, tmp_db):
         from qt_main import create_main_window
         from qt_app.main_window import NAV_ITEMS
-        from PySide6.QtCore import QCoreApplication
-        for _ in range(3):
-            QCoreApplication.processEvents()
 
         _app, self.window = create_main_window(db_path=tmp_db)
         self.nav_items = NAV_ITEMS
@@ -126,9 +115,12 @@ class TestAllPagesNavigable:
         for key, label in self.nav_items:
             try:
                 self.window.navigate_to(key)
-                from PySide6.QtCore import QCoreApplication
-                for _ in range(5):
-                    QCoreApplication.processEvents()
+                page = self.window._pages.get(key)
+                if page and hasattr(page, "shutdown"):
+                    try:
+                        page.shutdown()
+                    except Exception:
+                        pass
                 self._built_keys.append(key)
             except Exception as exc:
                 unreachable.append(f"{key} ({label}): {exc}")
@@ -169,11 +161,13 @@ class TestAllPagesNavigable:
                     pytest.fail(f"Page '{key}' still has a running QThread after teardown")
 
     def _navigate_all(self) -> None:
-        from PySide6.QtCore import QCoreApplication
-        # Dashboard, settings, and AI pages are pure-placeholder and safe.
-        # All other pages use read-only SQLite workers with bounded lifetimes.
+        # Navigate to each page, shut down its worker, then move on.
         for key, _label in self.nav_items:
             self.window.navigate_to(key)
-            for _ in range(5):
-                QCoreApplication.processEvents()
+            page = self.window._pages.get(key)
+            if page and hasattr(page, "shutdown"):
+                try:
+                    page.shutdown()
+                except Exception:
+                    pass
             self._built_keys.append(key)

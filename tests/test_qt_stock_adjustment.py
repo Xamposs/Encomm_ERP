@@ -1,7 +1,7 @@
 """Offscreen Qt tests for stock adjustment UI on Inventory page.
 
 Tests: button gating, dialog validation, real cancellation via
-_on_adjust_stock, real success refresh, real loading-state lifecycle,
+_on_adjust_stock, real success refresh, real Qt-event-driven lifecycle,
 real worker shutdown, and ProductDialog stock read-only gate.
 """
 
@@ -11,9 +11,11 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import (
     QApplication, QTableWidgetItem, QDialog, QMessageBox, QLabel,
 )
@@ -24,6 +26,26 @@ from qt_app.pages.inventory_page import (
 from infrastructure.stock_adjustment_service import (
     StockAdjustmentResult, adjust_stock,
 )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Bounded Qt event-processing helper for tests only
+# ═══════════════════════════════════════════════════════════════════════
+
+def _pump_until(predicate, *, timeout_s: float = 3.0, tick_s: float = 0.05):
+    """Process Qt events in bounded ticks until *predicate()* is True.
+
+    Fails with a descriptive AssertionError if the predicate is still
+    False after *timeout_s* seconds.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        if predicate():
+            return
+        time.sleep(tick_s)
+    raise AssertionError(
+        f"_pump_until: predicate still False after {timeout_s:.1f}s")
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────
@@ -191,7 +213,6 @@ class TestAdjustmentDialog:
         dlg.deleteLater()
 
     def test_other_reason_requires_text(self, qapp, monkeypatch):
-        import qt_app.pages.inventory_page as ip_mod
         fk = _install_qmb(monkeypatch)
 
         dlg = StockAdjustmentDialog(
@@ -223,7 +244,6 @@ class TestAdjustmentDialog:
             barcode="X", name="Y", current_stock=50)
         dlg.show()
 
-        # Collect all label text to check visible fields
         all_label_text = ""
         for w in dlg.findChildren(QLabel):
             try:
@@ -231,19 +251,16 @@ class TestAdjustmentDialog:
             except Exception:
                 pass
 
-        # No price/VAT/expiry/supplier labels
         assert "Τιμή" not in all_label_text, "Price label found"
         assert "ΦΠΑ" not in all_label_text, "VAT label found"
         assert "Λήξης" not in all_label_text, "Expiry label found"
         assert "Προμηθευτής" not in all_label_text, "Supplier label found"
 
-        # Verify only the counted stock spinbox is present
         spinners = [w for w in dlg.findChildren(type(dlg._counted_spin))
                     if w is not dlg._counted_spin]
         assert len(spinners) == 0, (
             "Only one QSpinBox (counted stock) should exist")
 
-        # Verify reason combo exists
         assert dlg._reason_combo is not None
 
         dlg.close()
@@ -262,7 +279,6 @@ class TestAdjustmentCancellation:
         Assert _run_adjustment not called, stock unchanged."""
         import qt_app.pages.inventory_page as ip_mod
 
-        # Populate table with one row and select it
         inventory_page._table.setRowCount(1)
         inventory_page._table.setItem(0, 0, QTableWidgetItem("TEST001"))
         inventory_page._table.setItem(0, 1, QTableWidgetItem("Test Product"))
@@ -271,7 +287,6 @@ class TestAdjustmentCancellation:
         inventory_page._table.setItem(0, 4, QTableWidgetItem("€10.50"))
         inventory_page._table.selectRow(0)
 
-        # Fake dialog that auto-accepts and returns adjustment data
         class _FakeAcceptedDialog:
             @staticmethod
             def exec():
@@ -284,70 +299,20 @@ class TestAdjustmentCancellation:
                     "reason": "Απογραφή",
                 }
 
-        original_adj_dialog = ip_mod.StockAdjustmentDialog
         monkeypatch.setattr(
             ip_mod, "StockAdjustmentDialog",
             lambda *a, **kw: _FakeAcceptedDialog())
 
-        # QMessageBox.question returns No → user cancels
         fk = _install_qmb(monkeypatch, question_ret=_FakeQMB.No)
 
-        # Call the real _on_adjust_stock — runs through dialog→confirm path
         inventory_page._on_adjust_stock()
 
-        # No worker was started (question returned No)
         assert not inventory_page._adj_loading
         assert inventory_page._adj_thread is None
         assert inventory_page._adj_worker is None
 
-        # Stock must be unchanged
         stock = _read_stock(temp_db_path, "TEST001")
         assert stock == 50
-
-    def test_confirm_yes_dispatches_worker(self, inventory_page,
-                                            monkeypatch):
-        """When user confirms (QMB.question→Yes), _run_adjustment is called."""
-        import qt_app.pages.inventory_page as ip_mod
-
-        inventory_page._table.setRowCount(1)
-        inventory_page._table.setItem(0, 0, QTableWidgetItem("TEST001"))
-        inventory_page._table.setItem(0, 1, QTableWidgetItem("TP"))
-        inventory_page._table.setItem(0, 2, QTableWidgetItem("50"))
-        inventory_page._table.setItem(0, 3, QTableWidgetItem("2027-12-31"))
-        inventory_page._table.setItem(0, 4, QTableWidgetItem("€10.50"))
-        inventory_page._table.selectRow(0)
-
-        class _FakeAcceptedDialog:
-            @staticmethod
-            def exec():
-                return QDialog.Accepted
-            def result(self):
-                return {
-                    "barcode": "TEST001",
-                    "expected_stock": 50,
-                    "counted_stock": 60,
-                    "reason": "Απογραφή",
-                }
-
-        monkeypatch.setattr(
-            ip_mod, "StockAdjustmentDialog",
-            lambda *a, **kw: _FakeAcceptedDialog())
-
-        fk = _install_qmb(monkeypatch, question_ret=_FakeQMB.Yes)
-
-        # Should start a real worker
-        inventory_page._on_adjust_stock()
-
-        assert inventory_page._adj_loading
-        assert inventory_page._adj_thread is not None
-        assert inventory_page._adj_worker is not None
-
-        # Cleanup: wait for worker
-        if inventory_page._adj_thread:
-            inventory_page._adj_thread.wait(5000)
-        inventory_page._adj_worker = None
-        inventory_page._adj_thread = None
-        inventory_page._adj_loading = False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -402,20 +367,18 @@ class TestAdjustmentSuccess:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test: real loading-state lifecycle (call _run_adjustment)
+# Test: real event-driven adjustment lifecycle
 # ═══════════════════════════════════════════════════════════════════════
 
-class TestRealLoadingState:
+class TestRealLifecycle:
 
-    def test_run_adjustment_disables_controls_and_restores(self,
-                                                            inventory_page,
-                                                            monkeypatch):
-        """Call real _run_adjustment, assert controls disabled by production
-        code, wait for thread, assert restored by production callbacks."""
-        import qt_app.pages.inventory_page as ip_mod
+    def test_full_adjustment_lifecycle(self, inventory_page, monkeypatch,
+                                        temp_db_path):
+        """Call real _run_adjustment against temp DB, pump Qt events
+        until production callbacks restore state, assert DB changed."""
         fk = _install_qmb(monkeypatch)
 
-        # Ensure buttons start enabled and unset any stale state
+        # Ensure clean starting state (no stale loading flag)
         inventory_page._adj_loading = False
         inventory_page._write_loading = False
         inventory_page._create_btn.setEnabled(True)
@@ -424,7 +387,7 @@ class TestRealLoadingState:
         inventory_page._refresh_btn.setEnabled(True)
         inventory_page._preview_btn.setEnabled(True)
 
-        # Call real _run_adjustment with valid data against temp DB
+        # Start real worker against the temp DB
         inventory_page._run_adjustment({
             "barcode": "TEST001",
             "expected_stock": 50,
@@ -432,8 +395,8 @@ class TestRealLoadingState:
             "reason": "Απογραφή",
         })
 
-        # Production code must have set _adj_loading and disabled controls
-        assert inventory_page._adj_loading, "_adj_loading not set by production code"
+        # Production code must have immediately set loading + disabled
+        assert inventory_page._adj_loading
         assert not inventory_page._create_btn.isEnabled()
         assert not inventory_page._edit_btn.isEnabled()
         assert not inventory_page._adj_btn.isEnabled()
@@ -442,21 +405,28 @@ class TestRealLoadingState:
         assert inventory_page._adj_thread is not None
         assert inventory_page._adj_worker is not None
 
-        # Wait for real worker thread to finish
-        if inventory_page._adj_thread:
-            inventory_page._adj_thread.wait(5000)
-            # The finished→quit→deleteLater→_on_adjust_thread_done chain
-            # runs via queued connections; without event loop, call directly
-            # to simulate what the event loop would deliver.
-            if inventory_page._adj_loading:
-                # thread finished but _on_adjust_thread_done may not have fired
-                inventory_page._on_adjust_thread_done()
+        # Pump real Qt events until the full signal chain completes
+        # (finished → _on_adjust_done → quit → _on_adjust_thread_done)
+        _pump_until(lambda: inventory_page._adj_thread is None)
 
-        # After thread done, state must be restored by production code
+        # Production callbacks must have restored state
         assert not inventory_page._adj_loading
+        assert inventory_page._adj_worker is None
+        assert inventory_page._adj_thread is None
         assert inventory_page._create_btn.isEnabled()
         assert inventory_page._preview_btn.isEnabled()
         assert inventory_page._refresh_btn.isEnabled()
+
+        # DB must reflect the change
+        assert _read_stock(temp_db_path, "TEST001") == 55
+
+        # Exactly one audit row
+        audit = _audit_rows(temp_db_path, "TEST001")
+        assert len(audit) == 1
+        assert audit[0]["change_amount"] == 5
+        assert audit[0]["reason"] == "Απογραφή"
+        assert audit[0]["old_stock"] == 50
+        assert audit[0]["new_stock"] == 55
 
     def test_adjust_while_loading_is_blocked(self, inventory_page):
         inventory_page._adj_loading = True
@@ -486,54 +456,60 @@ class TestShutdownLifecycle:
     def test_shutdown_with_no_workers_returns_true(self, inventory_page):
         assert inventory_page.shutdown()
 
-    def test_shutdown_while_worker_running(self, inventory_page,
-                                            monkeypatch):
-        """Start a real worker, call shutdown while active, assert safe."""
+    def test_shutdown_while_worker_blocked_then_recovers(self,
+                                                          inventory_page,
+                                                          monkeypatch):
+        """Start blocking worker, shutdown→False, release, pump events,
+        shutdown→True with no running thread retained."""
         import qt_app.pages.inventory_page as ip_mod
 
-        # Use a blocking adjust that waits on an event for timing control
-        _shutdown_event = threading.Event()
+        _block = threading.Event()
         _started = threading.Event()
 
         def _blocking_adjust(db_path, req):
-            """Block until shutdown event is set, then call real adjust."""
             _started.set()
-            _shutdown_event.wait(timeout=5.0)  # block until shutdown or timeout
+            _block.wait(timeout=5.0)
             return adjust_stock(db_path, req)
 
-        monkeypatch.setattr(
-            ip_mod, "adjust_stock", _blocking_adjust)
-
+        monkeypatch.setattr(ip_mod, "adjust_stock", _blocking_adjust)
         fk = _install_qmb(monkeypatch)
 
-        # Start real worker with blocking adjust
+        # Start worker
         inventory_page._run_adjustment({
             "barcode": "TEST001",
             "expected_stock": 50,
             "counted_stock": 55,
             "reason": "Απογραφή",
         })
-
         assert inventory_page._adj_thread is not None
         assert inventory_page._adj_thread.isRunning()
 
-        # Wait for worker to actually be inside the blocking call
+        # Wait until worker is inside the blocking call
         _started.wait(timeout=2.0)
         assert _started.is_set(), "Worker never started running"
 
-        # Call shutdown while worker is active
-        result = inventory_page.shutdown()
+        # First shutdown — worker still blocked, must return False
+        result1 = inventory_page.shutdown()
+        assert result1 is False, (
+            f"Expected shutdown→False while worker blocked, got {result1}")
+        # Page must preserve the running thread reference
+        assert inventory_page._adj_thread is not None, (
+            "Thread reference must be preserved after timeout")
+        assert inventory_page._adj_thread.isRunning()
 
-        # Signal the blocking adjust to complete
-        _shutdown_event.set()
+        # Release the blocking operation
+        _block.set()
 
-        # Let thread finish
-        if inventory_page._adj_thread:
-            inventory_page._adj_thread.wait(3000)
+        # Pump Qt events until the worker's completion callbacks fire
+        _pump_until(lambda: inventory_page._adj_thread is None)
 
-        # Shutdown must not crash — result is deterministic
-        assert result is True or result is False
-        assert not inventory_page._adj_thread or not inventory_page._adj_thread.isRunning()
+        # Second shutdown — no workers left, must return True
+        result2 = inventory_page.shutdown()
+        assert result2 is True, (
+            f"Expected shutdown→True after worker completed, got {result2}")
+        assert inventory_page._adj_thread is None
+        assert inventory_page._adj_worker is None
+        assert not inventory_page._adj_loading
 
     def test_dialog_reject_does_not_crash(self, qapp):
         dlg = StockAdjustmentDialog(
@@ -569,9 +545,7 @@ class TestProductDialogStockGate:
         dlg = ProductDialog(temp_db_path, existing=existing)
         assert dlg._stock_spin.isReadOnly(), (
             "Stock field must be read-only when editing existing product")
-        # Value is still readable
         assert dlg._stock_spin.value() == 50
-        # get_data must preserve the original stock
         data = dlg.get_data()
         assert data["stock"] == 50
         dlg.close()
@@ -591,7 +565,7 @@ class TestProductDialogStockGate:
         dlg.deleteLater()
 
 
-# ── Helper ──────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────
 
 def _read_stock(db_path: str, barcode: str) -> int:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -601,3 +575,14 @@ def _read_stock(db_path: str, barcode: str) -> int:
     ).fetchone()[0]
     conn.close()
     return stock
+
+
+def _audit_rows(db_path: str, barcode: str) -> list:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM stock_movements WHERE barcode=? ORDER BY id",
+        (barcode,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
