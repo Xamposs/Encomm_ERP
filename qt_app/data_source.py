@@ -1566,15 +1566,20 @@ def load_daily_alerts(
         conn = _connect_ro(db_path)
         cur = conn.cursor()
 
+        # ── Shared expiry-validity guard (rejects SQLite-normalized dates) ──
+        # date('2026-02-30') = '2026-03-02' ≠ '2026-02-30'  → invalid
+        # date('2026-02-28') = '2026-02-28' = same          → valid
+        _valid_exp = "p.ExpiryDate != '' AND date(p.ExpiryDate) = p.ExpiryDate"
+
         # ── Computed severity ──────────────────────────────────────────
         # 1 = expired (may also be low stock)
         # 2 = expiring soon (may also be low stock)
         # 3 = low stock only (not expired, not near-expiry)
         severity_sql = (
             "CASE "
-            "  WHEN p.ExpiryDate != '' AND date(p.ExpiryDate) < date('now') "
+            f"  WHEN {_valid_exp} AND date(p.ExpiryDate) < date('now') "
             "    THEN 1 "
-            "  WHEN p.ExpiryDate != '' "
+            f"  WHEN {_valid_exp} "
             "       AND date(p.ExpiryDate) >= date('now') "
             "       AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days') "
             "    THEN 2 "
@@ -1583,12 +1588,12 @@ def load_daily_alerts(
         )
 
         is_expired_sql = (
-            "CASE WHEN p.ExpiryDate != '' "
+            f"CASE WHEN {_valid_exp} "
             "     AND date(p.ExpiryDate) < date('now') "
             "THEN 1 ELSE 0 END"
         )
         is_near_sql = (
-            "CASE WHEN p.ExpiryDate != '' "
+            f"CASE WHEN {_valid_exp} "
             "     AND date(p.ExpiryDate) >= date('now') "
             "     AND date(p.ExpiryDate) <= "
             "         date('now', '+' || ? || ' days') "
@@ -1601,8 +1606,8 @@ def load_daily_alerts(
         filter_parms: list
         if alert_filter == "all":
             filter_clause = (
-                "(p.ExpiryDate != '' AND date(p.ExpiryDate) < date('now')) "
-                "OR (p.ExpiryDate != '' "
+                f"({_valid_exp} AND date(p.ExpiryDate) < date('now')) "
+                f"OR ({_valid_exp} "
                 "    AND date(p.ExpiryDate) >= date('now') "
                 "    AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')) "
                 "OR (p.Stock <= ?)"
@@ -1610,12 +1615,12 @@ def load_daily_alerts(
             filter_parms = [alert_days, threshold]
         elif alert_filter == "expired":
             filter_clause = (
-                "p.ExpiryDate != '' AND date(p.ExpiryDate) < date('now')"
+                f"{_valid_exp} AND date(p.ExpiryDate) < date('now')"
             )
             filter_parms = []
         elif alert_filter == "expiring_soon":
             filter_clause = (
-                "p.ExpiryDate != '' "
+                f"{_valid_exp} "
                 "AND date(p.ExpiryDate) >= date('now') "
                 "AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')"
             )
@@ -1631,16 +1636,16 @@ def load_daily_alerts(
         ).fetchone()[0]
 
         near_cnt = cur.execute(
-            "SELECT COUNT(*) FROM ProductMaster p "
-            "WHERE p.ExpiryDate != '' "
+            f"SELECT COUNT(*) FROM ProductMaster p "
+            f"WHERE {_valid_exp} "
             "AND date(p.ExpiryDate) >= date('now') "
             "AND date(p.ExpiryDate) <= date('now', '+' || ? || ' days')",
             (alert_days,),
         ).fetchone()[0]
 
         expired_cnt = cur.execute(
-            "SELECT COUNT(*) FROM ProductMaster p "
-            "WHERE p.ExpiryDate != '' "
+            f"SELECT COUNT(*) FROM ProductMaster p "
+            f"WHERE {_valid_exp} "
             "AND date(p.ExpiryDate) < date('now')",
         ).fetchone()[0]
 
@@ -1669,7 +1674,7 @@ def load_daily_alerts(
                    ({severity_sql}) AS severity
             FROM ProductMaster p
             WHERE {filter_clause}
-            ORDER BY severity ASC, p.ExpiryDate ASC, p.Name ASC
+            ORDER BY severity ASC, p.ExpiryDate ASC, p.Name ASC, p.Barcode ASC
             LIMIT ? OFFSET ?
             """,
             [alert_days, threshold, alert_days, threshold]

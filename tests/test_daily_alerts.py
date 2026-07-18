@@ -308,6 +308,56 @@ class TestDailyAlertsLoad:
         assert r.ok
         assert 0 < len(r.snapshot.items) <= 100
 
+    # ── Invalid calendar dates ──────────────────────────────────────────
+
+    def test_invalid_date_feb30_not_expired(self, tmp_path):
+        """SQLite normalizes 2026-02-30 → 2026-03-02; must NOT count as
+        expired even though the normalized result is in the past."""
+        db = str(tmp_path / "test.db")
+        _make_db(db, [("A", "BadDate", 50, "2026-02-30", 1.0)])
+        r = load_daily_alerts(db, threshold=10, alert_days=30)
+        assert r.snapshot.expired_count == 0
+        assert r.snapshot.expiring_soon_count == 0
+        # Not low stock either
+        assert r.snapshot.total_alerts == 0
+
+    def test_invalid_date_appears_as_low_stock_only(self, tmp_path):
+        """Invalid expiry date must still allow low-stock detection."""
+        db = str(tmp_path / "test.db")
+        _make_db(db, [("A", "BadLow", 3, "2026-02-30", 1.0)])
+        r = load_daily_alerts(db, threshold=10, alert_days=30)
+        assert r.snapshot.expired_count == 0
+        assert r.snapshot.expiring_soon_count == 0
+        assert r.snapshot.low_stock_count == 1
+        assert r.snapshot.total_alerts == 1
+        reasons = _reason_set(r.snapshot.items[0])
+        assert reasons == {"Χαμηλό απόθεμα"}
+
+    def test_malformed_date_not_expired(self, tmp_path):
+        """Totally malformed date must not count as expired."""
+        db = str(tmp_path / "test.db")
+        _make_db(db, [("A", "Garbage", 50, "not-a-date", 1.0)])
+        r = load_daily_alerts(db, threshold=10, alert_days=30)
+        assert r.snapshot.expired_count == 0
+        assert r.snapshot.expiring_soon_count == 0
+        assert r.snapshot.total_alerts == 0
+
+    # ── Deterministic barcode tiebreaker ────────────────────────────────
+
+    def test_same_severity_expiry_name_stable_order_by_barcode(self,
+                                                                tmp_path):
+        """Two products identical in severity, expiry, and name must
+        order deterministically by barcode."""
+        db = str(tmp_path / "test.db")
+        _make_db(db, [
+            ("B", "Same", 3, _d(365), 1.0),
+            ("A", "Same", 3, _d(365), 1.0),
+        ])
+        r = load_daily_alerts(db, threshold=10, alert_days=30)
+        items = r.snapshot.items
+        assert items[0].barcode == "A"
+        assert items[1].barcode == "B"
+
     # ── Read-only safety ───────────────────────────────────────────────
 
     def test_no_writes_on_repeat_calls(self, tmp_path):
