@@ -20,12 +20,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QVBoxLayout, QWidget, QScrollArea,
-    QFrame, QAbstractItemView,
+    QFrame, QAbstractItemView, QInputDialog,
 )
 
 from qt_app.pages.base_page import BasePage
@@ -86,17 +86,21 @@ class SupplierReorderPage(BasePage):
 
     shutdown_ready = Signal()
 
-    # Columns for grouped (assigned) candidates
+    # Columns for grouped (assigned) candidates — last col is an
+    # explicit Greek action column that hosts the 'add to draft' control.
     _GROUPED_COLS = [
         "Barcode", "Προϊόν", "Απόθεμα", "Όριο", "Λήξη", "Τιμή",
+        "Προσθήκη στο πρόχειρο",
     ]
     # Columns for unassigned products — one extra for the reason
     _UNASSIGNED_COLS = [
         "Barcode", "Προϊόν", "Απόθεμα", "Όριο", "Λήξη", "Τιμή", "Αιτία",
     ]
-    # Draft columns — last two are user-entered quantity and an action button
-    _DRAFT_COLS = [
-        "Barcode", "Προϊόν", "Απόθεμα", "Όριο", "Λήξη", "Τιμή", "Ποσότητα", "",
+    # Columns for one supplier's draft section — last col is a per-line
+    # remove action.  Quantity is a user-edited QSpinBox in column 6.
+    _DRAFT_LINE_COLS = [
+        "Barcode", "Προϊόν", "Απόθεμα", "Όριο", "Λήξη", "Τιμή",
+        "Ποσότητα", "Αφαίρεση",
     ]
 
     def __init__(self, db_service, config, parent=None):
@@ -180,22 +184,16 @@ class SupplierReorderPage(BasePage):
             f"color: {styles.TEXT_MUTED}; font-size: 12px;")
         self._draft_layout.addWidget(self._draft_summary)
 
-        self._draft_table = QTableWidget(0, len(self._DRAFT_COLS))
-        self._draft_table.setHorizontalHeaderLabels(self._DRAFT_COLS)
-        dh = self._draft_table.horizontalHeader()
-        dh.setStretchLastSection(True)
-        dh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        dh.setSectionResizeMode(1, QHeaderView.Stretch)
-        for i in range(2, len(self._DRAFT_COLS) - 1):
-            dh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-        dh.setSectionResizeMode(len(self._DRAFT_COLS) - 1,
-                                QHeaderView.ResizeToContents)
-        self._draft_table.verticalHeader().setVisible(False)
-        self._draft_table.setSelectionBehavior(
-            QAbstractItemView.SelectRows)
-        self._draft_table.setEditTriggers(
-            QAbstractItemView.NoEditTriggers)
-        self._draft_layout.addWidget(self._draft_table)
+        # Per-supplier draft sections.  Each supplier with at least one
+        # draft line gets its own QGroupBox (titled 'Προμηθευτής: <name>')
+        # containing a draft-line table.  This makes the supplier that
+        # owns every line unambiguously visible — a flat mixed table
+        # would not.  The container is rebuilt on every render.
+        self._draft_sections_host = QWidget()
+        self._draft_sections_layout = QVBoxLayout(self._draft_sections_host)
+        self._draft_sections_layout.setContentsMargins(0, 0, 0, 0)
+        self._draft_sections_layout.setSpacing(10)
+        self._draft_layout.addWidget(self._draft_sections_host)
 
         self._draft_empty = QLabel(
             "Το πρόχειρο αναπαραγγελίας είναι άδειο. "
@@ -394,10 +392,17 @@ class SupplierReorderPage(BasePage):
                 add_btn = QPushButton("➕  Προσθήκη")
                 add_btn.setStyleSheet(self._btn_qss())
                 add_btn.setCursor(Qt.PointingHandCursor)
+                add_btn.setEnabled(p.barcode not in self._draft)
+                if not add_btn.isEnabled():
+                    add_btn.setText("✓  Στο πρόχειρο")
+                # Tag with barcode so _refresh_add_button_states can
+                # re-enable/re-label without scanning table rows.
+                add_btn.setProperty("candidate_barcode", p.barcode)
                 # Snapshot data on the bound handler — never refetch.
                 add_btn.clicked.connect(
-                    lambda _checked=False, _g=group_id, _s=supplier_name,
-                    _p=p: self._add_to_draft(_g, _s, _p))
+                    lambda _checked=False, _btn=add_btn, _g=group_id,
+                    _s=supplier_name, _p=p:
+                    self._add_candidate_via_button(_btn, _g, _s, _p))
                 table.setCellWidget(r, len(cols) - 1, add_btn)
         return table
 
@@ -425,37 +430,109 @@ class SupplierReorderPage(BasePage):
                 table.setItem(row, 6 + i, QTableWidgetItem(val))
 
     def _on_thread_done(self) -> None:
+        """Slot connected to ``thread.finished``.
+
+        Drops the page's ``_loading`` flag and re-enables the refresh
+        button immediately.  The references to ``_worker`` and
+        ``_thread`` are cleared on the NEXT event-loop iteration via a
+        zero-delay timer: this slot runs *inside* the dispatch of
+        ``thread.finished``, and dropping the Python references
+        in-flight can free the underlying C++ objects before their
+        connected ``deleteLater`` slots have run.  Deferring one tick
+        lets Qt finish dispatching the signal first.
+        """
         self._loading = False
         self._refresh_btn.setEnabled(True)
-        self._worker = None
-        self._thread = None
-        if self._close_pending:
-            self._close_pending = False
-            self.shutdown_ready.emit()
+        close_pending = self._close_pending
+        self._close_pending = False
+
+        def _drop_refs() -> None:
+            self._worker = None
+            self._thread = None
+            if close_pending:
+                self.shutdown_ready.emit()
+        QTimer.singleShot(0, _drop_refs)
 
     # ── Draft workflow (in-memory only) ───────────────────────────────
+
+    def _prompt_quantity(self, candidate: ReorderCandidate) -> int | None:
+        """Ask the user for an explicit positive integer quantity.
+
+        Returns the entered positive integer, or None if the user
+        cancelled or entered an invalid value.  This is the ONLY
+        user-facing entry point that produces a quantity — there is no
+        default, no prefill, no inference.
+
+        The dialog starts at 0 (blank-equivalent); the user MUST
+        explicitly enter a positive integer.  Pressing OK with 0, or
+        cancelling, returns None.  Tests monkeypatch this method to
+        avoid the modal dialog.
+        """
+        value, ok = QInputDialog.getInt(
+            self,
+            "Ποσότητα αναπαραγγελίας",
+            f"Εισάγετε ποσότητα για το προϊόν:\n{candidate.name} "
+            f"({candidate.barcode})",
+            value=0, minValue=0, maxValue=100000,
+        )
+        if not ok:
+            return None
+        if value <= 0:
+            return None
+        return int(value)
+
+    def _add_candidate_via_button(
+        self,
+        button: QPushButton,
+        supplier_id: int,
+        supplier_name: str,
+        candidate: ReorderCandidate,
+    ) -> None:
+        """User-facing 'add to draft' handler bound to each candidate row.
+
+        Enforces the manual-quantity contract: a line can only be
+        created with an explicit positive integer the user enters in
+        the quantity dialog.  Repeated clicks on a candidate already
+        in the draft are a no-op (the button is disabled after a
+        successful add and re-enabled only when the line is removed).
+        """
+        # Button may have been disabled mid-flight; never silently bump.
+        if candidate.barcode in self._draft:
+            return
+        quantity = self._prompt_quantity(candidate)
+        if quantity is None:
+            return
+        if self._add_to_draft(supplier_id, supplier_name, candidate, quantity):
+            button.setEnabled(False)
+            button.setText("✓  Στο πρόχειρο")
 
     def _add_to_draft(
         self,
         supplier_id: int,
         supplier_name: str,
         candidate: ReorderCandidate,
-        quantity: int = 1,
+        quantity: int,
     ) -> bool:
-        """Add a candidate to the draft, or update its quantity if present.
+        """Add a candidate to the draft with an explicit quantity.
 
         Returns True on success, False on invalid input.  Never writes
-        outside this instance.  ``quantity`` MUST be a positive integer;
-        the entry point for changing a quantity is :meth:`update_quantity`.
+        outside this instance.  ``quantity`` MUST be a positive integer
+        — there is NO default; callers must obtain one from the user
+        (via :meth:`_prompt_quantity`) or pass an explicit value.
+
+        If the product is already in the draft, this is a no-op and
+        returns False: a product never appears twice, and the quantity
+        of an existing line changes ONLY through the explicit quantity
+        editor in the draft section (see :meth:`update_quantity`) or
+        another equally explicit user action.
         """
-        if not isinstance(quantity, int) or quantity <= 0:
+        if not isinstance(quantity, int) or isinstance(quantity, bool):
             return False
-        existing = self._draft.get(candidate.barcode)
-        if existing is not None:
-            # A product never appears twice — just bump its quantity.
-            existing.quantity += quantity
-            self._render_draft()
-            return True
+        if quantity <= 0:
+            return False
+        if candidate.barcode in self._draft:
+            # Repeated add attempts never silently increase quantity.
+            return False
         self._draft[candidate.barcode] = _DraftLine(
             supplier_id=supplier_id,
             supplier_name=supplier_name,
@@ -473,10 +550,14 @@ class SupplierReorderPage(BasePage):
     def update_quantity(self, barcode: str, quantity: int) -> bool:
         """Set the quantity on an existing draft line.
 
-        Updating never creates a new line.  Returns True on success,
-        False if the barcode is not in the draft or quantity is invalid.
+        This is the explicit user-facing entry point for changing a
+        quantity — wired to the QSpinBox in each draft line.  Updating
+        never creates a new line.  Returns True on success, False if
+        the barcode is not in the draft or the quantity is invalid.
         """
-        if not isinstance(quantity, int) or quantity <= 0:
+        if not isinstance(quantity, int) or isinstance(quantity, bool):
+            return False
+        if quantity <= 0:
             return False
         line = self._draft.get(barcode)
         if line is None:
@@ -488,11 +569,13 @@ class SupplierReorderPage(BasePage):
     def remove_line(self, barcode: str) -> bool:
         """Remove a line from the draft.  Returns True if a line was
         removed, False otherwise.  Removing restores the candidate to
-        its normal eligible state — it stays visible in its group.
+        its normal eligible state — the candidate's add button is
+        re-enabled on the next render.
         """
         if barcode in self._draft:
             del self._draft[barcode]
             self._render_draft()
+            self._refresh_add_button_states()
             return True
         return False
 
@@ -500,16 +583,40 @@ class SupplierReorderPage(BasePage):
         """Discard the entire local draft.  Does not touch anything else."""
         self._draft.clear()
         self._render_draft()
+        self._refresh_add_button_states()
 
     def draft_lines(self) -> tuple[_DraftLine, ...]:
-        """Return a deterministic snapshot of the draft grouped by
-        supplier (supplier name asc, supplier id asc), then product name
-        asc, then barcode asc — matching the candidate ordering.
+        """Return a deterministic snapshot of all draft lines.
+
+        Order: supplier name asc → supplier id asc → product name asc
+        → barcode asc.  Grouping by supplier is done in the renderer;
+        this flattened view is still deterministically ordered so the
+        per-supplier sections are stable.
         """
         return tuple(sorted(
             self._draft.values(),
             key=lambda l: (l.supplier_name, l.supplier_id, l.name, l.barcode),
         ))
+
+    def draft_groups(self) -> tuple[tuple[int, str, tuple[_DraftLine, ...]], ...]:
+        """Return the draft bucketed by supplier, deterministically.
+
+        Each entry is ``(supplier_id, supplier_name, lines)`` where
+        ``lines`` is sorted by product name then barcode.  Suppliers
+        are sorted by name then id.  Used by the renderer to build
+        visible per-supplier sections.
+        """
+        buckets: dict[tuple[int, str], list[_DraftLine]] = {}
+        for line in self._draft.values():
+            buckets.setdefault((line.supplier_id, line.supplier_name), []) \
+                .append(line)
+        ordered_keys = sorted(buckets.keys(), key=lambda k: (k[1], k[0]))
+        out: list[tuple[int, str, tuple[_DraftLine, ...]]] = []
+        for key in ordered_keys:
+            lines = sorted(
+                buckets[key], key=lambda l: (l.name, l.barcode))
+            out.append((key[0], key[1], tuple(lines)))
+        return tuple(out)
 
     def is_draft_empty(self) -> bool:
         return not self._draft
@@ -517,53 +624,112 @@ class SupplierReorderPage(BasePage):
     # ── Draft rendering ───────────────────────────────────────────────
 
     def _render_draft(self) -> None:
-        """Rebuild the draft table from the in-memory model.
+        """Rebuild the per-supplier draft sections from the model.
 
-        Deterministic ordering: supplier name asc → supplier id asc →
-        product name asc → barcode asc.  Empty state, summary line, and
-        discard button visibility are kept consistent.
+        Each supplier with at least one line gets its own titled
+        QGroupBox so the owning supplier is unambiguously visible.
+        Within a section, lines are sorted by product name then
+        barcode.  Empty state, summary line, and discard button
+        visibility are kept consistent.
         """
-        lines = self.draft_lines()
-        self._draft_table.setRowCount(len(lines))
+        groups = self.draft_groups()
+        line_count = sum(len(lines) for _, _, lines in groups)
+        supplier_count = len(groups)
 
-        supplier_ids = {(l.supplier_id) for l in lines}
-        if lines:
-            self._draft_summary.setText(
-                f"Γραμμές: {len(lines)}  |  Προμηθευτές: {len(supplier_ids)}")
-            self._draft_summary.show()
-            self._draft_empty.hide()
-            self._draft_table.show()
-            self._discard_btn.setVisible(True)
-        else:
+        # ── Tear down any previous section widgets ───────────────────
+        # We remove them from the layout and detach from their parent
+        # immediately so a subsequent ``findChildren`` scan does not
+        # see stale sections whose ``deleteLater`` hasn't fired yet.
+        while self._draft_sections_layout.count():
+            item = self._draft_sections_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        if line_count == 0:
             self._draft_summary.setText("")
+            self._draft_summary.hide()
             self._draft_empty.show()
-            self._draft_table.hide()
+            self._draft_sections_host.hide()
             self._discard_btn.setVisible(False)
+            return
+
+        self._draft_summary.setText(
+            f"Γραμμές: {line_count}  |  Προμηθευτές: {supplier_count}")
+        self._draft_summary.show()
+        self._draft_empty.hide()
+        self._draft_sections_host.show()
+        self._discard_btn.setVisible(True)
+
+        # ── Build one QGroupBox per supplier ─────────────────────────
+        for supplier_id, supplier_name, lines in groups:
+            gb = QGroupBox(f"Προμηθευτής: {supplier_name}")
+            gb.setStyleSheet(self._group_box_qss())
+            gb_layout = QVBoxLayout(gb)
+            gb_layout.setContentsMargins(8, 20, 8, 8)
+            gb_layout.addWidget(self._build_draft_section_table(lines))
+            self._draft_sections_layout.addWidget(gb)
+
+    def _build_draft_section_table(
+        self, lines: tuple[_DraftLine, ...],
+    ) -> QTableWidget:
+        """Build the draft-line table for one supplier section."""
+        table = QTableWidget(0, len(self._DRAFT_LINE_COLS))
+        table.setHorizontalHeaderLabels(self._DRAFT_LINE_COLS)
+        h = table.horizontalHeader()
+        h.setStretchLastSection(True)
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.Stretch)
+        for i in range(2, len(self._DRAFT_LINE_COLS)):
+            h.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setRowCount(len(lines))
 
         for r, line in enumerate(lines):
-            self._draft_table.setItem(r, 0, QTableWidgetItem(line.barcode))
-            self._draft_table.setItem(r, 1, QTableWidgetItem(line.name))
-            self._draft_table.setItem(r, 2, QTableWidgetItem(str(line.stock)))
-            self._draft_table.setItem(
-                r, 3, QTableWidgetItem(str(line.threshold)))
-            self._draft_table.setItem(
-                r, 4, QTableWidgetItem(line.expiry_date))
-            self._draft_table.setItem(
-                r, 5, QTableWidgetItem(f"€{line.price:.2f}"))
+            table.setItem(r, 0, QTableWidgetItem(line.barcode))
+            table.setItem(r, 1, QTableWidgetItem(line.name))
+            table.setItem(r, 2, QTableWidgetItem(str(line.stock)))
+            table.setItem(r, 3, QTableWidgetItem(str(line.threshold)))
+            table.setItem(r, 4, QTableWidgetItem(line.expiry_date))
+            table.setItem(r, 5, QTableWidgetItem(f"€{line.price:.2f}"))
+
+            # Explicit quantity editor — the only way to change qty.
             qty_spin = QSpinBox()
             qty_spin.setRange(1, 100000)
             qty_spin.setValue(line.quantity)
             qty_spin.setMinimumHeight(30)
             qty_spin.valueChanged.connect(
                 lambda v, b=line.barcode: self.update_quantity(b, int(v)))
-            self._draft_table.setCellWidget(r, 6, qty_spin)
+            table.setCellWidget(r, 6, qty_spin)
 
             rm_btn = QPushButton("✕  Αφαίρεση")
             rm_btn.setStyleSheet(self._danger_btn_qss())
             rm_btn.setCursor(Qt.PointingHandCursor)
             rm_btn.clicked.connect(
                 lambda _checked=False, b=line.barcode: self.remove_line(b))
-            self._draft_table.setCellWidget(r, 7, rm_btn)
+            table.setCellWidget(r, 7, rm_btn)
+        return table
+
+    def _refresh_add_button_states(self) -> None:
+        """Re-enable / re-disable candidate 'add' buttons to match the
+        draft state.  Walks the candidate group boxes installed by the
+        last successful refresh.
+
+        Each add button was tagged with a ``candidate_barcode`` dynamic
+        property by :meth:`_build_product_table` — this avoids walking
+        table rows via the viewport, which is fragile.
+        """
+        for btn in self._scroll_widget.findChildren(QPushButton):
+            barcode = btn.property("candidate_barcode")
+            if barcode is None:
+                continue
+            in_draft = barcode in self._draft
+            btn.setEnabled(not in_draft)
+            btn.setText(
+                "✓  Στο πρόχειρο" if in_draft else "➕  Προσθήκη")
 
     def _on_discard_clicked(self) -> None:
         """Clear the local draft.  Purely in-memory; touches nothing else."""

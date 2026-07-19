@@ -12,47 +12,49 @@ from __future__ import annotations
 import inspect
 import sqlite3
 import threading
-import time
 
 import pytest
 
 # Qt offscreen — conftest handles this, but keep import-safe
 pytest.importorskip("PySide6")
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QElapsedTimer, QEvent
 from PySide6.QtWidgets import (
     QGroupBox, QTableWidget, QSpinBox, QPushButton,
     QLabel, QScrollArea, QMessageBox,
 )
 
 
-# ── Bounded event pumping ───────────────────────────────────────────────
+# ── Bounded event pumping (no time.sleep) ───────────────────────────────
 #
-# We never use unbounded ``time.sleep``.  ``_spin`` pumps the event loop
-# in short slices so queued signals (worker.finished → _on_data_ready,
-# thread.finished → _on_thread_done) are delivered deterministically.
-# ``_wait_for`` pumps until a predicate is satisfied or a deadline
-# elapses — used for the rare cases where the predicate is observable
-# from the main thread (e.g. a worker thread reaching a state).
+# ``_spin`` pumps the event loop a fixed number of times so queued
+# Qt signals are delivered deterministically.
+#
+# ``_wait_for`` pumps until ``predicate()`` is truthy or a deadline
+# elapses.  The deadline is measured with ``QElapsedTimer`` (a Qt-native
+# monotonic clock).  There is NO ``time.sleep`` — the loop just spins
+# on ``processEvents``, which yields naturally because processing
+# posted events lets the worker thread progress.  A tiny lower bound
+# on iterations (without sleeping) is acceptable because the worker's
+# lifecycle is signal-driven and finishes within a handful of pumps.
 
 def _spin(n: int = 5) -> None:
     for _ in range(n):
         QCoreApplication.processEvents()
 
 
-def _wait_for(predicate, *, timeout_ms: int = 3000, slice_ms: int = 20) -> bool:
+def _wait_for(predicate, *, timeout_ms: int = 3000) -> bool:
     """Pump events until ``predicate()`` is truthy or deadline elapses.
 
-    Returns True if the predicate was satisfied, False on timeout.  Uses
-    small slices so queued Qt signals are processed promptly.  This
-    replaces ad-hoc fixed multi-second waits.
+    Returns True if the predicate was satisfied, False on timeout.
+    Deadline tracked with ``QElapsedTimer`` — no ``time.sleep``.
     """
-    deadline = time.monotonic() + timeout_ms / 1000.0
-    while time.monotonic() < deadline:
+    timer = QElapsedTimer()
+    timer.start()
+    deadline = timeout_ms  # milliseconds
+    while timer.elapsed() < deadline:
         QCoreApplication.processEvents()
         if predicate():
             return True
-        # Yield without blocking — small bounded slice.
-        time.sleep(slice_ms / 1000.0)
     QCoreApplication.processEvents()
     return bool(predicate())
 
@@ -115,23 +117,18 @@ def _drain_initial_load(page) -> None:
     queued connection, which then invokes ``thread.quit`` (also via a
     queued connection).  Both queue hops require the *main* event loop
     to pump.  ``QThread.wait()`` therefore cannot observe completion
-    on its own — it would block until its timeout because the
-    thread's event loop never exits without the main-thread delivery
-    of ``thread.quit``.
+    on its own — it would block until its timeout.
 
-    We pump events in a tight bounded loop instead.  This is safe
-    because the worker is purely read-only and emits exactly one
-    signal; there is no reentrancy into the page during the pump
-    other than the connected slots themselves, which are designed to
-    be idempotent.
-
-    The previous test helper manually called ``_on_thread_done`` after
-    a fixed ``_thread.wait(5000)`` — that masked lifecycle bugs
-    because it short-circuited Qt's own signal delivery and silently
-    ignored the wait() timeout.  We let Qt deliver the signals for
-    real.
+    ``_on_thread_done`` defers its reference cleanup via a zero-delay
+    ``QTimer.singleShot``, so we pump until the page reports BOTH
+    ``not _loading`` AND ``_thread is None`` — the latter proves the
+    deferred cleanup has actually run.  No ``time.sleep``.
     """
+    # First stage: wait for _loading to flip (thread.finished delivered).
     _wait_for(lambda: not page._loading, timeout_ms=3000)
+    # Second stage: wait for the deferred ref-drop timer to fire.
+    _wait_for(lambda: page._thread is None and page._worker is None,
+              timeout_ms=2000)
 
 
 def _make_page(db_path: str, threshold: int = 10):
@@ -156,6 +153,41 @@ def _teardown_page(page) -> None:
     _spin(3)
     QCoreApplication.sendPostedEvents(page, QEvent.DeferredDelete)
     _spin(2)
+
+
+# ── Draft-section helpers ───────────────────────────────────────────────
+#
+# The draft UI is rendered as one QGroupBox per supplier inside
+# ``page._draft_sections_host``.  Each group box contains exactly one
+# QTableWidget whose rows are the draft lines for that supplier.
+
+def _draft_section_boxes(page):
+    """Return the per-supplier QGroupBox widgets inside the draft area."""
+    return [
+        w for w in page._draft_sections_host.findChildren(QGroupBox)
+    ]
+
+
+def _draft_section_table(page, supplier_name: str) -> QTableWidget | None:
+    """Return the draft-line table for the named supplier, or None."""
+    for gb in _draft_section_boxes(page):
+        if supplier_name in gb.title():
+            tables = gb.findChildren(QTableWidget)
+            if tables:
+                return tables[0]
+    return None
+
+
+def _all_draft_section_tables(page):
+    """Return all draft-line tables across every supplier section,
+    ordered by the section's visual position in the layout."""
+    tables: list[tuple[int, QTableWidget]] = []
+    for gb in _draft_section_boxes(page):
+        for t in gb.findChildren(QTableWidget):
+            # Use the group box's y-position as a stable ordering key.
+            tables.append((gb.pos().y(), t))
+    tables.sort(key=lambda x: x[0])
+    return [t for _, t in tables]
 
 
 # ── Page structure tests ────────────────────────────────────────────────
@@ -623,18 +655,25 @@ class TestSupplierReorderDraftWorkflow:
         finally:
             _teardown_page(page)
 
-    def test_duplicate_add_updates_existing_line(self, qapp, tmp_path):
-        """A product must never appear twice — re-adding bumps quantity."""
+    def test_duplicate_add_is_noop(self, qapp, tmp_path):
+        """A product already in the draft cannot be added again.
+
+        Repeated ``_add_to_draft`` calls for the same barcode are a
+        no-op (return False) and never silently increase the quantity.
+        The only way to change an existing line's quantity is the
+        explicit per-line quantity editor (``update_quantity``).
+        """
         db = str(tmp_path / "t.db")
         _make_reorder_db(db, [], suppliers=[])
         page = _make_page(db)
         try:
             from qt_app.data_source import ReorderCandidate
             cand = ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0)
-            page._add_to_draft(1, "S1", cand, quantity=2)
-            page._add_to_draft(1, "S1", cand, quantity=3)
+            assert page._add_to_draft(1, "S1", cand, 2)
+            # Second add — same product — must NOT bump or duplicate.
+            assert not page._add_to_draft(1, "S1", cand, 3)
             assert len(page._draft) == 1
-            assert page._draft["A"].quantity == 5
+            assert page._draft["A"].quantity == 2
         finally:
             _teardown_page(page)
 
@@ -725,18 +764,90 @@ class TestSupplierReorderDraftWorkflow:
             from qt_app.data_source import ReorderCandidate
             # Insert in non-sorted order
             page._add_to_draft(2, "Zeta", ReorderCandidate(
-                "B", "Beta", 1, 10, "2027-01-01", 1.0), quantity=1)
+                "B", "Beta", 1, 10, "2027-01-01", 1.0), 1)
             page._add_to_draft(1, "Alpha", ReorderCandidate(
-                "A", "Alfa", 1, 10, "2027-01-01", 1.0), quantity=1)
+                "A", "Alfa", 1, 10, "2027-01-01", 1.0), 1)
             page._add_to_draft(1, "Alpha", ReorderCandidate(
-                "C", "Gamma", 1, 10, "2027-01-01", 1.0), quantity=1)
+                "C", "Gamma", 1, 10, "2027-01-01", 1.0), 1)
             page._add_to_draft(2, "Zeta", ReorderCandidate(
-                "D", "Delta", 1, 10, "2027-01-01", 1.0), quantity=1)
+                "D", "Delta", 1, 10, "2027-01-01", 1.0), 1)
 
             lines = page.draft_lines()
             assert [l.supplier_name for l in lines] == [
                 "Alpha", "Alpha", "Zeta", "Zeta"]
             assert [l.name for l in lines] == ["Alfa", "Gamma", "Beta", "Delta"]
+        finally:
+            _teardown_page(page)
+
+    def test_draft_rendered_as_visible_per_supplier_sections(
+        self, qapp, tmp_path,
+    ):
+        """Finding 3: the draft is visibly grouped by supplier — each
+        supplier has its own titled QGroupBox section so the owning
+        supplier cannot be mistaken for a flat mixed list.
+        """
+        db = str(tmp_path / "t.db")
+        _make_reorder_db(db, [], suppliers=[])
+        page = _make_page(db)
+        try:
+            from qt_app.data_source import ReorderCandidate
+            page._add_to_draft(2, "ZetaSupplies", ReorderCandidate(
+                "B", "Beta", 1, 10, "2027-01-01", 1.0), 4)
+            page._add_to_draft(1, "AlphaCorp", ReorderCandidate(
+                "A", "Alfa", 1, 10, "2027-01-01", 1.0), 2)
+            page._add_to_draft(1, "AlphaCorp", ReorderCandidate(
+                "C", "Gamma", 1, 10, "2027-01-01", 1.0), 3)
+            _spin(3)
+
+            boxes = _draft_section_boxes(page)
+            # Two supplier sections, visibly titled.
+            assert len(boxes) == 2
+            titles = [b.title() for b in boxes]
+            assert all("Προμηθευτής:" in t for t in titles)
+            assert any("AlphaCorp" in t for t in titles)
+            assert any("ZetaSupplies" in t for t in titles)
+            # Visual order is deterministic: AlphaCorp before ZetaSupplies.
+            assert titles[0].endswith("AlphaCorp")
+            assert titles[1].endswith("ZetaSupplies")
+
+            # AlphaCorp has two lines (sorted by product name), Zeta one.
+            alpha_tbl = _draft_section_table(page, "AlphaCorp")
+            zeta_tbl = _draft_section_table(page, "ZetaSupplies")
+            assert alpha_tbl is not None and zeta_tbl is not None
+            assert alpha_tbl.rowCount() == 2
+            assert zeta_tbl.rowCount() == 1
+            # Within AlphaCorp, lines sorted by product name: Alfa, Gamma.
+            assert alpha_tbl.item(0, 1).text() == "Alfa"
+            assert alpha_tbl.item(1, 1).text() == "Gamma"
+        finally:
+            _teardown_page(page)
+
+    def test_draft_section_shows_full_line_data(self, qapp, tmp_path):
+        """Each draft line shows supplier (via section title), barcode,
+        product name, stock, threshold, expiry, snapshot price, and the
+        manually chosen quantity."""
+        db = str(tmp_path / "t.db")
+        _make_reorder_db(db, [], suppliers=[])
+        page = _make_page(db)
+        try:
+            from qt_app.data_source import ReorderCandidate
+            page._add_to_draft(1, "Acme", ReorderCandidate(
+                "5200001", "Paracetamol", 3, 10,
+                "2027-04-15", 4.20), 7)
+            _spin(3)
+            tbl = _draft_section_table(page, "Acme")
+            assert tbl is not None
+            assert tbl.rowCount() == 1
+            # Columns: Barcode, Product, Stock, Threshold, Expiry, Price,
+            # Quantity (spinbox), Remove (button).
+            assert tbl.item(0, 0).text() == "5200001"
+            assert tbl.item(0, 1).text() == "Paracetamol"
+            assert tbl.item(0, 2).text() == "3"
+            assert tbl.item(0, 3).text() == "10"
+            assert tbl.item(0, 4).text() == "2027-04-15"
+            assert tbl.item(0, 5).text() == "€4.20"
+            qty = tbl.cellWidget(0, 6)
+            assert isinstance(qty, QSpinBox) and qty.value() == 7
         finally:
             _teardown_page(page)
 
@@ -792,7 +903,11 @@ class TestSupplierReorderDraftWorkflow:
         finally:
             _teardown_page(page)
 
-    def test_clicking_add_button_adds_to_draft(self, qapp, tmp_path):
+    def test_action_column_preserves_price_column(self, qapp, tmp_path):
+        """Finding 2: the candidate table has a dedicated Greek action
+        column; Barcode/Name/Stock/Threshold/Expiry/Price stay as
+        visible data columns and the add button sits ONLY in the
+        action column (never replacing the price cell)."""
         db = str(tmp_path / "t.db")
         _make_reorder_db(db, [], suppliers=[])
         page = _make_page(db)
@@ -807,13 +922,170 @@ class TestSupplierReorderDraftWorkflow:
                 (),
             ))
             _spin(3)
+            # Find the grouped candidate table (inside a 'Προμηθευτής' box)
+            cand_tables = [
+                t for gb in page._scroll_widget.findChildren(QGroupBox)
+                if "Προμηθευτής" in gb.title()
+                for t in gb.findChildren(QTableWidget)
+            ]
+            assert len(cand_tables) == 1
+            table = cand_tables[0]
+            # Header includes the Greek action column.
+            headers = [table.horizontalHeaderItem(i).text()
+                       for i in range(table.columnCount())]
+            assert "Τιμή" in headers
+            assert any("Προσθήκη" in h for h in headers)
+            # Price column (index 5) is populated, not overwritten.
+            price_item = table.item(0, headers.index("Τιμή"))
+            assert price_item is not None
+            assert price_item.text() == "€10.00"
+            # The action-column cell is a button widget, not a text item.
+            action_col = next(i for i, h in enumerate(headers)
+                              if "Προσθήκη" in h)
+            assert table.cellWidget(0, action_col) is not None
+            assert isinstance(table.cellWidget(0, action_col), QPushButton)
+            # And the price cell is NOT a widget.
+            assert table.cellWidget(0, headers.index("Τιμή")) is None
+        finally:
+            _teardown_page(page)
+
+    def test_clicking_add_button_adds_to_draft(
+        self, qapp, tmp_path, monkeypatch,
+    ):
+        """Clicking 'Προσθήκη' prompts for a quantity, then adds the
+        line.  We monkeypatch ``_prompt_quantity`` to return an
+        explicit positive integer without showing the modal dialog.
+        """
+        db = str(tmp_path / "t.db")
+        _make_reorder_db(db, [], suppliers=[])
+        page = _make_page(db)
+        try:
+            from qt_app.data_source import (
+                SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
+            )
+            prompted: list = []
+            def _fake_prompt(candidate):
+                prompted.append(candidate.barcode)
+                return 5
+            monkeypatch.setattr(page, "_prompt_quantity", _fake_prompt)
+
+            page._on_data_ready(SupplierReorderResult.success(
+                (SupplierReorderGroup(1, "S1", (
+                    ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0),
+                )),),
+                (),
+            ))
+            _spin(3)
             add_btns = [b for b in page._scroll_widget.findChildren(QPushButton)
                         if "Προσθήκη" in (b.text() or "")]
             assert len(add_btns) == 1
             add_btns[0].click()
             _spin(2)
+            # The user was prompted for an explicit quantity.
+            assert prompted == ["A"]
             assert "A" in page._draft
-            assert page._draft["A"].quantity == 1
+            # The explicitly-entered quantity (5) is used — no default.
+            assert page._draft["A"].quantity == 5
+            # The button is disabled and relabelled.
+            assert not add_btns[0].isEnabled()
+            assert "Στο πρόχειρο" in add_btns[0].text()
+        finally:
+            _teardown_page(page)
+
+    def test_clicking_add_button_cancel_does_not_add(
+        self, qapp, tmp_path, monkeypatch,
+    ):
+        """If the user cancels the quantity prompt, nothing is added."""
+        db = str(tmp_path / "t.db")
+        _make_reorder_db(db, [], suppliers=[])
+        page = _make_page(db)
+        try:
+            from qt_app.data_source import (
+                SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
+            )
+            monkeypatch.setattr(page, "_prompt_quantity",
+                                lambda cand: None)  # cancel
+            page._on_data_ready(SupplierReorderResult.success(
+                (SupplierReorderGroup(1, "S1", (
+                    ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0),
+                )),),
+                (),
+            ))
+            _spin(3)
+            add_btns = [b for b in page._scroll_widget.findChildren(QPushButton)
+                        if "Προσθήκη" in (b.text() or "")]
+            add_btns[0].click()
+            _spin(2)
+            assert page.is_draft_empty()
+            assert add_btns[0].isEnabled()
+        finally:
+            _teardown_page(page)
+
+    def test_clicking_add_button_zero_quantity_rejected(
+        self, qapp, tmp_path, monkeypatch,
+    ):
+        """If the user enters 0 (the blank-equivalent default), nothing is
+        added — the contract requires an explicit positive integer."""
+        db = str(tmp_path / "t.db")
+        _make_reorder_db(db, [], suppliers=[])
+        page = _make_page(db)
+        try:
+            from qt_app.data_source import (
+                SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
+            )
+            monkeypatch.setattr(page, "_prompt_quantity",
+                                lambda cand: 0)  # blank-equivalent
+            page._on_data_ready(SupplierReorderResult.success(
+                (SupplierReorderGroup(1, "S1", (
+                    ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0),
+                )),),
+                (),
+            ))
+            _spin(3)
+            add_btns = [b for b in page._scroll_widget.findChildren(QPushButton)
+                        if "Προσθήκη" in (b.text() or "")]
+            add_btns[0].click()
+            _spin(2)
+            assert page.is_draft_empty()
+            assert add_btns[0].isEnabled()
+        finally:
+            _teardown_page(page)
+
+    def test_repeated_click_does_not_bump_quantity(
+        self, qapp, tmp_path, monkeypatch,
+    ):
+        """Once a candidate is in the draft, repeated button clicks must
+        NOT silently increase its quantity.  The button is disabled
+        after the first successful add."""
+        db = str(tmp_path / "t.db")
+        _make_reorder_db(db, [], suppliers=[])
+        page = _make_page(db)
+        try:
+            from qt_app.data_source import (
+                SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
+            )
+            monkeypatch.setattr(page, "_prompt_quantity",
+                                lambda cand: 9)
+            page._on_data_ready(SupplierReorderResult.success(
+                (SupplierReorderGroup(1, "S1", (
+                    ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0),
+                )),),
+                (),
+            ))
+            _spin(3)
+            add_btns = [b for b in page._scroll_widget.findChildren(QPushButton)
+                        if "Προσθήκη" in (b.text() or "")]
+            add_btns[0].click()
+            _spin(2)
+            assert page._draft["A"].quantity == 9
+            # Button now disabled — clicking a disabled button is a
+            # no-op, but even calling the handler directly must not bump.
+            assert not add_btns[0].isEnabled()
+            page._add_candidate_via_button(
+                add_btns[0], 1, "S1",
+                ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0))
+            _spin(2)
+            assert page._draft["A"].quantity == 9  # unchanged
         finally:
             _teardown_page(page)
 
@@ -822,10 +1094,10 @@ class TestSupplierReorderDraftWorkflow:
         _make_reorder_db(db, [], suppliers=[])
         page = _make_page(db)
         try:
-            assert page._draft_table.rowCount() == 0
-            # Empty label is explicitly shown, table explicitly hidden.
+            # Empty: no section boxes, empty label visible, summary blank.
+            assert _draft_section_boxes(page) == []
             assert not page._draft_empty.isHidden()
-            assert page._draft_table.isHidden()
+            assert page._draft_sections_host.isHidden()
             assert "άδειο" in page._draft_empty.text()
             assert page._draft_summary.text() == ""
         finally:
@@ -838,13 +1110,17 @@ class TestSupplierReorderDraftWorkflow:
         try:
             from qt_app.data_source import ReorderCandidate
             page._add_to_draft(1, "S1", ReorderCandidate(
-                "A", "Alpha", 1, 10, "2027-01-01", 1.0), quantity=2)
+                "A", "Alpha", 1, 10, "2027-01-01", 1.0), 2)
             page._add_to_draft(2, "S2", ReorderCandidate(
-                "B", "Beta", 1, 10, "2027-01-01", 1.0), quantity=3)
+                "B", "Beta", 1, 10, "2027-01-01", 1.0), 3)
+            _spin(2)
             summary = page._draft_summary.text()
             assert "Γραμμές: 2" in summary
             assert "Προμηθευτές: 2" in summary
-            assert page._draft_table.rowCount() == 2
+            # Two per-supplier sections, one line each.
+            tables = _all_draft_section_tables(page)
+            assert len(tables) == 2
+            assert sum(t.rowCount() for t in tables) == 2
         finally:
             _teardown_page(page)
 
@@ -876,9 +1152,11 @@ class TestSupplierReorderDraftWorkflow:
         try:
             from qt_app.data_source import ReorderCandidate
             page._add_to_draft(1, "S1", ReorderCandidate(
-                "A", "Alpha", 1, 10, "2027-01-01", 1.0), quantity=2)
+                "A", "Alpha", 1, 10, "2027-01-01", 1.0), 2)
             _spin(2)
-            spin = page._draft_table.cellWidget(0, 6)
+            table = _draft_section_table(page, "S1")
+            assert table is not None
+            spin = table.cellWidget(0, 6)
             assert isinstance(spin, QSpinBox)
             spin.setValue(15)
             _spin(2)
@@ -893,9 +1171,11 @@ class TestSupplierReorderDraftWorkflow:
         try:
             from qt_app.data_source import ReorderCandidate
             page._add_to_draft(1, "S1", ReorderCandidate(
-                "A", "Alpha", 1, 10, "2027-01-01", 1.0), quantity=2)
+                "A", "Alpha", 1, 10, "2027-01-01", 1.0), 2)
             _spin(2)
-            rm_btn = page._draft_table.cellWidget(0, 7)
+            table = _draft_section_table(page, "S1")
+            assert table is not None
+            rm_btn = table.cellWidget(0, 7)
             assert isinstance(rm_btn, QPushButton)
             rm_btn.click()
             _spin(2)
