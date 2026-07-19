@@ -788,9 +788,11 @@ class TestGoodsReceiptPageStructural:
         keys = {k for k, _ in NAV_ITEMS}
         required = {"dashboard", "inventory", "suppliers", "pos",
                     "customers", "invoice_history", "stock_movements",
-                    "settings", "ai_assistant", "goods_receipts"}
-        assert keys == required, f"Missing keys: {required - keys}"
-        assert len(NAV_ITEMS) == 10
+                    "settings", "ai_assistant", "goods_receipts",
+                    "supplier_reorder"}
+        missing = required - keys
+        assert not missing, f"Missing keys: {missing}"
+        assert len(NAV_ITEMS) == 11
 
 
 # ═══════════════════════════════════════════════════════════════════════
