@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import errno
 import os
 import sqlite3
 import tempfile
@@ -522,32 +523,30 @@ class TestRaceFinalizationSafety:
         self, tmp_path, monkeypatch,
     ):
         """Simulate a concurrent process creating the target after
-        validation passes but before rename finalizes.  Export must
+        validation passes but before finalization.  Export must
         fail and the concurrent file's bytes survive untouched."""
         snap = _inv_snapshot()
         path = str(tmp_path / "race.xlsx")
         original_bytes = b"concurrent payload"
 
-        # Let validation pass (no file yet), then create the file
-        # right before the os.rename inside _safe_write.
         import infrastructure.xlsx_export_service as svc
 
-        _real_rename = os.rename
-        rename_calls = []
+        _real_link = os.link
+        link_calls = []
 
-        def _fake_rename(src, dst):
+        def _fake_link(src, dst):
             # Create the concurrent file just-in-time if it's our target
             if dst == path and not os.path.exists(dst):
                 with open(dst, "wb") as f:
                     f.write(original_bytes)
-            rename_calls.append((src, dst))
-            return _real_rename(src, dst)
+            link_calls.append((src, dst))
+            return _real_link(src, dst)
 
-        monkeypatch.setattr(os, "rename", _fake_rename)
+        monkeypatch.setattr(os, "link", _fake_link)
 
         r = export_inventory_snapshot(snap, path)
 
-        # os.rename on Windows raises FileExistsError → export fails
+        # os.link raises FileExistsError → export fails
         assert not r.ok
         assert "υπάρχει ήδη" in r.error_message
 
@@ -579,22 +578,19 @@ class TestRaceFinalizationSafety:
         with open(pre_existing, "rb") as f:
             assert f.read() == pre_bytes
 
-    def test_rename_failure_cleans_temp_not_target(self, tmp_path, monkeypatch):
-        """When rename fails, only the temp file is cleaned — the
-        target (if it exists) is never touched."""
+    def test_link_failure_cleans_temp_not_target(self, tmp_path, monkeypatch):
+        """When ``os.link`` fails (target exists), only the temp file
+        is cleaned — the target is never touched.
+        Simulates a concurrent file appearing between validation and
+        finalization by bypassing validation."""
         snap = _inv_snapshot()
         path = str(tmp_path / "final.xlsx")
         concurrent_bytes = b"concurrent data"
 
-        # Create target file to trigger rename failure
+        # Create target file to trigger link failure
         with open(path, "wb") as f:
             f.write(concurrent_bytes)
 
-        # Now validation is bypassed (we call _safe_write with an
-        # already-existing target — normally guarded, but testing the
-        # lower-level safety).  Use a direct approach: patch
-        # _validate_xlsx_path to always return None, so _safe_write
-        # is exercised with a target that exists.
         import infrastructure.xlsx_export_service as svc
 
         # Monkeypatch the validate to return None (skip check)
@@ -615,6 +611,28 @@ class TestRaceFinalizationSafety:
             full = os.path.join(tempdir, entry)
             if full == path:
                 continue  # this is the concurrent target, expected
+            assert not entry.endswith(".xlsx"), \
+                f"Temp file left behind: {entry}"
+
+    def test_fail_closed_when_link_unavailable(self, tmp_path, monkeypatch):
+        """When ``os.link`` is unavailable (cross-device / no hard-link
+        support), export fails closed with a clear Greek error.
+        No target file and no temp leftovers."""
+        snap = _inv_snapshot()
+        path = str(tmp_path / "out.xlsx")
+
+        def _broken_link(src, dst):
+            raise OSError(errno.EXDEV, "Cross-device link")
+
+        monkeypatch.setattr(os, "link", _broken_link)
+
+        r = export_inventory_snapshot(snap, path)
+        assert not r.ok
+        assert "δεν υποστηρίζει" in r.error_message
+        # No target file should be created
+        assert not os.path.exists(path)
+        # No temp .xlsx files should remain
+        for entry in os.listdir(tmp_path):
             assert not entry.endswith(".xlsx"), \
                 f"Temp file left behind: {entry}"
 

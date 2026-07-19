@@ -12,6 +12,7 @@ Export scopes:
 
 from __future__ import annotations
 
+import errno
 import os
 import tempfile
 from dataclasses import dataclass
@@ -91,34 +92,47 @@ def _write_header(ws, headers: list[str]) -> None:
 
 
 def _safe_write(path: str, wb: Workbook) -> ExportResult:
-    """Write workbook to a temp file, then rename into final position.
+    """Write workbook to a temp file, then create a hard link into
+    final position.
 
-    Uses ``os.rename`` (not ``os.replace``) so the final target is
-    created *only* when it does not already exist — on Windows
-    ``os.rename`` raises ``FileExistsError`` when *dst* exists; on
-    POSIX it safely creates a new directory entry for a file that
-    doesn't exist yet (rename across devices is not used here).
+    ``os.link(tmp_path, path)`` creates a new directory entry for the
+    temp inode under *path* — it succeeds *only* when *path* does not
+    yet exist.  Both POSIX and Windows raise ``FileExistsError`` when
+    *dst* already exists, making this a genuinely non-overwriting
+    finalization that works identically on every supported OS.
+
+    After a successful link the temp directory entry is removed with
+    ``os.unlink``; the data survives through *path*'s directory entry.
 
     On any failure the temp file is cleaned up.  The target path is
     **never** removed — if a concurrent process created it in the
-    window between validation and rename the rename fails and the
-    concurrent file survives untouched.
+    window between validation and finalization, ``os.link`` raises
+    ``FileExistsError`` and the concurrent file survives untouched.
+
+    If ``os.link`` is unavailable on the filesystem (cross-device
+    link, no hard-link support), the export fails closed with a clear
+    Greek error and no leftover temp files.
     """
     parent = os.path.dirname(path) or "."
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=parent)
     try:
         os.close(tmp_fd)
         wb.save(tmp_path)
-        os.rename(tmp_path, path)
-        return ExportResult.success(path)
+        os.link(tmp_path, path)
     except OSError:
-        # os.rename on Windows raises FileExistsError when *dst* exists;
-        # on POSIX it may raise EXDEV across devices (not our case).
-        # The target file was NOT created by us — never touch it.
+        # FileExistsError (dst exists), EXDEV (cross-device link),
+        # ENOTSUP (filesystem doesn't support hard links), or any
+        # other OS-level failure.  The target is never ours to touch.
         _remove_if_exists(tmp_path)
+        if os.path.exists(path):
+            return ExportResult.failure(
+                f"Το αρχείο '{os.path.basename(path)}' υπάρχει ήδη. "
+                "Η αντικατάσταση υπαρχόντων αρχείων δεν επιτρέπεται."
+            )
         return ExportResult.failure(
-            f"Το αρχείο '{os.path.basename(path)}' υπάρχει ήδη. "
-            "Η αντικατάσταση υπαρχόντων αρχείων δεν επιτρέπεται."
+            "Αδυναμία εγγραφής αρχείου εξαγωγής: "
+            "το σύστημα αρχείων δεν υποστηρίζει "
+            "την ασφαλή ολοκλήρωση της εξαγωγής."
         )
     except Exception as exc:
         _remove_if_exists(tmp_path)
@@ -126,6 +140,19 @@ def _safe_write(path: str, wb: Workbook) -> ExportResult:
             "Αδυναμία εγγραφής αρχείου εξαγωγής: "
             f"σφάλμα κατά την αποθήκευση — {exc}"
         )
+
+    # Success — unlink the temp directory entry; data lives at *path*.
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        # Clean up both entries on unlink failure to avoid orphans.
+        _remove_if_exists(path)
+        _remove_if_exists(tmp_path)
+        return ExportResult.failure(
+            "Αδυναμία εγγραφής αρχείου εξαγωγής: "
+            "σφάλμα κατά την αφαίρεση προσωρινού αρχείου."
+        )
+    return ExportResult.success(path)
 
 
 def _remove_if_exists(p: str) -> None:
