@@ -8,7 +8,8 @@ Covers:
   - Deterministic row ordering
   - Invalid extension rejection
   - Existing-file non-overwrite protection
-  - Failure cleanup (no partial output left behind)
+  - Race-condition safety (target appearing after validation)
+  - Failure cleanup (no target-file deletion; temp-only cleanup)
   - Snapshot non-mutation guarantee
 """
 
@@ -286,7 +287,18 @@ class TestSupplierReorderExport:
             "Προϊόντα Χωρίς Προμηθευτή",
         ]
 
-    def test_candidates_sheet_has_supplier_sections(self, tmp_path):
+    def test_candidates_sheet_frozen_header_row(self, tmp_path):
+        """Freeze at A2 so the single header row stays visible on scroll."""
+        r = _reorder_result()
+        path = str(tmp_path / "reorder.xlsx")
+        export_supplier_reorder(r, path)
+        wb = load_workbook(path)
+        ws = wb["Υποψήφιοι Αναπαραγγελίας"]
+        assert ws.freeze_panes == "A2"
+
+    def test_candidates_sheet_has_header_and_data(self, tmp_path):
+        """New layout: row 1 = column headers, row 2+ = data with
+        supplier name carried as a data column."""
         prod = ReorderCandidate(
             barcode="5200000000017", name="Παρακεταμόλη",
             stock=3, threshold=10, expiry_date="2026-12-31", price=3.50,
@@ -301,24 +313,20 @@ class TestSupplierReorderExport:
         wb = load_workbook(path)
         ws = wb["Υποψήφιοι Αναπαραγγελίας"]
 
-        # Row 1: supplier header
-        assert ws.cell(row=1, column=1).value == "Προμηθευτής: Demo Pharma"
-        # Row 2: column headers
-        prod_headers = [
-            ws.cell(row=2, column=c).value for c in range(1, 8)
-        ]
-        assert prod_headers == [
+        # Row 1: column headers (single frozen row)
+        headers = [ws.cell(row=1, column=c).value for c in range(1, 8)]
+        assert headers == [
             "Barcode", "Προϊόν", "Απόθεμα", "Όριο",
             "Ημ/νία Λήξης", "Τιμή", "Προμηθευτής",
         ]
-        # Row 3: product data
-        assert ws.cell(row=3, column=1).value == "5200000000017"
-        assert ws.cell(row=3, column=2).value == "Παρακεταμόλη"
-        assert ws.cell(row=3, column=3).value == 3
-        assert ws.cell(row=3, column=4).value == 10
-        assert ws.cell(row=3, column=5).value == "2026-12-31"
-        assert ws.cell(row=3, column=6).value == 3.50
-        assert ws.cell(row=3, column=7).value == "Demo Pharma"
+        # Row 2: product data
+        assert ws.cell(row=2, column=1).value == "5200000000017"
+        assert ws.cell(row=2, column=2).value == "Παρακεταμόλη"
+        assert ws.cell(row=2, column=3).value == 3
+        assert ws.cell(row=2, column=4).value == 10
+        assert ws.cell(row=2, column=5).value == "2026-12-31"
+        assert ws.cell(row=2, column=6).value == 3.50
+        assert ws.cell(row=2, column=7).value == "Demo Pharma"
 
     def test_unassigned_sheet_headers_and_values(self, tmp_path):
         unassigned = UnassignedReorderProduct(
@@ -361,7 +369,7 @@ class TestSupplierReorderExport:
         assert ws.cell(row=2, column=7).value == "Ο προμηθευτής δεν υπάρχει"
 
     def test_supplier_name_unambiguous_per_row(self, tmp_path):
-        """Each product row must carry its owning supplier name."""
+        """Each product row must carry its owning supplier name in col 7."""
         a1 = ReorderCandidate("A", "Alpha", 1, 10, "—", 1.0)
         b1 = ReorderCandidate("B", "Beta", 1, 10, "—", 1.0)
         g1 = SupplierReorderGroup(1, "Supplier One", (a1,))
@@ -372,25 +380,17 @@ class TestSupplierReorderExport:
         wb = load_workbook(path)
         ws = wb["Υποψήφιοι Αναπαραγγελίας"]
 
-        # Find data rows (skip header/label rows that aren't product data)
+        # Row 1: header, Row 2: A/Alpha -> Supplier One,
+        # Row 3: blank separator, Row 4: B/Beta -> Supplier Two
         all_values = []
         for row in ws.iter_rows(min_row=1, values_only=True):
             all_values.append(row)
 
-        # Row 0: Supplier One header
-        # Row 1: product headers
-        # Row 2: A/Alpha product row → supplier col should be "Supplier One"
-        # Row 3: blank separator
-        # Row 4: Supplier Two header
-        # Row 5: product headers
-        # Row 6: B/Beta product row → supplier col should be "Supplier Two"
-
-        assert all_values[0][0] == "Προμηθευτής: Supplier One"
-        assert all_values[2][0] == "A"  # barcode
-        assert all_values[2][6] == "Supplier One"
-        assert all_values[4][0] == "Προμηθευτής: Supplier Two"
-        assert all_values[6][0] == "B"
-        assert all_values[6][6] == "Supplier Two"
+        assert all_values[1][0] == "A"
+        assert all_values[1][6] == "Supplier One"
+        assert all_values[2][0] is None  # blank separator
+        assert all_values[3][0] == "B"
+        assert all_values[3][6] == "Supplier Two"
 
     def test_no_quantities_or_formulas(self, tmp_path):
         prod = ReorderCandidate("X", "Test", 3, 10, "—", 5.0)
@@ -400,7 +400,6 @@ class TestSupplierReorderExport:
         export_supplier_reorder(r, path)
         wb = load_workbook(path)
         ws = wb["Υποψήφιοι Αναπαραγγελίας"]
-        # Check no cell contains a formula
         for row in ws.iter_rows():
             for cell in row:
                 assert not str(cell.value).startswith("="), \
@@ -416,8 +415,8 @@ class TestSupplierReorderExport:
         export_supplier_reorder(r, path)
         wb = load_workbook(path)
         ws = wb["Υποψήφιοι Αναπαραγγελίας"]
-        # Product rows start at row 3 (after supplier header + column headers)
-        names = [ws.cell(row=r, column=2).value for r in range(3, 6)]
+        # Data rows start at row 2 (after single header)
+        names = [ws.cell(row=r, column=2).value for r in range(2, 5)]
         assert names == ["Άλφα", "Βήτα", "Γάμμα"]
 
     def test_does_not_mutate_result(self, tmp_path):
@@ -463,8 +462,6 @@ class TestValidation:
         """Export must fail when target already exists — no silent overwrite."""
         snap = _inv_snapshot()
         path = str(tmp_path / "existing.xlsx")
-        # Create a placeholder file
-        path.encode()  # ensure str
         with open(path, "wb") as f:
             f.write(b"not a real xlsx")
         r = export_inventory_snapshot(snap, path)
@@ -509,12 +506,117 @@ class TestValidation:
     def test_no_partial_output_on_write_failure(self, tmp_path):
         """If the target directory is read-only, no partial file remains."""
         snap = _inv_snapshot()
-        # Path on a non-existent directory — write will fail
         bad_path = str(tmp_path / "nonexistent" / "out.xlsx")
         r = export_inventory_snapshot(snap, bad_path)
         assert not r.ok
-        # The target file must not exist
         assert not os.path.exists(bad_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Race / finalization safety (P5.1a repair)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestRaceFinalizationSafety:
+
+    def test_target_appearing_after_validation_fails_gracefully(
+        self, tmp_path, monkeypatch,
+    ):
+        """Simulate a concurrent process creating the target after
+        validation passes but before rename finalizes.  Export must
+        fail and the concurrent file's bytes survive untouched."""
+        snap = _inv_snapshot()
+        path = str(tmp_path / "race.xlsx")
+        original_bytes = b"concurrent payload"
+
+        # Let validation pass (no file yet), then create the file
+        # right before the os.rename inside _safe_write.
+        import infrastructure.xlsx_export_service as svc
+
+        _real_rename = os.rename
+        rename_calls = []
+
+        def _fake_rename(src, dst):
+            # Create the concurrent file just-in-time if it's our target
+            if dst == path and not os.path.exists(dst):
+                with open(dst, "wb") as f:
+                    f.write(original_bytes)
+            rename_calls.append((src, dst))
+            return _real_rename(src, dst)
+
+        monkeypatch.setattr(os, "rename", _fake_rename)
+
+        r = export_inventory_snapshot(snap, path)
+
+        # os.rename on Windows raises FileExistsError → export fails
+        assert not r.ok
+        assert "υπάρχει ήδη" in r.error_message
+
+        # The concurrent file must survive with its original bytes
+        assert os.path.exists(path)
+        with open(path, "rb") as f:
+            assert f.read() == original_bytes
+
+    def test_cleanup_never_removes_pre_existing_target(
+        self, tmp_path, monkeypatch,
+    ):
+        """A pre-existing target file at the path must survive a failed
+        export — the cleanup must never delete a file it didn't create."""
+        pre_existing = str(tmp_path / "keep_me.xlsx")
+        pre_bytes = b"DO NOT DELETE"
+
+        with open(pre_existing, "wb") as f:
+            f.write(pre_bytes)
+
+        # Create an inventory snapshot — validation will reject because
+        # file already exists.  Make sure no cleanup path touches it.
+        snap = _inv_snapshot()
+        r = export_inventory_snapshot(snap, pre_existing)
+        assert not r.ok
+        assert "υπάρχει ήδη" in r.error_message
+
+        # Pre-existing file must be untouched
+        assert os.path.exists(pre_existing)
+        with open(pre_existing, "rb") as f:
+            assert f.read() == pre_bytes
+
+    def test_rename_failure_cleans_temp_not_target(self, tmp_path, monkeypatch):
+        """When rename fails, only the temp file is cleaned — the
+        target (if it exists) is never touched."""
+        snap = _inv_snapshot()
+        path = str(tmp_path / "final.xlsx")
+        concurrent_bytes = b"concurrent data"
+
+        # Create target file to trigger rename failure
+        with open(path, "wb") as f:
+            f.write(concurrent_bytes)
+
+        # Now validation is bypassed (we call _safe_write with an
+        # already-existing target — normally guarded, but testing the
+        # lower-level safety).  Use a direct approach: patch
+        # _validate_xlsx_path to always return None, so _safe_write
+        # is exercised with a target that exists.
+        import infrastructure.xlsx_export_service as svc
+
+        # Monkeypatch the validate to return None (skip check)
+        monkeypatch.setattr(svc, "_validate_xlsx_path", lambda p: None)
+
+        r = export_inventory_snapshot(snap, path)
+        assert not r.ok
+        assert "υπάρχει ήδη" in r.error_message
+
+        # Target must survive untouched
+        assert os.path.exists(path)
+        with open(path, "rb") as f:
+            assert f.read() == concurrent_bytes
+
+        # No temp file should be left behind in the directory
+        tempdir = str(tmp_path)
+        for entry in os.listdir(tempdir):
+            full = os.path.join(tempdir, entry)
+            if full == path:
+                continue  # this is the concurrent target, expected
+            assert not entry.endswith(".xlsx"), \
+                f"Temp file left behind: {entry}"
 
 
 # ═══════════════════════════════════════════════════════════════════════

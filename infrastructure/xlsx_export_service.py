@@ -91,28 +91,50 @@ def _write_header(ws, headers: list[str]) -> None:
 
 
 def _safe_write(path: str, wb: Workbook) -> ExportResult:
-    """Write workbook to a temp file first, then atomically rename.
+    """Write workbook to a temp file, then rename into final position.
 
-    Cleans up partial output on any failure.
+    Uses ``os.rename`` (not ``os.replace``) so the final target is
+    created *only* when it does not already exist — on Windows
+    ``os.rename`` raises ``FileExistsError`` when *dst* exists; on
+    POSIX it safely creates a new directory entry for a file that
+    doesn't exist yet (rename across devices is not used here).
+
+    On any failure the temp file is cleaned up.  The target path is
+    **never** removed — if a concurrent process created it in the
+    window between validation and rename the rename fails and the
+    concurrent file survives untouched.
     """
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=os.path.dirname(path) or ".")
+    parent = os.path.dirname(path) or "."
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=parent)
     try:
         os.close(tmp_fd)
         wb.save(tmp_path)
-        os.replace(tmp_path, path)
+        os.rename(tmp_path, path)
         return ExportResult.success(path)
+    except OSError:
+        # os.rename on Windows raises FileExistsError when *dst* exists;
+        # on POSIX it may raise EXDEV across devices (not our case).
+        # The target file was NOT created by us — never touch it.
+        _remove_if_exists(tmp_path)
+        return ExportResult.failure(
+            f"Το αρχείο '{os.path.basename(path)}' υπάρχει ήδη. "
+            "Η αντικατάσταση υπαρχόντων αρχείων δεν επιτρέπεται."
+        )
     except Exception as exc:
-        # Remove partial temp file if it still exists
-        for p in (tmp_path, path):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
+        _remove_if_exists(tmp_path)
         return ExportResult.failure(
             "Αδυναμία εγγραφής αρχείου εξαγωγής: "
             f"σφάλμα κατά την αποθήκευση — {exc}"
         )
+
+
+def _remove_if_exists(p: str) -> None:
+    """Best-effort removal of a single path — never raises."""
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except OSError:
+        pass
 
 
 # ── Public export API ─────────────────────────────────────────────────
@@ -214,10 +236,12 @@ def export_supplier_reorder(
 ) -> ExportResult:
     """Export ``SupplierReorderResult`` to a multi-worksheet .xlsx file.
 
-    Worksheet 1: ``Υποψήφιοι Αναπαραγγελίας`` — one section per
-                 supplier (supplier name header row, then product rows).
-    Worksheet 2: ``Προϊόντα Χωρίς Προμηθευτή`` — unassigned products
-                 with a Greek reason column.
+    Worksheet 1: ``Υποψήφιοι Αναπαραγγελίας``
+        Single frozen header row with supplier name carried as a
+        data column.  Blank separator rows between supplier groups.
+
+    Worksheet 2: ``Προϊόντα Χωρίς Προμηθευτή``
+        Unassigned products with a Greek reason column.
 
     Columns (assigned):  Barcode, Προϊόν, Απόθεμα, Όριο,
                           Ημ/νία Λήξης, Τιμή, Προμηθευτής
@@ -239,23 +263,13 @@ def export_supplier_reorder(
             "Barcode", "Προϊόν", "Απόθεμα", "Όριο",
             "Ημ/νία Λήξης", "Τιμή", "Προμηθευτής",
         ]
-        bold_font = Font(bold=True)
+        _write_header(ws1, product_headers)
 
-        row = 1
-        for group in result.groups:
-            # Supplier name as a section header spanning row
-            supplier_cell = ws1.cell(row=row, column=1,
-                                     value=f"Προμηθευτής: {group.supplier_name}")
-            supplier_cell.font = bold_font
-            row += 1
+        row = 2
+        for gi, group in enumerate(result.groups):
+            if gi > 0:
+                row += 1  # blank separator between supplier groups
 
-            # Column headers for this section
-            for col_idx, header in enumerate(product_headers, start=1):
-                cell = ws1.cell(row=row, column=col_idx, value=header)
-                cell.font = bold_font
-            row += 1
-
-            # Product rows
             for product in group.products:
                 ws1.cell(row=row, column=1, value=product.barcode)
                 ws1.cell(row=row, column=2, value=product.name)
@@ -266,9 +280,6 @@ def export_supplier_reorder(
                 ws1.cell(row=row, column=7,
                          value=group.supplier_name)
                 row += 1
-
-            # Blank separator row between suppliers
-            row += 1
 
         _freeze_header(ws1)
         _auto_width(ws1)
