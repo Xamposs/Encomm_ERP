@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QVBoxLayout, QWidget, QScrollArea,
-    QFrame, QAbstractItemView, QInputDialog,
+    QFrame, QAbstractItemView,
 )
 
 from qt_app.pages.base_page import BasePage
@@ -86,11 +86,12 @@ class SupplierReorderPage(BasePage):
 
     shutdown_ready = Signal()
 
-    # Columns for grouped (assigned) candidates — last col is an
-    # explicit Greek action column that hosts the 'add to draft' control.
+    # Columns for grouped (assigned) candidates — col 6 is an inline
+    # quantity QSpinBox, col 7 is the 'add to draft' action button.
     _GROUPED_COLS = [
         "Barcode", "Προϊόν", "Απόθεμα", "Όριο", "Λήξη", "Τιμή",
-        "Προσθήκη στο πρόχειρο",
+        "Ποσότητα",
+        "Προσθήκη",
     ]
     # Columns for unassigned products — one extra for the reason
     _UNASSIGNED_COLS = [
@@ -389,20 +390,35 @@ class SupplierReorderPage(BasePage):
                                p.stock, p.threshold,
                                p.expiry_date, p.price)
             if add_action and group_id is not None and supplier_name:
+                # Inline quantity spinbox — starts at 0 (blank-equivalent).
+                qty_spin = QSpinBox()
+                qty_spin.setRange(0, 100000)
+                qty_spin.setValue(0)
+                qty_spin.setMinimumHeight(30)
+                qty_spin.setProperty("candidate_barcode", p.barcode)
+                table.setCellWidget(r, len(cols) - 2, qty_spin)
+
                 add_btn = QPushButton("➕  Προσθήκη")
                 add_btn.setStyleSheet(self._btn_qss())
                 add_btn.setCursor(Qt.PointingHandCursor)
-                add_btn.setEnabled(p.barcode not in self._draft)
-                if not add_btn.isEnabled():
-                    add_btn.setText("✓  Στο πρόχειρο")
-                # Tag with barcode so _refresh_add_button_states can
-                # re-enable/re-label without scanning table rows.
+                # Disabled at quantity 0 (the 'no selection' state).
+                add_btn.setEnabled(False)
                 add_btn.setProperty("candidate_barcode", p.barcode)
-                # Snapshot data on the bound handler — never refetch.
+
+                if p.barcode in self._draft:
+                    add_btn.setEnabled(False)
+                    add_btn.setText("✓  Στο πρόχειρο")
+                    qty_spin.setValue(self._draft[p.barcode].quantity)
+                    qty_spin.setEnabled(False)
+
+                # Spinbox change toggles the add button.
+                qty_spin.valueChanged.connect(
+                    lambda v, _btn=add_btn: _btn.setEnabled(v > 0))
                 add_btn.clicked.connect(
-                    lambda _checked=False, _btn=add_btn, _g=group_id,
-                    _s=supplier_name, _p=p:
-                    self._add_candidate_via_button(_btn, _g, _s, _p))
+                    lambda _checked=False, _btn=add_btn, _spin=qty_spin,
+                    _g=group_id, _s=supplier_name, _p=p:
+                    self._add_candidate_via_button(
+                        _btn, _spin, _g, _s, _p))
                 table.setCellWidget(r, len(cols) - 1, add_btn)
         return table
 
@@ -455,56 +471,33 @@ class SupplierReorderPage(BasePage):
 
     # ── Draft workflow (in-memory only) ───────────────────────────────
 
-    def _prompt_quantity(self, candidate: ReorderCandidate) -> int | None:
-        """Ask the user for an explicit positive integer quantity.
-
-        Returns the entered positive integer, or None if the user
-        cancelled or entered an invalid value.  This is the ONLY
-        user-facing entry point that produces a quantity — there is no
-        default, no prefill, no inference.
-
-        The dialog starts at 0 (blank-equivalent); the user MUST
-        explicitly enter a positive integer.  Pressing OK with 0, or
-        cancelling, returns None.  Tests monkeypatch this method to
-        avoid the modal dialog.
-        """
-        value, ok = QInputDialog.getInt(
-            self,
-            "Ποσότητα αναπαραγγελίας",
-            f"Εισάγετε ποσότητα για το προϊόν:\n{candidate.name} "
-            f"({candidate.barcode})",
-            value=0, minValue=0, maxValue=100000,
-        )
-        if not ok:
-            return None
-        if value <= 0:
-            return None
-        return int(value)
-
     def _add_candidate_via_button(
         self,
         button: QPushButton,
+        spinbox: QSpinBox,
         supplier_id: int,
         supplier_name: str,
         candidate: ReorderCandidate,
     ) -> None:
         """User-facing 'add to draft' handler bound to each candidate row.
 
-        Enforces the manual-quantity contract: a line can only be
-        created with an explicit positive integer the user enters in
-        the quantity dialog.  Repeated clicks on a candidate already
-        in the draft are a no-op (the button is disabled after a
-        successful add and re-enabled only when the line is removed).
+        Reads the exact quantity from the inline spinbox and passes it
+        to ``_add_to_draft``.  The spinbox starts at 0 (blank-equivalent)
+        and the button is disabled while the quantity is 0, so this
+        handler should only receive a positive integer.  Repeated clicks
+        on a candidate already in the draft are a no-op (the button is
+        disabled after a successful add and re-enabled only when the
+        line is removed or the draft is cleared).
         """
-        # Button may have been disabled mid-flight; never silently bump.
         if candidate.barcode in self._draft:
             return
-        quantity = self._prompt_quantity(candidate)
-        if quantity is None:
+        quantity = spinbox.value()
+        if quantity <= 0:
             return
         if self._add_to_draft(supplier_id, supplier_name, candidate, quantity):
             button.setEnabled(False)
             button.setText("✓  Στο πρόχειρο")
+            spinbox.setEnabled(False)
 
     def _add_to_draft(
         self,
@@ -517,8 +510,8 @@ class SupplierReorderPage(BasePage):
 
         Returns True on success, False on invalid input.  Never writes
         outside this instance.  ``quantity`` MUST be a positive integer
-        — there is NO default; callers must obtain one from the user
-        (via :meth:`_prompt_quantity`) or pass an explicit value.
+        — there is NO default; callers must obtain one from the user's
+        inline QSpinBox or pass an explicit value.
 
         If the product is already in the draft, this is a no-op and
         returns False: a product never appears twice, and the quantity
@@ -545,6 +538,7 @@ class SupplierReorderPage(BasePage):
             quantity=quantity,
         )
         self._render_draft()
+        self._refresh_add_button_states()
         return True
 
     def update_quantity(self, barcode: str, quantity: int) -> bool:
@@ -714,22 +708,60 @@ class SupplierReorderPage(BasePage):
         return table
 
     def _refresh_add_button_states(self) -> None:
-        """Re-enable / re-disable candidate 'add' buttons to match the
-        draft state.  Walks the candidate group boxes installed by the
-        last successful refresh.
+        """Re-enable / re-disable candidate 'add' controls to match
+        the draft state.
 
-        Each add button was tagged with a ``candidate_barcode`` dynamic
-        property by :meth:`_build_product_table` — this avoids walking
-        table rows via the viewport, which is fragile.
+        Walks the candidate group boxes installed by the last
+        successful refresh.  Both the add button and the inline
+        quantity spinbox are tagged with a ``candidate_barcode``
+        dynamic property by :meth:`_build_product_table`.
+
+        Buttons and spinboxes for the same barcode are processed
+        together in a single pass so that (a) spinbox value changes
+        are signal-blocked and (b) the button's enabled state is
+        derived from the actual spinbox value rather than the draft
+        status alone — a non-draft candidate with quantity 0 must
+        have a disabled button.
         """
+        barcodes_in_draft = set(self._draft.keys())
+
+        # Build barcode-indexed maps so we can process controls for
+        # the same candidate together.
+        btn_map: dict[str, QPushButton] = {}
         for btn in self._scroll_widget.findChildren(QPushButton):
-            barcode = btn.property("candidate_barcode")
-            if barcode is None:
-                continue
-            in_draft = barcode in self._draft
-            btn.setEnabled(not in_draft)
-            btn.setText(
-                "✓  Στο πρόχειρο" if in_draft else "➕  Προσθήκη")
+            bc = btn.property("candidate_barcode")
+            if bc is not None:
+                btn_map[bc] = btn
+
+        spin_map: dict[str, QSpinBox] = {}
+        for spin in self._scroll_widget.findChildren(QSpinBox):
+            bc = spin.property("candidate_barcode")
+            if bc is not None:
+                spin_map[bc] = spin
+
+        all_barcodes = set(btn_map) | set(spin_map)
+        for barcode in all_barcodes:
+            in_draft = barcode in barcodes_in_draft
+            spin = spin_map.get(barcode)
+            btn = btn_map.get(barcode)
+
+            if spin is not None:
+                spin.blockSignals(True)
+                if in_draft:
+                    spin.setValue(self._draft[barcode].quantity)
+                else:
+                    spin.setValue(0)
+                spin.blockSignals(False)
+                spin.setEnabled(not in_draft)
+
+            if btn is not None:
+                if in_draft:
+                    btn.setEnabled(False)
+                    btn.setText("✓  Στο πρόχειρο")
+                else:
+                    has_qty = spin is not None and spin.value() > 0
+                    btn.setEnabled(has_qty)
+                    btn.setText("➕  Προσθήκη")
 
     def _on_discard_clicked(self) -> None:
         """Clear the local draft.  Purely in-memory; touches nothing else."""

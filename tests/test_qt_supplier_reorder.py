@@ -873,15 +873,19 @@ class TestSupplierReorderDraftWorkflow:
                 ),),
             ))
             _spin(3)
-            # Unassigned section has no add buttons
+            # Unassigned section has no add buttons or quantity spinboxes
             add_btns = page._scroll_widget.findChildren(QPushButton)
             add_btns = [b for b in add_btns if "Προσθήκη" in (b.text() or "")]
             assert add_btns == []
+            qty_spins = [s for s in page._scroll_widget.findChildren(QSpinBox)
+                         if s.property("candidate_barcode") is not None]
+            assert qty_spins == []
         finally:
             _teardown_page(page)
 
-    def test_grouped_candidates_have_add_buttons(self, qapp, tmp_path):
-        """Each grouped candidate row has an 'Προσθήκη' button."""
+    def test_grouped_candidates_have_add_and_quantity_controls(self, qapp, tmp_path):
+        """Each grouped candidate row has a quantity spinbox and an
+        'Προσθήκη' button."""
         db = str(tmp_path / "t.db")
         _make_reorder_db(db, [], suppliers=[])
         page = _make_page(db)
@@ -900,14 +904,17 @@ class TestSupplierReorderDraftWorkflow:
             add_btns = [b for b in page._scroll_widget.findChildren(QPushButton)
                         if "Προσθήκη" in (b.text() or "")]
             assert len(add_btns) == 2
+            # Each row also has a tagged quantity spinbox.
+            qty_spins = [s for s in page._scroll_widget.findChildren(QSpinBox)
+                         if s.property("candidate_barcode") is not None]
+            assert len(qty_spins) == 2
         finally:
             _teardown_page(page)
 
-    def test_action_column_preserves_price_column(self, qapp, tmp_path):
-        """Finding 2: the candidate table has a dedicated Greek action
-        column; Barcode/Name/Stock/Threshold/Expiry/Price stay as
-        visible data columns and the add button sits ONLY in the
-        action column (never replacing the price cell)."""
+    def test_inline_quantity_and_action_column(self, qapp, tmp_path):
+        """Finding 2: the candidate table has an inline quantity spinbox
+        column and a separate Greek action column.  Data columns
+        Barcode/Name/Stock/Threshold/Expiry/Price stay intact."""
         db = str(tmp_path / "t.db")
         _make_reorder_db(db, [], suppliers=[])
         page = _make_page(db)
@@ -930,32 +937,37 @@ class TestSupplierReorderDraftWorkflow:
             ]
             assert len(cand_tables) == 1
             table = cand_tables[0]
-            # Header includes the Greek action column.
+            # 8 columns: Barcode, Product, Stock, Threshold, Expiry, Price,
+            #            Quantity (spinbox), Add (button)
+            assert table.columnCount() == 8
             headers = [table.horizontalHeaderItem(i).text()
                        for i in range(table.columnCount())]
             assert "Τιμή" in headers
-            assert any("Προσθήκη" in h for h in headers)
+            assert "Ποσότητα" in headers
+            assert "Προσθήκη" in headers
             # Price column (index 5) is populated, not overwritten.
-            price_item = table.item(0, headers.index("Τιμή"))
+            price_item = table.item(0, 5)
             assert price_item is not None
             assert price_item.text() == "€10.00"
-            # The action-column cell is a button widget, not a text item.
-            action_col = next(i for i, h in enumerate(headers)
-                              if "Προσθήκη" in h)
-            assert table.cellWidget(0, action_col) is not None
-            assert isinstance(table.cellWidget(0, action_col), QPushButton)
-            # And the price cell is NOT a widget.
-            assert table.cellWidget(0, headers.index("Τιμή")) is None
+            # Column 6 is the inline quantity spinbox.
+            qty_widget = table.cellWidget(0, 6)
+            assert qty_widget is not None
+            assert isinstance(qty_widget, QSpinBox)
+            assert qty_widget.value() == 0
+            # Column 7 is the action button.
+            act_widget = table.cellWidget(0, 7)
+            assert act_widget is not None
+            assert isinstance(act_widget, QPushButton)
+            # Price cell is NOT a widget.
+            assert table.cellWidget(0, 5) is None
         finally:
             _teardown_page(page)
 
     def test_clicking_add_button_adds_to_draft(
-        self, qapp, tmp_path, monkeypatch,
+        self, qapp, tmp_path,
     ):
-        """Clicking 'Προσθήκη' prompts for a quantity, then adds the
-        line.  We monkeypatch ``_prompt_quantity`` to return an
-        explicit positive integer without showing the modal dialog.
-        """
+        """Clicking 'Προσθήκη' with a positive quantity in the inline
+        spinbox adds the line with that exact quantity."""
         db = str(tmp_path / "t.db")
         _make_reorder_db(db, [], suppliers=[])
         page = _make_page(db)
@@ -963,12 +975,6 @@ class TestSupplierReorderDraftWorkflow:
             from qt_app.data_source import (
                 SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
             )
-            prompted: list = []
-            def _fake_prompt(candidate):
-                prompted.append(candidate.barcode)
-                return 5
-            monkeypatch.setattr(page, "_prompt_quantity", _fake_prompt)
-
             page._on_data_ready(SupplierReorderResult.success(
                 (SupplierReorderGroup(1, "S1", (
                     ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0),
@@ -976,26 +982,38 @@ class TestSupplierReorderDraftWorkflow:
                 (),
             ))
             _spin(3)
-            add_btns = [b for b in page._scroll_widget.findChildren(QPushButton)
-                        if "Προσθήκη" in (b.text() or "")]
-            assert len(add_btns) == 1
-            add_btns[0].click()
+            # Find the candidate table
+            cand_tables = [
+                t for gb in page._scroll_widget.findChildren(QGroupBox)
+                if "Προμηθευτής" in gb.title()
+                for t in gb.findChildren(QTableWidget)
+            ]
+            assert len(cand_tables) == 1
+            table = cand_tables[0]
+            # Set the inline quantity to 5
+            qty_spin = table.cellWidget(0, 6)
+            assert isinstance(qty_spin, QSpinBox)
+            qty_spin.setValue(5)
+            _spin(1)
+            # The add button should now be enabled
+            add_btn = table.cellWidget(0, 7)
+            assert isinstance(add_btn, QPushButton)
+            assert add_btn.isEnabled()
+            add_btn.click()
             _spin(2)
-            # The user was prompted for an explicit quantity.
-            assert prompted == ["A"]
+            # The exact quantity (5) is used — no default, no inference.
             assert "A" in page._draft
-            # The explicitly-entered quantity (5) is used — no default.
             assert page._draft["A"].quantity == 5
-            # The button is disabled and relabelled.
-            assert not add_btns[0].isEnabled()
-            assert "Στο πρόχειρο" in add_btns[0].text()
+            # Both controls are now disabled for this candidate.
+            assert not add_btn.isEnabled()
+            assert "Στο πρόχειρο" in add_btn.text()
+            assert not qty_spin.isEnabled()
         finally:
             _teardown_page(page)
 
-    def test_clicking_add_button_cancel_does_not_add(
-        self, qapp, tmp_path, monkeypatch,
-    ):
-        """If the user cancels the quantity prompt, nothing is added."""
+    def test_add_button_disabled_at_zero_quantity(self, qapp, tmp_path):
+        """At initial state (quantity=0) the add button is disabled.
+        Clicking the disabled button is a no-op."""
         db = str(tmp_path / "t.db")
         _make_reorder_db(db, [], suppliers=[])
         page = _make_page(db)
@@ -1003,8 +1021,6 @@ class TestSupplierReorderDraftWorkflow:
             from qt_app.data_source import (
                 SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
             )
-            monkeypatch.setattr(page, "_prompt_quantity",
-                                lambda cand: None)  # cancel
             page._on_data_ready(SupplierReorderResult.success(
                 (SupplierReorderGroup(1, "S1", (
                     ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0),
@@ -1012,20 +1028,32 @@ class TestSupplierReorderDraftWorkflow:
                 (),
             ))
             _spin(3)
-            add_btns = [b for b in page._scroll_widget.findChildren(QPushButton)
-                        if "Προσθήκη" in (b.text() or "")]
-            add_btns[0].click()
+            cand_tables = [
+                t for gb in page._scroll_widget.findChildren(QGroupBox)
+                if "Προμηθευτής" in gb.title()
+                for t in gb.findChildren(QTableWidget)
+            ]
+            assert len(cand_tables) == 1
+            table = cand_tables[0]
+            qty_spin = table.cellWidget(0, 6)
+            assert isinstance(qty_spin, QSpinBox)
+            assert qty_spin.value() == 0
+            add_btn = table.cellWidget(0, 7)
+            assert isinstance(add_btn, QPushButton)
+            # Button is disabled at quantity 0.
+            assert not add_btn.isEnabled()
+            # Clicking the disabled button does nothing.
+            add_btn.click()
             _spin(2)
             assert page.is_draft_empty()
-            assert add_btns[0].isEnabled()
         finally:
             _teardown_page(page)
 
-    def test_clicking_add_button_zero_quantity_rejected(
-        self, qapp, tmp_path, monkeypatch,
+    def test_positive_quantity_enables_add_button(
+        self, qapp, tmp_path,
     ):
-        """If the user enters 0 (the blank-equivalent default), nothing is
-        added — the contract requires an explicit positive integer."""
+        """Setting the inline spinbox to a positive integer enables the
+        add button.  Going back to 0 re-disables it."""
         db = str(tmp_path / "t.db")
         _make_reorder_db(db, [], suppliers=[])
         page = _make_page(db)
@@ -1033,8 +1061,6 @@ class TestSupplierReorderDraftWorkflow:
             from qt_app.data_source import (
                 SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
             )
-            monkeypatch.setattr(page, "_prompt_quantity",
-                                lambda cand: 0)  # blank-equivalent
             page._on_data_ready(SupplierReorderResult.success(
                 (SupplierReorderGroup(1, "S1", (
                     ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0),
@@ -1042,21 +1068,36 @@ class TestSupplierReorderDraftWorkflow:
                 (),
             ))
             _spin(3)
-            add_btns = [b for b in page._scroll_widget.findChildren(QPushButton)
-                        if "Προσθήκη" in (b.text() or "")]
-            add_btns[0].click()
-            _spin(2)
-            assert page.is_draft_empty()
-            assert add_btns[0].isEnabled()
+            cand_tables = [
+                t for gb in page._scroll_widget.findChildren(QGroupBox)
+                if "Προμηθευτής" in gb.title()
+                for t in gb.findChildren(QTableWidget)
+            ]
+            assert len(cand_tables) == 1
+            table = cand_tables[0]
+            qty_spin = table.cellWidget(0, 6)
+            assert isinstance(qty_spin, QSpinBox)
+            add_btn = table.cellWidget(0, 7)
+            assert isinstance(add_btn, QPushButton)
+            # Initially disabled at 0.
+            assert not add_btn.isEnabled()
+            # Set to positive — button enables.
+            qty_spin.setValue(3)
+            _spin(1)
+            assert add_btn.isEnabled()
+            # Going back to 0 — button disables again.
+            qty_spin.setValue(0)
+            _spin(1)
+            assert not add_btn.isEnabled()
         finally:
             _teardown_page(page)
 
     def test_repeated_click_does_not_bump_quantity(
-        self, qapp, tmp_path, monkeypatch,
+        self, qapp, tmp_path,
     ):
         """Once a candidate is in the draft, repeated button clicks must
-        NOT silently increase its quantity.  The button is disabled
-        after the first successful add."""
+        NOT silently increase its quantity.  The button and spinbox are
+        disabled after the first successful add."""
         db = str(tmp_path / "t.db")
         _make_reorder_db(db, [], suppliers=[])
         page = _make_page(db)
@@ -1064,8 +1105,6 @@ class TestSupplierReorderDraftWorkflow:
             from qt_app.data_source import (
                 SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
             )
-            monkeypatch.setattr(page, "_prompt_quantity",
-                                lambda cand: 9)
             page._on_data_ready(SupplierReorderResult.success(
                 (SupplierReorderGroup(1, "S1", (
                     ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0),
@@ -1073,16 +1112,32 @@ class TestSupplierReorderDraftWorkflow:
                 (),
             ))
             _spin(3)
-            add_btns = [b for b in page._scroll_widget.findChildren(QPushButton)
-                        if "Προσθήκη" in (b.text() or "")]
-            add_btns[0].click()
+            cand_tables = [
+                t for gb in page._scroll_widget.findChildren(QGroupBox)
+                if "Προμηθευτής" in gb.title()
+                for t in gb.findChildren(QTableWidget)
+            ]
+            assert len(cand_tables) == 1
+            table = cand_tables[0]
+            qty_spin = table.cellWidget(0, 6)
+            add_btn = table.cellWidget(0, 7)
+            assert isinstance(qty_spin, QSpinBox)
+            assert isinstance(add_btn, QPushButton)
+            # Set quantity and add.
+            qty_spin.setValue(9)
+            _spin(1)
+            assert add_btn.isEnabled()
+            add_btn.click()
             _spin(2)
             assert page._draft["A"].quantity == 9
-            # Button now disabled — clicking a disabled button is a
-            # no-op, but even calling the handler directly must not bump.
-            assert not add_btns[0].isEnabled()
+            # Both controls now disabled.
+            assert not add_btn.isEnabled()
+            assert not qty_spin.isEnabled()
+            # Direct handler call with a dummy spinbox must not bump.
+            dummy_spin = QSpinBox()
+            dummy_spin.setValue(99)
             page._add_candidate_via_button(
-                add_btns[0], 1, "S1",
+                add_btn, dummy_spin, 1, "S1",
                 ReorderCandidate("A", "Alpha", 3, 10, "2027-01-01", 10.0))
             _spin(2)
             assert page._draft["A"].quantity == 9  # unchanged
@@ -1180,6 +1235,107 @@ class TestSupplierReorderDraftWorkflow:
             rm_btn.click()
             _spin(2)
             assert "A" not in page._draft
+        finally:
+            _teardown_page(page)
+
+    def test_candidate_controls_reset_after_remove(self, qapp, tmp_path):
+        """Removing a draft line resets the candidate's inline quantity
+        spinbox to 0 and disables its add button."""
+        from qt_app.data_source import (
+            SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
+        )
+        db = str(tmp_path / "t.db")
+        _make_reorder_db(db, [], suppliers=[])
+        page = _make_page(db)
+        try:
+            # Feed grouped data and add one candidate to draft.
+            page._on_data_ready(SupplierReorderResult.success(
+                (SupplierReorderGroup(1, "S1", (
+                    ReorderCandidate("A", "Alpha", 1, 10, "2027-01-01", 1.0),
+                )),),
+                (),
+            ))
+            _spin(3)
+            cand_tables = [
+                t for gb in page._scroll_widget.findChildren(QGroupBox)
+                if "Προμηθευτής" in gb.title()
+                for t in gb.findChildren(QTableWidget)
+            ]
+            assert len(cand_tables) == 1
+            table = cand_tables[0]
+            qty_spin = table.cellWidget(0, 6)
+            add_btn = table.cellWidget(0, 7)
+            assert isinstance(qty_spin, QSpinBox)
+            assert isinstance(add_btn, QPushButton)
+            # Add to draft via direct call.
+            page._add_to_draft(1, "S1", ReorderCandidate(
+                "A", "Alpha", 1, 10, "2027-01-01", 1.0), 5)
+            _spin(2)
+            # Controls disabled while in draft.
+            assert not add_btn.isEnabled()
+            assert not qty_spin.isEnabled()
+            # Remove the line.
+            page.remove_line("A")
+            _spin(2)
+            # Candidate re-enabled: spinbox at 0, button disabled.
+            assert qty_spin.value() == 0
+            assert not add_btn.isEnabled()
+            assert "Προσθήκη" in add_btn.text()
+            # User can now set a new quantity and add again.
+            qty_spin.setValue(3)
+            _spin(1)
+            assert add_btn.isEnabled()
+        finally:
+            _teardown_page(page)
+
+    def test_candidate_controls_reset_after_clear(self, qapp, tmp_path):
+        """Clearing the entire draft resets every candidate's inline
+        quantity to 0 and disables all add buttons."""
+        from qt_app.data_source import (
+            SupplierReorderResult, SupplierReorderGroup, ReorderCandidate,
+        )
+        db = str(tmp_path / "t.db")
+        _make_reorder_db(db, [], suppliers=[])
+        page = _make_page(db)
+        try:
+            # Two candidates grouped under one supplier.
+            page._on_data_ready(SupplierReorderResult.success(
+                (SupplierReorderGroup(1, "S1", (
+                    ReorderCandidate("A", "Alpha", 1, 10, "2027-01-01", 1.0),
+                    ReorderCandidate("B", "Beta", 2, 10, "2027-06-01", 2.0),
+                )),),
+                (),
+            ))
+            _spin(3)
+            cand_tables = [
+                t for gb in page._scroll_widget.findChildren(QGroupBox)
+                if "Προμηθευτής" in gb.title()
+                for t in gb.findChildren(QTableWidget)
+            ]
+            assert len(cand_tables) == 1
+            table = cand_tables[0]
+            spin_a = table.cellWidget(0, 6)
+            btn_a = table.cellWidget(0, 7)
+            spin_b = table.cellWidget(1, 6)
+            btn_b = table.cellWidget(1, 7)
+            # Add both to draft.
+            page._add_to_draft(1, "S1", ReorderCandidate(
+                "A", "Alpha", 1, 10, "2027-01-01", 1.0), 5)
+            page._add_to_draft(1, "S1", ReorderCandidate(
+                "B", "Beta", 2, 10, "2027-06-01", 2.0), 3)
+            _spin(2)
+            assert not btn_a.isEnabled()
+            assert not spin_a.isEnabled()
+            assert not btn_b.isEnabled()
+            assert not spin_b.isEnabled()
+            # Clear the draft.
+            page.clear_draft()
+            _spin(2)
+            # Both candidates reset.
+            assert spin_a.value() == 0
+            assert not btn_a.isEnabled()
+            assert spin_b.value() == 0
+            assert not btn_b.isEnabled()
         finally:
             _teardown_page(page)
 
