@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QComboBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QSizePolicy, QDialog, QFormLayout,
     QSpinBox, QDoubleSpinBox, QDateEdit, QDialogButtonBox,
-    QMessageBox,
+    QMessageBox, QFileDialog,
 )
 
 from qt_app.pages.base_page import BasePage
@@ -29,6 +29,9 @@ from infrastructure.inventory_command_service import (
 from infrastructure.stock_adjustment_service import (
     StockAdjustmentRequest, StockAdjustmentResult,
     REASON_CHOICES, adjust_stock,
+)
+from infrastructure.xlsx_export_service import (
+    ExportResult, export_inventory_snapshot,
 )
 
 
@@ -298,6 +301,20 @@ class _AdjustWorker(QObject):
         self.finished.emit(adjust_stock(self._db_path, self._req))
 
 
+# ── Export worker ──────────────────────────────────────────────────
+class _ExportWorker(QObject):
+    finished = Signal(ExportResult)
+
+    def __init__(self, snapshot, target_path: str, parent=None):
+        super().__init__(parent)
+        self._snapshot = snapshot
+        self._target_path = target_path
+
+    def run(self):
+        self.finished.emit(
+            export_inventory_snapshot(self._snapshot, self._target_path))
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Inventory page
 # ═══════════════════════════════════════════════════════════════════════
@@ -334,6 +351,11 @@ class InventoryPage(BasePage):
         self._adj_worker = None
         self._adj_thread = None
         self._adj_loading = False
+        self._current_snapshot = None
+        self._export_btn = None
+        self._export_loading = False
+        self._export_worker = None
+        self._export_thread = None
         super().__init__(db_service, config, parent)
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
@@ -390,6 +412,12 @@ class InventoryPage(BasePage):
         self._adj_btn.setEnabled(False)
         self._adj_btn.clicked.connect(self._on_adjust_stock)
         act_row.addWidget(self._adj_btn)
+        self._export_btn = QPushButton("📤  Εξαγωγή τρέχουσας προβολής Excel")
+        self._export_btn.setCursor(Qt.PointingHandCursor)
+        self._export_btn.setStyleSheet(self._accent_btn_qss())
+        self._export_btn.setEnabled(False)
+        self._export_btn.clicked.connect(self._on_export)
+        act_row.addWidget(self._export_btn)
         act_row.addStretch()
         self.root_layout.addLayout(act_row)
 
@@ -744,6 +772,83 @@ class InventoryPage(BasePage):
         self._adj_worker = None
         self._adj_thread = None
 
+    # ── Export current view ──────────────────────────────────────────
+    def _on_export(self):
+        """Open save-file dialog, then dispatch export worker."""
+        if self._export_loading:
+            return
+        if self._current_snapshot is None:
+            return
+
+        from datetime import date
+        suggested = f"αποθήκη_{date.today().isoformat()}.xlsx"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Εξαγωγή τρέχουσας προβολής",
+            suggested,
+            "Excel αρχεία (*.xlsx)",
+        )
+        if not path:
+            return  # user cancelled
+
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        self._run_export(path)
+
+    def _run_export(self, target_path: str):
+        if self._export_loading:
+            return
+        self._export_loading = True
+        self._export_btn.setEnabled(False)
+
+        self._cleanup_export_worker()
+
+        self._export_thread = QThread(self)
+        self._export_worker = _ExportWorker(
+            self._current_snapshot, target_path)
+        self._export_worker.moveToThread(self._export_thread)
+        self._export_thread.started.connect(self._export_worker.run)
+        self._export_worker.finished.connect(self._on_export_done)
+        self._export_worker.finished.connect(self._export_thread.quit)
+        self._export_thread.finished.connect(
+            self._export_worker.deleteLater)
+        self._export_thread.finished.connect(
+            self._export_thread.deleteLater)
+        self._export_thread.finished.connect(
+            self._on_export_thread_done)
+        self._export_thread.start()
+
+    def _on_export_done(self, result: ExportResult):
+        if self._close_pending:
+            return
+        if result.ok:
+            QMessageBox.information(
+                self, "Επιτυχία",
+                f"Η εξαγωγή αποθηκεύτηκε:\n{result.path}")
+        else:
+            QMessageBox.warning(
+                self, "Σφάλμα", result.error_message)
+
+    def _on_export_thread_done(self):
+        self._export_loading = False
+        self._export_worker = None
+        self._export_thread = None
+        if self._close_pending:
+            self._maybe_finish_shutdown()
+            return
+        # Re-enable export button if we still have a valid snapshot
+        if self._current_snapshot is not None:
+            self._export_btn.setEnabled(True)
+
+    def _cleanup_export_worker(self):
+        if self._export_thread and self._export_thread.isRunning():
+            self._export_thread.quit()
+            self._export_thread.wait(2000)
+        self._export_worker = None
+        self._export_thread = None
+
     # ── Public API for cross-page navigation ──────────────────────────
     def focus_barcode(self, barcode: str) -> None:
         """Set the search field to *barcode* and trigger a refresh.
@@ -771,6 +876,7 @@ class InventoryPage(BasePage):
         self._pending_req = None
         self._loading = True
         self._refresh_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
         self._set_state("🔄 Φόρτωση δεδομένων αποθήκης...", styles.TEXT_MUTED)
         threshold = int(self.config.get("low_stock_threshold", 10)) if self.config else 10
         alert_days = int(self.config.get("expiry_alert_days", 30)) if self.config else 30
@@ -792,11 +898,14 @@ class InventoryPage(BasePage):
         if self._close_pending:
             return
         if not result.ok:
+            self._current_snapshot = None
             self._set_state(result.error_message, styles.RED)
             self._clear_table()
             self._summary_lbl.setText("")
+            self._export_btn.setEnabled(False)
             return
         snap = result.snapshot
+        self._current_snapshot = snap
         total = snap.total_matching
         first = (snap.page - 1) * snap.page_size + 1 if total else 0
         last = min(first + snap.page_size - 1, total)
@@ -806,9 +915,11 @@ class InventoryPage(BasePage):
         if not prods:
             self._set_state("Δεν βρέθηκαν προϊόντα με τα επιλεγμένα φίλτρα.", styles.TEXT_MUTED)
             self._clear_table()
+            self._export_btn.setEnabled(True)
         else:
             self._state_lbl.hide()
             self._table.show()
+            self._export_btn.setEnabled(True)
             self._table.setRowCount(len(prods))
             for r, p in enumerate(prods):
                 self._table.setItem(r, 0, QTableWidgetItem(p.barcode))
@@ -857,9 +968,12 @@ class InventoryPage(BasePage):
         read_running = self._thread is not None and self._thread.isRunning()
         write_running = self._write_thread is not None and self._write_thread.isRunning()
         adjust_running = self._adj_thread is not None and self._adj_thread.isRunning()
+        export_running = (self._export_thread is not None
+                          and self._export_thread.isRunning())
         preview_busy = (self._preview_dlg is not None
                         and self._preview_dlg.is_busy())
-        if not read_running and not write_running and not adjust_running and not preview_busy:
+        if not read_running and not write_running and not adjust_running \
+                and not export_running and not preview_busy:
             self._close_pending = False
             self.shutdown_ready.emit()
 
@@ -919,6 +1033,22 @@ class InventoryPage(BasePage):
                 self._write_worker = None
                 self._write_thread = None
                 self._write_loading = False
+            else:
+                all_stopped = False
+
+        # Attempt export worker shutdown
+        if self._export_thread and self._export_thread.isRunning():
+            try:
+                self._export_worker.finished.disconnect(
+                    self._on_export_done)
+            except (RuntimeError, TypeError):
+                pass
+            self._close_pending = True
+            self._export_thread.quit()
+            if self._export_thread.wait(2000):
+                self._export_worker = None
+                self._export_thread = None
+                self._export_loading = False
             else:
                 all_stopped = False
 
