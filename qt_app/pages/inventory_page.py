@@ -812,14 +812,16 @@ class InventoryPage(BasePage):
     def _run_export(self, target_path: str):
         if self._export_loading or self._loading or self._close_pending:
             return
+        snap = self._current_snapshot
+        if snap is None:
+            return
         self._export_loading = True
         self._sync_export_btn()
 
         self._cleanup_export_worker()
 
         self._export_thread = QThread(self)
-        self._export_worker = _ExportWorker(
-            self._current_snapshot, target_path)
+        self._export_worker = _ExportWorker(snap, target_path)
         self._export_worker.moveToThread(self._export_thread)
         self._export_thread.started.connect(self._export_worker.run)
         self._export_worker.finished.connect(self._on_export_done)

@@ -3,7 +3,7 @@
 Tests: real lifecycle button gating, save dialog cancellation, exact
 snapshot handoff, duplicate-export blocking, success/error messages,
 concurrent overlap (export-while-refresh and refresh-while-export),
-and safe shutdown while export is active.
+safe shutdown while export is active, and direct _run_export guard.
 
 Every button-state test exercises real production entry points and
 QThread signal lifecycle.  No manual callback invocation, no manual
@@ -111,13 +111,31 @@ def temp_db_path():
 
 @pytest.fixture
 def inventory_page(qapp, temp_db_path):
-    """Create an InventoryPage with the temp DB."""
+    """Create an InventoryPage with the temp DB.
+
+    Teardown uses bounded shutdown — never close()/deleteLater() while
+    a QThread is still running.
+    """
     page = InventoryPage(
         db_service=None,
         config={"db_path": temp_db_path},
     )
     yield page
-    page.shutdown()
+    deadline = time.monotonic() + 5.0
+    while not page.shutdown() and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.05)
+    if page._close_pending:
+        pytest.fail(
+            "Teardown: could not shutdown all workers within 5s "
+            "(close_pending still True)")
+    for attr in ('_thread', '_export_thread', '_adj_thread',
+                 '_write_thread'):
+        t = getattr(page, attr, None)
+        if t is not None:
+            pytest.fail(
+                f"Teardown: {attr} still {t!r} after shutdown — "
+                f"isRunning={t.isRunning() if hasattr(t, 'isRunning') else '?'}")
     page.close()
     page.deleteLater()
 
@@ -183,6 +201,39 @@ def _make_snapshot(barcode="EXP001", name="Exportable", stock=50):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Test: direct _run_export guard against None snapshot
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestRunExportNullSnapshotGuard:
+
+    def test_run_export_with_none_snapshot_does_nothing(
+            self, inventory_page, monkeypatch):
+        """Direct _run_export() with None snapshot must not create a
+        worker, not set _export_loading, and not invoke export."""
+        import qt_app.pages.inventory_page as ip_mod
+
+        called = []
+
+        def _capture_export(snapshot, path):
+            called.append(1)
+            return ExportResult.success(path)
+
+        monkeypatch.setattr(
+            ip_mod, "export_inventory_snapshot", _capture_export)
+
+        inventory_page._current_snapshot = None
+        inventory_page._export_loading = False
+
+        inventory_page._run_export("/tmp/no_snap.xlsx")
+
+        assert not inventory_page._export_loading
+        assert inventory_page._export_worker is None
+        assert inventory_page._export_thread is None
+        assert len(called) == 0
+        assert not inventory_page._export_btn.isEnabled()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Test: real lifecycle button gating
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -222,7 +273,8 @@ class TestLifecycleButtonGating:
 
         try:
             inventory_page._do_refresh()
-            _read_started.wait(timeout=2.0)
+            assert _read_started.wait(timeout=2.0), (
+                "Read worker never started")
 
             # Read worker is blocked; observe intermediate cleared state
             assert inventory_page._current_snapshot is None
@@ -315,6 +367,9 @@ class TestSnapshotHandoff:
             _read_block.wait(timeout=5.0)
             return original_load(*args, **kwargs)
 
+        monkeypatch.setattr(
+            ip_mod, "load_inventory_page", _blocking_load)
+
         # Block export worker to capture snapshot ref
         _export_block = threading.Event()
         _export_started = threading.Event()
@@ -329,19 +384,19 @@ class TestSnapshotHandoff:
         monkeypatch.setattr(
             ip_mod, "export_inventory_snapshot", _blocking_export)
         monkeypatch.setattr(
-            ip_mod, "load_inventory_page", _blocking_load)
-        monkeypatch.setattr(
             ip_mod, "QFileDialog", _FakeFileDialog)
         _install_qmb(monkeypatch)
 
         try:
             # Start export (captures snapshot, blocks in worker)
             inventory_page._on_export()
-            _export_started.wait(timeout=2.0)
+            assert _export_started.wait(timeout=2.0), (
+                "Export worker never started")
 
             # Now start a refresh — clears _current_snapshot
             inventory_page._do_refresh()
-            _read_started.wait(timeout=2.0)
+            assert _read_started.wait(timeout=2.0), (
+                "Read worker never started")
             assert inventory_page._current_snapshot is None
 
             # Release export and let it complete
@@ -415,7 +470,8 @@ class TestDuplicateExportBlocking:
             inventory_page._on_export()
 
             # Wait until export worker is inside the blocking function
-            _started.wait(timeout=2.0)
+            assert _started.wait(timeout=2.0), (
+                "Export worker never started")
             assert inventory_page._export_loading
             assert inventory_page._export_thread is not None
             assert inventory_page._export_thread.isRunning()
@@ -492,23 +548,9 @@ class TestOverlapExportWhileRefresh:
         """
         import qt_app.pages.inventory_page as ip_mod
 
-        _read_block = threading.Event()
-        _read_started = threading.Event()
+        # Monkeypatch export + dialog before initial load settles
         _export_block = threading.Event()
         _export_started = threading.Event()
-
-        original_load = ip_mod.load_inventory_page
-        _call_count = 0
-
-        def _blocking_load(*args, **kwargs):
-            nonlocal _call_count
-            _call_count += 1
-            # First call is the construction-time initial load
-            if _call_count <= 1:
-                return original_load(*args, **kwargs)
-            _read_started.set()
-            _read_block.wait(timeout=5.0)
-            return original_load(*args, **kwargs)
 
         def _blocking_export(snapshot, path):
             _export_started.set()
@@ -518,24 +560,39 @@ class TestOverlapExportWhileRefresh:
         monkeypatch.setattr(
             ip_mod, "export_inventory_snapshot", _blocking_export)
         monkeypatch.setattr(
-            ip_mod, "load_inventory_page", _blocking_load)
-        monkeypatch.setattr(
             ip_mod, "QFileDialog", _FakeFileDialog)
         _install_qmb(monkeypatch)
 
+        # Wait for construction-time load to finish BEFORE
+        # monkeypatching load_inventory_page
         _wait_initial_load(inventory_page)
-        pre_refresh_snap = inventory_page._current_snapshot
+
+        # Now install the blocking read (deterministic — only the
+        # explicit test refresh will hit this)
+        _read_block = threading.Event()
+        _read_started = threading.Event()
+        original_load = ip_mod.load_inventory_page
+
+        def _blocking_load(*args, **kwargs):
+            _read_started.set()
+            _read_block.wait(timeout=5.0)
+            return original_load(*args, **kwargs)
+
+        monkeypatch.setattr(
+            ip_mod, "load_inventory_page", _blocking_load)
 
         try:
             # ── Step 1: start export (captures snapshot, blocks) ──
             inventory_page._on_export()
-            _export_started.wait(timeout=2.0)
+            assert _export_started.wait(timeout=2.0), (
+                "Export worker never started")
             assert inventory_page._export_loading
             assert not inventory_page._export_btn.isEnabled()
 
             # ── Step 2: start refresh (clears snapshot, blocks) ──
             inventory_page._do_refresh()
-            _read_started.wait(timeout=2.0)
+            assert _read_started.wait(timeout=2.0), (
+                "Read worker never started")
             assert inventory_page._loading
             assert inventory_page._current_snapshot is None
             # Must stay disabled after _current_snapshot is cleared
@@ -563,6 +620,11 @@ class TestOverlapExportWhileRefresh:
         finally:
             _export_block.set()
             _read_block.set()
+            # Wait for all threads to settle before teardown
+            _pump_until(
+                lambda: (inventory_page._export_thread is None
+                         and inventory_page._thread is None),
+                timeout_s=4.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -580,23 +642,9 @@ class TestOverlapRefreshWhileExport:
         """
         import qt_app.pages.inventory_page as ip_mod
 
-        _read_block = threading.Event()
-        _read_started = threading.Event()
+        # Monkeypatch export + dialog before initial load settles
         _export_block = threading.Event()
         _export_started = threading.Event()
-
-        original_load = ip_mod.load_inventory_page
-        _call_count = 0
-
-        def _blocking_load(*args, **kwargs):
-            nonlocal _call_count
-            _call_count += 1
-            # First call is the construction-time initial load
-            if _call_count <= 1:
-                return original_load(*args, **kwargs)
-            _read_started.set()
-            _read_block.wait(timeout=5.0)
-            return original_load(*args, **kwargs)
 
         def _blocking_export(snapshot, path):
             _export_started.set()
@@ -606,18 +654,31 @@ class TestOverlapRefreshWhileExport:
         monkeypatch.setattr(
             ip_mod, "export_inventory_snapshot", _blocking_export)
         monkeypatch.setattr(
-            ip_mod, "load_inventory_page", _blocking_load)
-        monkeypatch.setattr(
             ip_mod, "QFileDialog", _FakeFileDialog)
         _install_qmb(monkeypatch)
 
-        # Wait for construction-time load before monkeypatch applies
+        # Wait for construction-time load to finish BEFORE
+        # monkeypatching load_inventory_page
         _wait_initial_load(inventory_page)
+
+        # Now install the blocking read (deterministic)
+        _read_block = threading.Event()
+        _read_started = threading.Event()
+        original_load = ip_mod.load_inventory_page
+
+        def _blocking_load(*args, **kwargs):
+            _read_started.set()
+            _read_block.wait(timeout=5.0)
+            return original_load(*args, **kwargs)
+
+        monkeypatch.setattr(
+            ip_mod, "load_inventory_page", _blocking_load)
 
         try:
             # ── Step 1: start export (captures snapshot, blocks) ──
             inventory_page._on_export()
-            _export_started.wait(timeout=2.0)
+            assert _export_started.wait(timeout=2.0), (
+                "Export worker never started")
             assert inventory_page._export_loading
             assert not inventory_page._export_btn.isEnabled()
 
@@ -626,7 +687,8 @@ class TestOverlapRefreshWhileExport:
 
             # ── Step 2: start refresh (clears snapshot, blocks) ──
             inventory_page._do_refresh()
-            _read_started.wait(timeout=2.0)
+            assert _read_started.wait(timeout=2.0), (
+                "Read worker never started")
             assert inventory_page._loading
             assert inventory_page._current_snapshot is None
             assert not inventory_page._export_btn.isEnabled()
@@ -652,6 +714,11 @@ class TestOverlapRefreshWhileExport:
         finally:
             _export_block.set()
             _read_block.set()
+            # Wait for all threads to settle before teardown
+            _pump_until(
+                lambda: (inventory_page._export_thread is None
+                         and inventory_page._thread is None),
+                timeout_s=4.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -693,8 +760,7 @@ class TestShutdownLifecycle:
             assert inventory_page._export_thread.isRunning()
 
             # Wait until export worker is inside the blocking function
-            _started.wait(timeout=2.0)
-            assert _started.is_set(), (
+            assert _started.wait(timeout=2.0), (
                 "Export worker never started running")
 
             # First shutdown — worker still blocked, must return False
@@ -753,8 +819,8 @@ class TestShutdownLifecycle:
             assert inventory_page._export_thread.isRunning()
 
             # Wait for worker to enter the blocking function
-            _started.wait(timeout=2.0)
-            assert _started.is_set()
+            assert _started.wait(timeout=2.0), (
+                "Export worker never started")
 
             # shutdown disconnects the callback and attempts to quit
             result = inventory_page.shutdown()
