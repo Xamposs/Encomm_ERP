@@ -32,9 +32,9 @@ NAV_ITEMS = [
     ("customers",        "👥  Πελάτες"),
     ("invoice_history",  "🔎  Ιστορικό"),
     ("stock_movements",  "📋  Κινήσεις"),
+    ("stock_lot_integrity", "⏳  Παρτίδες / Λήξεις"),
     ("settings",         "⚙️  Ρυθμίσεις"),
     ("ai_assistant",     "🤖  AI Βοηθός"),
-    ("stock_lot_integrity", "⏳  Παρτίδες / Λήξεις"),
 ]
 
 PAGE_TITLES = {
@@ -51,6 +51,9 @@ PAGE_TITLES = {
     "ai_assistant":     "AI Βοηθός",
     "stock_lot_integrity": "Ακεραιότητα Παρτίδων",
 }
+
+# ── Pinned utility navigation keys (bottom of sidebar, outside scroll area) ──
+UTILITY_NAV_KEYS = ("settings", "ai_assistant")
 
 # ── Sidebar button QSS (active state via :checked pseudo-class) ───────
 NAV_QSS = (
@@ -142,40 +145,72 @@ class MainWindow(QMainWindow):
         brand.setStyleSheet("color: #d0d4dc; padding-bottom: 12px;")
         side_lay.addWidget(brand)
 
-        # Nav buttons (exclusive QButtonGroup)
+        # Nav buttons (exclusive QButtonGroup for all 12 routes)
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
         self._nav_keys: list[str] = []
 
-        # Scrollable nav area — prevents clipping when items grow
+        # Derive primary and utility items from canonical NAV_ITEMS
+        primary_items = [(k, l) for k, l in NAV_ITEMS if k not in UTILITY_NAV_KEYS]
+        utility_items = [(k, l) for k, l in NAV_ITEMS if k in UTILITY_NAV_KEYS]
+
+        # Primary scrollable navigation area — operational pages
         nav_scroll = QScrollArea()
+        nav_scroll.setObjectName("primaryNavScroll")
         nav_scroll.setWidgetResizable(True)
         nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         nav_scroll.setStyleSheet(
             "QScrollArea { border: none; background: transparent; }")
-        nav_container = QWidget()
-        nav_container.setStyleSheet("background: transparent;")
-        nav_lay = QVBoxLayout(nav_container)
-        nav_lay.setContentsMargins(0, 0, 0, 0)
-        nav_lay.setSpacing(6)
+        primary_container = QWidget()
+        primary_container.setStyleSheet("background: transparent;")
+        primary_lay = QVBoxLayout(primary_container)
+        primary_lay.setContentsMargins(0, 0, 0, 0)
+        primary_lay.setSpacing(6)
 
-        for idx, (key, label) in enumerate(NAV_ITEMS):
+        for idx, (key, label) in enumerate(primary_items):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(NAV_QSS)
             self._nav_group.addButton(btn, idx)
-            nav_lay.addWidget(btn)
+            primary_lay.addWidget(btn)
             self._nav_keys.append(key)
 
-        nav_lay.addStretch()
-        nav_scroll.setWidget(nav_container)
+        primary_lay.addStretch()
+        nav_scroll.setWidget(primary_container)
         side_lay.addWidget(nav_scroll, 1)
+
+        # Subtle separator above pinned utility section
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(
+            "QFrame { color: #2a2e36; max-height: 1px; margin: 4px 0; }")
+        side_lay.addWidget(sep)
+
+        # Pinned utility navigation — always visible, never scrolls
+        util_container = QWidget()
+        util_container.setObjectName("utilityNavContainer")
+        util_container.setStyleSheet("background: transparent;")
+        util_lay = QVBoxLayout(util_container)
+        util_lay.setContentsMargins(0, 0, 0, 0)
+        util_lay.setSpacing(6)
+
+        for idx, (key, label) in enumerate(
+                utility_items, start=len(primary_items)):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(NAV_QSS)
+            self._nav_group.addButton(btn, idx)
+            util_lay.addWidget(btn)
+            self._nav_keys.append(key)
+
+        side_lay.addWidget(util_container)
 
         self._nav_group.idClicked.connect(self._on_nav_clicked)
 
-        # Version
+        # Version label (above utility, beneath primary nav)
         ver = QLabel("v1.0.0 | ENCOMM Qt")
         ver.setStyleSheet(f"color: {styles.TEXT_DIM}; font-size: 10px;")
         side_lay.addWidget(ver)

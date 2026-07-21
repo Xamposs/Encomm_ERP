@@ -191,7 +191,8 @@ def _teardown_main_window(mw, page_keys: list[str]):
                 f"MainWindow teardown: {key} not idle before close: "
                 f"_loading={page._loading}"
             )
-    mw.close()
+    if not mw.close():
+        raise RuntimeError("MainWindow close rejected")
     _spin(5)
     if mw.isVisible():
         raise RuntimeError("MainWindow close did not succeed")
@@ -729,9 +730,13 @@ class TestPagePagination:
 
 class TestWorkerLifecycle:
 
-    def test_teardown_main_window_timeout_raises(self, qapp):
-        """_teardown_main_window raises RuntimeError when page cannot close.
-        No close()/deleteLater() is called."""
+    def test_teardown_main_window_timeout_raises(self, qapp, monkeypatch):
+        """_teardown_main_window raises RuntimeError when shutdown returns False
+        and page never reaches IDLE. No close()/deleteLater() is called.
+
+        Uses monkeypatched _wait_for to avoid real 5-second waits.
+        """
+        shutdown_calls = []
         close_called = []
         delete_called = []
 
@@ -739,16 +744,57 @@ class TestWorkerLifecycle:
             _loading = True
             _thread = "not-None-stub"
             _worker = "not-None-stub"
+            def shutdown(self):
+                shutdown_calls.append(True)
+                return False
             def close(self):
+                close_called.append(True)
                 return False
             def deleteLater(self):
-                pass
+                delete_called.append(True)
 
         class _FakeMW:
             def __init__(self):
                 self._pages = {"fake": _FakePage()}
             def close(self):
                 close_called.append(True)
+                return False
+            def deleteLater(self):
+                delete_called.append(True)
+            def isVisible(self):
+                return False
+
+        import sys
+        mod = sys.modules[__name__]
+        monkeypatch.setattr(mod, "_wait_for", lambda *a, **k: False)
+
+        mw = _FakeMW()
+        with pytest.raises(RuntimeError) as exc:
+            _teardown_main_window(mw, ["fake"])
+        assert len(shutdown_calls) == 1
+        assert len(close_called) == 0
+        assert len(delete_called) == 0
+        msg = str(exc.value)
+        assert "fake" in msg
+        assert "_loading=True" in msg
+
+    def test_teardown_main_window_close_rejected_raises(self, qapp):
+        """_teardown_main_window raises when mw.close() returns False
+        even though every page is IDLE. deleteLater() is not called."""
+        close_called = []
+        delete_called = []
+
+        class _FakeIdlePage:
+            _loading = False
+            _thread = None
+            _worker = None
+
+        class _FakeMW:
+            def __init__(self):
+                self._pages = {"fake": _FakeIdlePage()}
+            def close(self):
+                close_called.append(True)
+                return False
             def deleteLater(self):
                 delete_called.append(True)
             def isVisible(self):
@@ -757,8 +803,8 @@ class TestWorkerLifecycle:
         mw = _FakeMW()
         with pytest.raises(RuntimeError) as exc:
             _teardown_main_window(mw, ["fake"])
-        assert "not idle" in str(exc.value)
-        assert len(close_called) == 0
+        assert "close rejected" in str(exc.value)
+        assert len(close_called) == 1
         assert len(delete_called) == 0
 
     def test_loading_controls_disable_and_restore(self, qapp, tmp_path):
@@ -1074,7 +1120,13 @@ class TestWorkerLifecycle:
             assert _is_idle(page)
         finally:
             monkeypatch.undo()
-            QTimer.singleShot = original_singleShot
+            # Ensure page is idle before strict teardown
+            if not _is_idle(page):
+                if captured_callback:
+                    captured_callback[-1]()
+                _spin(10)
+                if not _is_idle(page):
+                    _wait_for(lambda: _is_idle(page), timeout_ms=3000)
             _teardown_page(page)
 
     def test_shutdown_during_deferred_window(self, qapp, tmp_path):
