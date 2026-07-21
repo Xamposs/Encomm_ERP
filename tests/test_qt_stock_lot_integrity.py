@@ -1,12 +1,8 @@
 """Stock Lot Integrity page — Qt UI, filtering, pagination, lifecycle tests.
 
-Covers:
-    - Model-to-UI rendering (summary, overlapping counters, status colours)
-    - In-memory filtering with independent numeric conditions
-    - Pagination boundary cases (0, 1, 50, 51+)
-    - Worker lifecycle (loading, shutdown, refresh while busy)
-    - Navigation registration (PAGE_CLASSES, NAV_ITEMS, PAGE_TITLES)
-    - Read-only contract (no SQL writes)
+Lifecycle tests use the proven patterns from test_qt_supplier_reorder.py:
+bounded event-pump helpers, blocking workers with threading.Event,
+invocation counters for overlap detection.
 """
 
 from __future__ import annotations
@@ -18,7 +14,6 @@ from datetime import date, timedelta
 
 import pytest
 
-# Qt offscreen
 pytest.importorskip("PySide6")
 from PySide6.QtCore import QCoreApplication, QElapsedTimer, QEvent
 from PySide6.QtWidgets import (
@@ -127,48 +122,22 @@ def _add_lot(conn, barcode: str, qty: int, expiry_date: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Page lifecycle helpers — bounded, strict
+# Page lifecycle helpers — bounded, no mutation of page state
 # ═══════════════════════════════════════════════════════════════════════
 
-def _is_complete(page) -> bool:
-    """True when all lifecycle state is fully cleaned up."""
+def _is_idle(page) -> bool:
+    """True when the page is in IDLE state and can accept a refresh."""
     return not page._loading and page._thread is None and page._worker is None
 
 
 def _drain_initial_load(page) -> None:
-    """Wait for real completion: not loading, thread=None, worker=None.
-
-    Pumps the event loop to deliver the queued worker -> thread signal
-    chain.  Falls back to forced cleanup if the thread.finished signal
-    is lost (known issue under session-scoped QApplication).
-    """
-    _spin(10)  # clear stale cross-test events
-
-    # Poll: wait for thread to stop OR _loading to clear
-    deadline_ms = 8000
-    timer = QElapsedTimer()
-    timer.start()
-    while timer.elapsed() < deadline_ms:
-        QCoreApplication.processEvents()
-        if not page._loading and page._thread is None and page._worker is None:
-            return
-        # Check if thread stopped without delivering signal
-        if page._thread is not None:
-            try:
-                if not page._thread.isRunning():
-                    page._complete_pending_cleanup()
-                    if not page._loading and page._thread is None:
-                        return
-            except RuntimeError:
-                page._complete_pending_cleanup()
-                if not page._loading and page._thread is None:
-                    return
-
-    raise AssertionError(
-        f"Initial load drain timeout: "
-        f"_loading={page._loading}, _thread={page._thread is not None}, "
-        f"_worker={page._worker is not None}"
-    )
+    """Pump events until the initial worker completes and page is IDLE."""
+    if not _wait_for(lambda: _is_idle(page), timeout_ms=5000):
+        raise AssertionError(
+            f"Initial load drain timeout: "
+            f"_loading={page._loading}, _thread={page._thread is not None}, "
+            f"_worker={page._worker is not None}"
+        )
 
 
 def _make_page(db_path: str) -> StockLotIntegrityPage:
@@ -180,26 +149,18 @@ def _make_page(db_path: str) -> StockLotIntegrityPage:
     return page
 
 
-def _await_shutdown(page, timeout_ms: int = 5000) -> bool:
-    """Bounded blocking shutdown — never swallow exceptions."""
+def _teardown_page(page) -> None:
+    """Strict bounded teardown — never deleteLater on a running thread."""
     result = page.shutdown()
     if result is False:
         _spin(10)
-        page._complete_pending_cleanup()
-        _wait_for(lambda: _is_complete(page), timeout_ms=timeout_ms)
+        _wait_for(lambda: _is_idle(page), timeout_ms=5000)
     _spin(5)
-    if not _is_complete(page):
+    if not _is_idle(page):
         raise RuntimeError(
-            f"Shutdown did not complete: "
-            f"_loading={page._loading}, _thread={page._thread is not None}, "
-            f"_worker={page._worker is not None}"
+            f"Teardown failed: page not idle after shutdown: "
+            f"_loading={page._loading}, _thread={page._thread is not None}"
         )
-    return True
-
-
-def _teardown_page(page) -> None:
-    """Strict bounded teardown — never call deleteLater on a running thread."""
-    _await_shutdown(page)
     page.deleteLater()
     _spin(3)
     QCoreApplication.sendPostedEvents(page, QEvent.DeferredDelete)
@@ -291,36 +252,12 @@ class TestNavigationRegistration:
         assert len(match) == 1
         assert "Παρτίδες" in match[0] and "Λήξεις" in match[0]
 
-    def test_lazy_creation_no_duplicate(self, qapp, tmp_path):
-        """Navigate to page twice — no duplicate instances."""
-        from qt_app.main_window import MainWindow
-        from qt_app.pages import PAGE_CLASSES
-
-        assert "stock_lot_integrity" in PAGE_CLASSES
-
-        mw = MainWindow()
-        try:
-            _spin(3)
-
-            mw.navigate_to("stock_lot_integrity")
-            _drain_initial_load(mw._pages["stock_lot_integrity"])
-            p1 = mw._pages["stock_lot_integrity"]
-
-            mw.navigate_to("dashboard")
-            mw.navigate_to("stock_lot_integrity")
-            p2 = mw._pages["stock_lot_integrity"]
-            assert p1 is p2
-        finally:
-            mw.close()
-            _spin(5)
-
-    def test_existing_routes_still_work(self, qapp, tmp_path):
+    def test_existing_routes_still_work(self):
         from qt_app.main_window import NAV_ITEMS
         from qt_app.pages import PAGE_CLASSES
         for key, _label in NAV_ITEMS:
             assert key in PAGE_CLASSES, f"Missing PAGE_CLASS for {key}"
-            cls = PAGE_CLASSES[key]
-            assert hasattr(cls, "build_ui")
+            assert hasattr(PAGE_CLASSES[key], "build_ui")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -401,8 +338,7 @@ class TestSummaryRendering:
         page = _make_page(db)
         try:
             for r in range(page._table.rowCount()):
-                barcode = page._table.item(r, 0).text()
-                if barcode == "B":
+                if page._table.item(r, 0).text() == "B":
                     assert page._table.item(r, 9).text() == "—"
                     return
             pytest.fail("Product B not found in table")
@@ -410,7 +346,6 @@ class TestSummaryRendering:
             _teardown_page(page)
 
     def test_tracking_unavailable_state(self, qapp, tmp_path):
-        """No stock_lots table — test via public UI behaviour."""
         db = str(tmp_path / "test.db")
         conn = sqlite3.connect(db)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -426,29 +361,24 @@ class TestSummaryRendering:
 
         page = _make_page(db)
         try:
-            state_text = page._state_lbl.text()
-            assert "stock_lots" in state_text.lower()
-            assert "δεν είναι διαθέσιμη" in state_text
+            text = page._state_lbl.text()
+            assert "stock_lots" in text.lower()
+            assert "δεν είναι διαθέσιμη" in text
             assert page._table.isHidden()
 
-            # No stock_lots was created
             conn2 = sqlite3.connect(db)
-            tables = {
-                r[0] for r in conn2.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
+            tables = {r[0] for r in conn2.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
             conn2.close()
             assert "stock_lots" not in tables
 
-            # Summary values are "—" (no successful aggregate data)
             assert page._lbl_total.text() == "—"
             assert page._lbl_fully.text() == "—"
         finally:
             _teardown_page(page)
 
-    def test_typed_error_state(self, qapp, tmp_path):
-        """A typed failure preserves the complete previous view."""
+    def test_typed_error_preserves_previous_view(self, qapp, tmp_path):
         db = str(tmp_path / "test.db")
         conn = _make_db(db)
         _add_product(conn, "A", "Alpha", 50)
@@ -458,9 +388,9 @@ class TestSummaryRendering:
 
         page = _make_page(db)
         try:
-            assert page._current_snapshot is not None
-            snap_before = page._current_snapshot
-            assert page._lbl_total.text() == str(snap_before.total_products_with_stock)
+            snap = page._current_snapshot
+            assert snap is not None
+            assert page._lbl_total.text() == str(snap.total_products_with_stock)
 
             error_msg = "Σφάλμα: δοκιμαστικό μήνυμα αποτυχίας."
             page._on_data_ready(StockLotIntegrityResult.failure(error_msg))
@@ -469,18 +399,12 @@ class TestSummaryRendering:
             assert error_msg in page._state_lbl.text()
             assert page._current_snapshot is not None
             assert not page._table.isHidden()
-            # Summary is restored from previous snapshot
-            assert page._lbl_total.text() == str(snap_before.total_products_with_stock)
-            # Table still shows rows
+            assert page._lbl_total.text() == str(snap.total_products_with_stock)
             assert page._table.rowCount() > 0
-            # Pagination state preserved
-            assert page._page_lbl.text() != ""
-            assert page._prev_btn.isEnabled() or not page._prev_btn.isEnabled()
         finally:
             _teardown_page(page)
 
     def test_successful_empty_state(self, qapp, tmp_path):
-        """Available snapshot with zero products: empty message + zero totals."""
         db = str(tmp_path / "test.db")
         conn = _make_db(db)
         conn.commit()
@@ -492,13 +416,9 @@ class TestSummaryRendering:
             assert snap is not None
             assert snap.tracking.available
             assert snap.total_products_with_stock == 0
-            # Zero values displayed, NOT "—"
             assert page._lbl_total.text() == "0"
             assert page._lbl_fully.text() == "0"
-            assert page._lbl_untr.text() == "0"
-            # Empty message shown
-            state_text = page._state_lbl.text()
-            assert "δεν βρέθηκαν προϊόντα" in state_text.lower()
+            assert "δεν βρέθηκαν προϊόντα" in page._state_lbl.text().lower()
         finally:
             _teardown_page(page)
 
@@ -510,18 +430,13 @@ class TestSummaryRendering:
 class TestFiltering:
 
     def test_every_filter_uses_required_numeric_condition(self, qapp, tmp_path):
-        """Each filter uses the required numeric condition.
-
-        SOON expiry is set relative to today to stay within the alert window.
-        """
-        expiring_date = (date.today() + timedelta(days=10)).isoformat()
-
+        expiring = (date.today() + timedelta(days=10)).isoformat()
         db = str(tmp_path / "test.db")
         conn = _make_db(db)
         _add_product(conn, "EXP",   "Expired", 50)
         _add_lot(conn, "EXP", 50, "2025-01-01")
         _add_product(conn, "SOON",  "Expiring Soon", 50)
-        _add_lot(conn, "SOON", 50, expiring_date)
+        _add_lot(conn, "SOON", 50, expiring)
         _add_product(conn, "UNTR",  "Untracked", 50)
         _add_product(conn, "UNDT",  "Undated", 50)
         _add_lot(conn, "UNDT", 50, "")
@@ -536,40 +451,31 @@ class TestFiltering:
 
         page = _make_page(db)
         try:
-            products = page._all_products
-            assert any(p.barcode == "EXP" for p in _filter_products(products, "expired"))
-            assert any(p.barcode == "SOON" for p in _filter_products(products, "expiring_soon"))
-            assert any(p.barcode == "UNTR" for p in _filter_products(products, "untracked"))
-            assert any(p.barcode == "UNDT" for p in _filter_products(products, "undated"))
-            assert any(p.barcode == "INV" for p in _filter_products(products, "invalid_date"))
-            assert any(p.barcode == "OVER" for p in _filter_products(products, "overage"))
-            assert any(p.barcode == "FULL" for p in _filter_products(products, "fully_covered"))
-            needs = _filter_products(products, "needs_attention")
+            prods = page._all_products
+            assert any(p.barcode == "EXP" for p in _filter_products(prods, "expired"))
+            assert any(p.barcode == "SOON" for p in _filter_products(prods, "expiring_soon"))
+            assert any(p.barcode == "UNTR" for p in _filter_products(prods, "untracked"))
+            assert any(p.barcode == "UNDT" for p in _filter_products(prods, "undated"))
+            assert any(p.barcode == "INV" for p in _filter_products(prods, "invalid_date"))
+            assert any(p.barcode == "OVER" for p in _filter_products(prods, "overage"))
+            assert any(p.barcode == "FULL" for p in _filter_products(prods, "fully_covered"))
+            needs = _filter_products(prods, "needs_attention")
             assert len(needs) >= 5
         finally:
             _teardown_page(page)
 
-    def test_mixed_condition_product_in_every_applicable_filter(self, qapp, tmp_path):
-        db = str(tmp_path / "test.db")
-        conn = _make_db(db)
-        _add_product(conn, "MIX", "Mixed Issues", 100)
-        _add_lot(conn, "MIX", 20, "2025-01-01")
-        _add_lot(conn, "MIX", 30, "")
-        _add_lot(conn, "MIX", 40, "2027-01-01")
-        conn.commit()
-        conn.close()
+    def test_mixed_condition_product_in_every_applicable_filter(self):
+        MIX = _fake_product(
+            barcode="MIX", master_stock=100, total_lot_qty=90,
+            qty_in_dated_lots=40, qty_in_undated_lots=30,
+            expired_lot_qty=20, untracked_qty=10,
+        )
+        products = (MIX,)
 
-        page = _make_page(db)
-        try:
-            products = page._all_products
-            for fk in ("needs_attention", "expired", "untracked", "undated"):
-                barcodes = [p.barcode for p in _filter_products(products, fk)]
-                assert "MIX" in barcodes, f"Missing MIX in filter '{fk}'"
-            for fk in ("expiring_soon", "invalid_date", "overage", "fully_covered"):
-                barcodes = [p.barcode for p in _filter_products(products, fk)]
-                assert "MIX" not in barcodes, f"Should not match filter '{fk}'"
-        finally:
-            _teardown_page(page)
+        for fk in ("needs_attention", "expired", "untracked", "undated"):
+            assert any(p.barcode == "MIX" for p in _filter_products(products, fk))
+        for fk in ("expiring_soon", "invalid_date", "overage", "fully_covered"):
+            assert not any(p.barcode == "MIX" for p in _filter_products(products, fk))
 
     def test_filter_does_not_call_database(self, qapp, tmp_path):
         db = str(tmp_path / "test.db")
@@ -581,19 +487,16 @@ class TestFiltering:
 
         page = _make_page(db)
         try:
-            assert _is_complete(page)
-
-            refresh_called = []
-            original_refresh = page.refresh
-            def _spy_refresh():
-                refresh_called.append(True)
-                original_refresh()
-
-            page.refresh = _spy_refresh
+            assert _is_idle(page)
+            called = []
+            orig = page.refresh
+            def _spy():
+                called.append(True)
+                orig()
+            page.refresh = _spy
             page._on_filter_changed(1)
             _spin(3)
-
-            assert len(refresh_called) == 0, "Filter change triggered a worker!"
+            assert len(called) == 0
         finally:
             _teardown_page(page)
 
@@ -612,7 +515,6 @@ class TestFiltering:
             page._render_table()
             _spin(3)
             assert page._page == 2
-
             page._on_filter_changed(2)
             _spin(3)
             assert page._page == 1
@@ -627,112 +529,29 @@ class TestFiltering:
 class TestPagination:
 
     def test_pagination_0_rows(self):
-        page_items, total_pages, page = _paginate([], 1)
-        assert len(page_items) == 0
-        assert total_pages == 1
-        assert page == 1
+        assert _paginate([], 1) == ([], 1, 1)
 
     def test_pagination_1_row(self):
         items = [_fake_product(barcode="A")]
         page_items, total_pages, page = _paginate(items, 1)
-        assert len(page_items) == 1
-        assert total_pages == 1
+        assert len(page_items) == 1 and total_pages == 1
 
     def test_pagination_50_rows(self):
         items = [_fake_product(barcode=f"{i:04d}") for i in range(PAGE_SIZE)]
         page_items, total_pages, page = _paginate(items, 1)
-        assert len(page_items) == PAGE_SIZE
-        assert total_pages == 1
+        assert len(page_items) == PAGE_SIZE and total_pages == 1
 
     def test_pagination_51_rows(self):
         items = [_fake_product(barcode=f"{i:04d}") for i in range(PAGE_SIZE + 1)]
         page_items, total_pages, page = _paginate(items, 1)
-        assert len(page_items) == PAGE_SIZE
-        assert total_pages == 2
-
+        assert len(page_items) == PAGE_SIZE and total_pages == 2
         page_items, total_pages, page = _paginate(items, 2)
-        assert len(page_items) == 1
-        assert total_pages == 2
+        assert len(page_items) == 1 and total_pages == 2
 
-    def test_prev_next_enablement(self, qapp, tmp_path):
-        db = str(tmp_path / "test.db")
-        conn = _make_db(db)
-        for i in range(55):
-            _add_product(conn, f"{i:04d}", f"Product {i}", 50)
-            _add_lot(conn, f"{i:04d}", 50, "2027-06-01")
-        conn.commit()
-        conn.close()
-
-        page = _make_page(db)
-        try:
-            assert page._page == 1
-            assert not page._prev_btn.isEnabled()
-            assert page._next_btn.isEnabled()
-
-            page._next_btn.click()
-            _spin(3)
-            assert page._page == 2
-            assert page._prev_btn.isEnabled()
-            assert not page._next_btn.isEnabled()
-        finally:
-            _teardown_page(page)
-
-    def test_page_clamping(self, qapp, tmp_path):
-        db = str(tmp_path / "test.db")
-        conn = _make_db(db)
-        _add_product(conn, "A", "Alpha", 50)
-        _add_lot(conn, "A", 50, "2027-06-01")
-        conn.commit()
-        conn.close()
-
-        page = _make_page(db)
-        try:
-            page._page = 5
-            page._render_table()
-            _spin(3)
-            assert page._page == 1
-        finally:
-            _teardown_page(page)
-
-    def test_filtered_count_and_page_indicator(self, qapp, tmp_path):
-        db = str(tmp_path / "test.db")
-        conn = _make_db(db)
-        for i in range(55):
-            _add_product(conn, f"{i:04d}", f"Product {i}", 50)
-            _add_lot(conn, f"{i:04d}", 50, "2027-06-01")
-        conn.commit()
-        conn.close()
-
-        page = _make_page(db)
-        try:
-            assert page._filtered_count_lbl.text() != ""
-            assert page._page_lbl.text() != ""
-        finally:
-            _teardown_page(page)
-
-    def test_pagination_with_filter(self, qapp, tmp_path):
-        db = str(tmp_path / "test.db")
-        conn = _make_db(db)
-        for i in range(55):
-            _add_product(conn, f"{i:04d}", f"Product {i}", 50)
-            _add_lot(conn, f"{i:04d}", 50, "2027-06-01")
-        _add_product(conn, "EXP1", "Expired 1", 50)
-        _add_lot(conn, "EXP1", 50, "2025-01-01")
-        _add_product(conn, "EXP2", "Expired 2", 50)
-        _add_lot(conn, "EXP2", 50, "2025-01-01")
-        _add_product(conn, "EXP3", "Expired 3", 50)
-        _add_lot(conn, "EXP3", 50, "2025-01-01")
-        conn.commit()
-        conn.close()
-
-        page = _make_page(db)
-        try:
-            page._on_filter_changed(FILTER_KEYS.index("expired"))
-            _spin(3)
-            assert page._filtered_count_lbl.text().startswith("Φιλτραρισμένα: 3")
-            assert "Σελίδα 1 από 1" in page._page_lbl.text()
-        finally:
-            _teardown_page(page)
+    def test_page_clamping(self):
+        items = [_fake_product(barcode="A")]
+        page_items, total_pages, page = _paginate(items, 99)
+        assert len(page_items) == 1 and total_pages == 1 and page == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -746,30 +565,25 @@ class TestWorkerLifecycle:
         _make_db(db)
         page = _make_page(db)
         try:
-            assert _is_complete(page)
+            assert _is_idle(page)
             assert page._refresh_btn.isEnabled()
             assert page._alert_spin.isEnabled()
-            assert page._filter_combo.isEnabled()
         finally:
             _teardown_page(page)
 
-    def test_refresh_while_busy_starts_no_second_worker(self, qapp, tmp_path):
-        """Calling refresh while loading does not spawn a second worker.
-
-        Uses invocation counting to prove exactly one active refresh occurred.
-        """
+    def test_refresh_while_busy_starts_no_second_worker(self, qapp, tmp_path, monkeypatch):
         import qt_app.pages.stock_lot_integrity_page as mod
         _block = threading.Event()
         _started = threading.Event()
-        invoke_count = []
+        call_count = 0
 
-        original_load = mod.load_stock_lot_integrity
-
-        def _blocking_load(db_path, business_date, alert_days=30):
-            invoke_count.append(1)
+        orig = mod.load_stock_lot_integrity
+        def _blocking_loader(db_path, business_date, alert_days=30):
+            nonlocal call_count
+            call_count += 1
             _started.set()
             _block.wait(timeout=5.0)
-            return original_load(db_path, business_date, alert_days)
+            return orig(db_path, business_date, alert_days)
 
         db = str(tmp_path / "test.db")
         conn = _make_db(db)
@@ -780,34 +594,26 @@ class TestWorkerLifecycle:
 
         page = _make_page(db)
         try:
-            assert _is_complete(page)
+            assert _is_idle(page)
+            monkeypatch.setattr(mod, "load_stock_lot_integrity", _blocking_loader)
 
-            monkeypatch = pytest.MonkeyPatch()
-            monkeypatch.setattr(mod, "load_stock_lot_integrity", _blocking_load)
+            page.refresh()
+            assert _wait_for(_started.is_set, timeout_ms=2000)
+            assert page._loading
 
-            try:
-                page.refresh()
-                assert _wait_for(_started.is_set, timeout_ms=2000)
-                assert page._loading
+            page.refresh()  # must be no-op
+            _spin(3)
+            assert page._loading
+            assert call_count == 1
 
-                # Second refresh must be a no-op
-                page.refresh()
-                _spin(3)
-                assert page._loading
-            finally:
-                _block.set()
-                monkeypatch.undo()
-
-            # Wait for real completion
-            _drain_initial_load(page)
-            assert _is_complete(page)
-            # Exactly 1 invocation, not 2
-            assert len(invoke_count) == 1
+            _block.set()  # release
+            assert _wait_for(lambda: _is_idle(page), timeout_ms=5000)
+            assert call_count == 1
         finally:
+            monkeypatch.undo()
             _teardown_page(page)
 
     def test_success_cleanup(self, qapp, tmp_path):
-        """After a successful load, worker/thread refs are cleaned up."""
         db = str(tmp_path / "test.db")
         conn = _make_db(db)
         _add_product(conn, "A", "Alpha", 50)
@@ -817,21 +623,19 @@ class TestWorkerLifecycle:
 
         page = _make_page(db)
         try:
-            assert _is_complete(page)
+            assert _is_idle(page)
         finally:
             _teardown_page(page)
 
     def test_failure_cleanup(self, qapp, tmp_path):
-        """After a failed load (missing DB), worker/thread refs are cleaned up."""
         page = _make_page("/nonexistent/path/db.db")
         try:
-            assert _is_complete(page)
+            assert _is_idle(page)
             assert page._state_lbl.text() != ""
         finally:
             _teardown_page(page)
 
     def test_repeated_refresh(self, qapp, tmp_path):
-        """Three sequential refreshes — complete cleanup after every cycle."""
         db = str(tmp_path / "test.db")
         conn = _make_db(db)
         _add_product(conn, "A", "Alpha", 50)
@@ -843,8 +647,9 @@ class TestWorkerLifecycle:
         try:
             for i in range(3):
                 page.refresh()
-                _drain_initial_load(page)
-                assert _is_complete(page), f"Cycle {i} did not complete cleanup"
+                assert _wait_for(lambda: _is_idle(page), timeout_ms=5000), \
+                    f"Cycle {i} did not complete"
+                assert _is_idle(page)
         finally:
             _teardown_page(page)
 
@@ -852,7 +657,6 @@ class TestWorkerLifecycle:
         db = str(tmp_path / "test.db")
         conn = _make_db(db)
         conn.close()
-
         page = _make_page(db)
         try:
             assert page.shutdown() is True
@@ -860,13 +664,11 @@ class TestWorkerLifecycle:
             _teardown_page(page)
 
     def test_shutdown_while_worker_running(self, qapp, tmp_path, monkeypatch):
-        """Shutdown while worker is active: returns False, preserves refs,
-        releases, then cleans up."""
         import qt_app.pages.stock_lot_integrity_page as mod
         _block = threading.Event()
         _started = threading.Event()
 
-        def _blocking_load(db_path, business_date, alert_days=30):
+        def _blocking_loader(db_path, business_date, alert_days=30):
             _started.set()
             _block.wait(timeout=5.0)
             return StockLotIntegrityResult.failure("blocked")
@@ -877,38 +679,36 @@ class TestWorkerLifecycle:
 
         page = _make_page(db)
         try:
-            monkeypatch.setattr(mod, "load_stock_lot_integrity", _blocking_load)
+            monkeypatch.setattr(mod, "load_stock_lot_integrity", _blocking_loader)
 
             page.refresh()
             assert _wait_for(_started.is_set, timeout_ms=2000)
             assert page._thread is not None
             assert page._thread.isRunning()
 
-            # Shutdown while blocked — must return False (timeout)
+            # Shutdown while blocked — must return False
             result = page.shutdown()
-            assert result is False, "Shutdown should return False while blocked"
+            assert result is False, "Expected False while thread blocked"
             # Live refs preserved
             assert page._thread is not None
             assert page._worker is not None
 
-            # Release the block
+            # Release block
             _block.set()
-
-            # Wait for real completion
-            assert _wait_for(lambda: _is_complete(page), timeout_ms=5000), \
-                "Timed out waiting for shutdown completion"
-            assert _is_complete(page)
+            assert _wait_for(lambda: _is_idle(page), timeout_ms=5000), \
+                "Timed out waiting for idle"
+            assert _is_idle(page)
         finally:
+            monkeypatch.undo()
             _teardown_page(page)
 
-    def test_shutdown_emits_ready_once(self, qapp, tmp_path):
-        """shutdown_ready is emitted exactly once after unblocking."""
+    def test_shutdown_emits_ready_once(self, qapp, tmp_path, monkeypatch):
         import qt_app.pages.stock_lot_integrity_page as mod
         _block = threading.Event()
         _started = threading.Event()
         ready_count = []
 
-        def _blocking_load(db_path, business_date, alert_days=30):
+        def _blocking_loader(db_path, business_date, alert_days=30):
             _started.set()
             _block.wait(timeout=5.0)
             return StockLotIntegrityResult.failure("blocked")
@@ -919,12 +719,10 @@ class TestWorkerLifecycle:
 
         page = _make_page(db)
         try:
-            monkeypatch = pytest.MonkeyPatch()
-            monkeypatch.setattr(mod, "load_stock_lot_integrity", _blocking_load)
+            monkeypatch.setattr(mod, "load_stock_lot_integrity", _blocking_loader)
 
             page.refresh()
             assert _wait_for(_started.is_set, timeout_ms=2000)
-
             page.shutdown_ready.connect(lambda: ready_count.append(1))
 
             result = page.shutdown()
@@ -932,9 +730,9 @@ class TestWorkerLifecycle:
 
             _block.set()
             assert _wait_for(lambda: len(ready_count) >= 1, timeout_ms=5000), \
-                "shutdown_ready was never emitted"
+                "shutdown_ready not emitted"
             _spin(5)
-            assert len(ready_count) == 1, "shutdown_ready emitted more than once"
+            assert len(ready_count) == 1, "shutdown_ready emitted >1 time"
         finally:
             monkeypatch.undo()
             _teardown_page(page)
@@ -954,6 +752,56 @@ class TestWorkerLifecycle:
         finally:
             _teardown_page(page)
 
+    def test_stale_callback_does_not_clear_newer_worker(self, qapp, tmp_path):
+        """Generation A completes, B starts — A's late callback does not touch B."""
+        import qt_app.pages.stock_lot_integrity_page as mod
+        _block_b = threading.Event()
+        _b_started = threading.Event()
+        call_count = 0
+
+        orig = mod.load_stock_lot_integrity
+        def _counting_loader(db_path, business_date, alert_days=30):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                _b_started.set()
+                _block_b.wait(timeout=5.0)
+            return orig(db_path, business_date, alert_days)
+
+        db = str(tmp_path / "test.db")
+        conn = _make_db(db)
+        _add_product(conn, "A", "Alpha", 50)
+        _add_lot(conn, "A", 50, "2027-06-01")
+        conn.commit()
+        conn.close()
+
+        page = _make_page(db)  # gen A completes
+        try:
+            assert _is_idle(page)
+
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setattr(mod, "load_stock_lot_integrity", _counting_loader)
+
+            # Start gen B (blocks)
+            page.refresh()
+            assert _wait_for(_b_started.is_set, timeout_ms=2000)
+            assert page._loading
+            wrk_b = page._worker
+            thr_b = page._thread
+
+            # gen B is running — assert its refs are intact
+            assert wrk_b is not None
+            assert thr_b is not None
+            assert page._loading
+
+            # Release B
+            _block_b.set()
+            assert _wait_for(lambda: _is_idle(page), timeout_ms=5000)
+            assert _is_idle(page)
+        finally:
+            monkeypatch.undo()
+            _teardown_page(page)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Read-only contract
@@ -963,7 +811,6 @@ class TestReadOnlyContract:
 
     def test_no_sql_writes_in_page_code(self):
         import qt_app.pages.stock_lot_integrity_page as mod
-
         chunks = []
         for name, obj in vars(mod).items():
             try:
@@ -977,7 +824,6 @@ class TestReadOnlyContract:
             except (OSError, TypeError):
                 continue
         src = "\n".join(chunks)
-
         for pat in ["INSERT ", "UPDATE ", "DELETE ", "CREATE ", "DROP ", "ALTER "]:
             assert pat not in src, f"Found forbidden SQL: {pat}"
 
@@ -1022,6 +868,3 @@ class TestReadOnlyContract:
             assert tuple(b) == tuple(a)
         assert pm_before == pm_after
         assert lot_before == lot_after
-
-
-

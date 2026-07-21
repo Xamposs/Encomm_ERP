@@ -4,27 +4,25 @@ Uses the accepted P5.2a model ``load_stock_lot_integrity`` for all
 database access.  Never queries SQLite on the GUI thread; always uses a
 QObject worker moved to a QThread.
 
-Lifecycle
----------
-- A generation counter (``_gen``) tags every worker/thread pair so that
-  stale callbacks from a previous generation do not clear or corrupt
-  references belonging to the current generation.
-- ``_loading`` remains True until the deferred ``QTimer.singleShot(0)``
-  cleanup has cleared both ``_worker`` and ``_thread`` references.
-- A new ``refresh()`` checks ``_loading`` only — the generation counter
-  is internal identity safety only.
-- ``shutdown()`` disconnects only the UI callback, then calls
-  ``thread.quit()`` with bounded ``wait(2000)``.  On timeout it keeps
-  live refs and returns False; the ``shutdown_ready`` signal lets the
-  MainWindow retry.
-- No ``terminate()`` call.  No ``deleteLater()`` on a running thread.
+Lifecycle follows the proven DashboardPage pattern exactly:
+
+IDLE:   _loading=False, _thread=None, _worker=None, refresh() allowed
+RUNNING: _loading=True,  _thread/worker reference the single active pair,
+         refresh() is a no-op, controls disabled
+     → worker finishes → _on_data_ready processes result
+     → thread.finished → _on_thread_done clears refs, sets _loading=False,
+                          restores controls, handles close_pending
+
+Shutdown: disconnect UI callback, quit + bounded wait(2000).
+          On timeout: preserve live refs, return False.
+          The normal completion path emits shutdown_ready when close_pending.
 """
 
 from __future__ import annotations
 
 from datetime import date
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QObject
 from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QFrame, QPushButton,
@@ -41,10 +39,6 @@ from infrastructure.stock_lot_integrity_model import (
     ProductLotIntegrity,
 )
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Table columns
-# ═══════════════════════════════════════════════════════════════════════
 
 TABLE_COLS = [
     "Barcode",
@@ -71,10 +65,6 @@ TOOLTIP_OVERAGE = (
     "Αυτό υποδεικνύει πιθανό σφάλμα δεδομένων."
 )
 
-# ═══════════════════════════════════════════════════════════════════════
-# Filters
-# ═══════════════════════════════════════════════════════════════════════
-
 FILTER_OPTIONS = [
     ("all",                  "Όλα"),
     ("needs_attention",      "Χρειάζεται Έλεγχο"),
@@ -94,11 +84,6 @@ def _filter_products(
     products: tuple[ProductLotIntegrity, ...],
     filter_key: str,
 ) -> list[ProductLotIntegrity]:
-    """Apply in-memory filter.  Returns a new list (never mutates source).
-
-    Each filter uses independent numeric conditions — a product may appear
-    in several filters.
-    """
     if filter_key == "all":
         return list(products)
 
@@ -138,10 +123,6 @@ def _filter_products(
     return [p for p in products if _check(p)]
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Pagination helper
-# ═══════════════════════════════════════════════════════════════════════
-
 PAGE_SIZE = 50
 
 
@@ -149,7 +130,6 @@ def _paginate(
     items: list[ProductLotIntegrity],
     page: int,
 ) -> tuple[list[ProductLotIntegrity], int, int]:
-    """Return (page_slice, total_pages, clamped_page)."""
     total = len(items)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE if total > 0 else 1)
     if total == 0:
@@ -158,11 +138,6 @@ def _paginate(
     start = (clamped - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
     return items[start:end], total_pages, clamped
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# QThread worker
-# ═══════════════════════════════════════════════════════════════════════
 
 
 class _StockLotIntegrityWorker(QObject):
@@ -189,11 +164,6 @@ class _StockLotIntegrityWorker(QObject):
         self.finished.emit(result)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Stat-card builder
-# ═══════════════════════════════════════════════════════════════════════
-
-
 def _stat_card(title: str, accent: str = styles.GREEN) -> tuple[QFrame, QLabel]:
     card = QFrame()
     card.setFrameShape(QFrame.StyledPanel)
@@ -217,17 +187,11 @@ def _stat_card(title: str, accent: str = styles.GREEN) -> tuple[QFrame, QLabel]:
     return card, value_lbl
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Page
-# ═══════════════════════════════════════════════════════════════════════
-
-
 class StockLotIntegrityPage(BasePage):
     """Operator-facing read-only stock-lot integrity page.
 
-    Uses the accepted P5.2a model for all data.  Never writes to
-    SQLite.  Never calls ProductMaster.ExpiryDate as authoritative
-    lot-expiry information.
+    Lifecycle mirrors DashboardPage: one active pair at a time,
+    _loading prevents overlaps, _on_thread_done clears refs synchronously.
     """
 
     shutdown_ready = Signal()
@@ -242,18 +206,11 @@ class StockLotIntegrityPage(BasePage):
         self._thread: QThread | None = None
         self._loading = False
         self._close_pending = False
-        self._gen = 0  # monotonically increasing generation counter
-        self._pending_cleanup = False  # True between _on_thread_done and deferred ref drop
 
-        # Snapshot state
         self._current_snapshot: StockLotIntegritySnapshot | None = None
         self._all_products: tuple[ProductLotIntegrity, ...] = ()
-
-        # Filter / pagination state
         self._filter_key = "all"
         self._page = 1
-
-        # Alert days
         self._alert_days = 30
 
         super().__init__(db_service, config, parent)
@@ -261,10 +218,8 @@ class StockLotIntegrityPage(BasePage):
     # ── UI construction ──────────────────────────────────────────────
 
     def build_ui(self) -> None:
-        # ── Controls row: alert days + refresh ──────────────────────────
         ctrl_row = QHBoxLayout()
         ctrl_row.setSpacing(8)
-
         ctrl_row.addWidget(QLabel("Προειδοποίηση (ημέρες):"))
         self._alert_spin = QSpinBox()
         self._alert_spin.setRange(0, 3650)
@@ -272,18 +227,14 @@ class StockLotIntegrityPage(BasePage):
         self._alert_spin.setMinimumHeight(36)
         self._alert_spin.valueChanged.connect(self._on_alert_days_changed)
         ctrl_row.addWidget(self._alert_spin)
-
         ctrl_row.addStretch()
-
         self._refresh_btn = QPushButton("🔄  Ανανέωση")
         self._refresh_btn.setCursor(Qt.PointingHandCursor)
         self._refresh_btn.setStyleSheet(self._btn_qss())
         self._refresh_btn.clicked.connect(self._on_refresh_clicked)
         ctrl_row.addWidget(self._refresh_btn)
-
         self.root_layout.addLayout(ctrl_row)
 
-        # ── Summary row 1: 4 cards ──────────────────────────────────────
         sum_row1 = QHBoxLayout()
         sum_row1.setSpacing(8)
         self._card_total,  self._lbl_total  = _stat_card("Σύνολο Προϊόντων")
@@ -299,7 +250,6 @@ class StockLotIntegrityPage(BasePage):
         sum_row1.addWidget(self._card_undated)
         self.root_layout.addLayout(sum_row1)
 
-        # ── Summary row 2: 4 cards ──────────────────────────────────────
         sum_row2 = QHBoxLayout()
         sum_row2.setSpacing(8)
         self._card_inv,  self._lbl_inv  = _stat_card(
@@ -316,7 +266,6 @@ class StockLotIntegrityPage(BasePage):
         sum_row2.addWidget(self._card_esoon)
         self.root_layout.addLayout(sum_row2)
 
-        # ── Overlap note ────────────────────────────────────────────────
         note_lbl = QLabel(
             "Οι κατηγορίες μπορεί να επικαλύπτονται. Η κάλυψη δείχνει "
             "συμφωνία ποσοτήτων, όχι ότι το απόθεμα είναι κατάλληλο "
@@ -328,27 +277,21 @@ class StockLotIntegrityPage(BasePage):
         )
         self.root_layout.addWidget(note_lbl)
 
-        # ── Filter row ──────────────────────────────────────────────────
         filter_row = QHBoxLayout()
         filter_row.setSpacing(8)
-
         filter_row.addWidget(QLabel("Φίλτρο:"))
         self._filter_combo = QComboBox()
         for _key, label in FILTER_OPTIONS:
             self._filter_combo.addItem(label)
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self._filter_combo)
-
         filter_row.addStretch()
-
         self._filtered_count_lbl = QLabel("")
         self._filtered_count_lbl.setStyleSheet(
             f"color: {styles.TEXT_MUTED}; font-size: 12px;")
         filter_row.addWidget(self._filtered_count_lbl)
-
         self.root_layout.addLayout(filter_row)
 
-        # ── State label (loading / error / empty) ──────────────────────
         self._state_lbl = QLabel("")
         self._state_lbl.setWordWrap(True)
         self._state_lbl.setAlignment(Qt.AlignCenter)
@@ -356,7 +299,6 @@ class StockLotIntegrityPage(BasePage):
             f"color: {styles.TEXT_MUTED}; font-size: 14px; padding: 20px;")
         self.root_layout.addWidget(self._state_lbl)
 
-        # ── Product table ──────────────────────────────────────────────
         self._table = QTableWidget(0, len(TABLE_COLS))
         self._table.setHorizontalHeaderLabels(TABLE_COLS)
         hdr = self._table.horizontalHeader()
@@ -371,29 +313,22 @@ class StockLotIntegrityPage(BasePage):
         self._table.setAlternatingRowColors(True)
         self.root_layout.addWidget(self._table, 1)
 
-        # ── Pagination row ─────────────────────────────────────────────
         page_row = QHBoxLayout()
         page_row.setSpacing(8)
-
         self._prev_btn = QPushButton("◀  Προηγούμενη")
         self._prev_btn.clicked.connect(self._prev_page)
         page_row.addWidget(self._prev_btn)
-
         self._page_lbl = QLabel("")
         self._page_lbl.setStyleSheet(
             f"color: {styles.TEXT_PRIMARY}; font-size: 12px;")
         page_row.addWidget(self._page_lbl)
-
         self._next_btn = QPushButton("Επόμενη  ▶")
         self._next_btn.clicked.connect(self._next_page)
         page_row.addWidget(self._next_btn)
-
         page_row.addStretch()
         self.root_layout.addLayout(page_row)
 
         self.refresh()
-
-    # ── Button QSS ───────────────────────────────────────────────────
 
     @staticmethod
     def _btn_qss() -> str:
@@ -405,32 +340,13 @@ class StockLotIntegrityPage(BasePage):
             "QPushButton:disabled { background: #3b3f48; color: #6b7280; }"
         )
 
-    # ── Refresh (QThread-based) ──────────────────────────────────────
+    # ── Refresh (QThread-based, mirrors DashboardPage) ───────────────
 
     def refresh(self) -> None:
-        """Public refresh — called from build_ui and MainWindow navigation."""
-        if self._loading or self._pending_cleanup:
-            return
-        self._do_refresh()
-
-    def _on_refresh_clicked(self) -> None:
-        self.refresh()
-
-    def _on_alert_days_changed(self, value: int) -> None:
-        if self._close_pending:
-            return
-        self._alert_days = value
-        self._page = 1
-        self.refresh()
-
-    def _do_refresh(self) -> None:
-        # Clear any stale pending cleanup from previous operations
-        self._complete_pending_cleanup()
-        if self._loading or self._pending_cleanup:
+        """Start a background load.  No-op when already loading."""
+        if self._loading:
             return
         self._loading = True
-        self._gen += 1
-        current_gen = self._gen
         self._set_controls_enabled(False)
         self._show_loading_state()
 
@@ -449,12 +365,19 @@ class StockLotIntegrityPage(BasePage):
         self._worker.finished.connect(self._thread.quit)
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
-        # Use a lambda closure to capture current_gen for identity safety
-        self._thread.finished.connect(
-            lambda gen=current_gen: self._on_thread_done(gen)
-        )
+        self._thread.finished.connect(self._on_thread_done)
 
         self._thread.start()
+
+    def _on_refresh_clicked(self) -> None:
+        self.refresh()
+
+    def _on_alert_days_changed(self, value: int) -> None:
+        if self._close_pending:
+            return
+        self._alert_days = value
+        self._page = 1
+        self.refresh()
 
     def _on_data_ready(self, result: StockLotIntegrityResult) -> None:
         if self._close_pending:
@@ -480,92 +403,35 @@ class StockLotIntegrityPage(BasePage):
         self._render_summary(snapshot)
         self._render_table()
 
-    def _on_thread_done(self, gen: int) -> None:
-        """Deferred cleanup —_loading stays True until refs are cleared.
+    def _on_thread_done(self) -> None:
+        """Clear refs synchronously (same pattern as DashboardPage).
 
-        A generation guard prevents a stale callback from clearing
-        references belonging to a newer worker/thread pair.
-        The actual ref-drop is deferred via QTimer.singleShot(0) so that
-        deleteLater handlers running in the same thread.finished dispatch
-        have completed before we orphan the C++ wrapper.
+        Runs inside the thread.finished dispatch, after deleteLater slots
+        have queued their events but before they execute.  It is safe to
+        clear our Python references now because the C++ objects are still
+        alive until the next event-loop iteration.
         """
-        if gen != self._gen:
-            return  # stale callback — ignore
+        self._worker = None
+        self._thread = None
+        self._loading = False
+        self._set_controls_enabled(True)
+        if self._close_pending:
+            self._close_pending = False
+            self.shutdown_ready.emit()
 
-        self._pending_cleanup = True
-
-        def _drop_refs(gen_guard: int = gen) -> None:
-            if gen_guard != self._gen:
-                return
-            self._worker = None
-            self._thread = None
-            self._pending_cleanup = False
-            self._loading = False
-            self._set_controls_enabled(True)
-            if self._close_pending:
-                self._close_pending = False
-                self.shutdown_ready.emit()
-
-        QTimer.singleShot(0, lambda: _drop_refs(self._gen))
-
-    def _complete_pending_cleanup(self) -> None:
-        """Force-complete any deferred cleanup immediately.
-
-        Called by tests after the event loop has been pumped — executes
-        the deferred QTimer.singleShot(0) cleanup synchronously if it
-        hasn't fired yet.
-        """
-        if self._pending_cleanup:
-            from PySide6.QtCore import QCoreApplication
-            for _ in range(10):
-                QCoreApplication.processEvents()
-                if not self._pending_cleanup:
-                    break
-        if not self._loading:
-            return
-        # Thread.finished signal may have been lost.  Check thread state.
-        if self._thread is not None:
-            try:
-                if not self._thread.isRunning():
-                    self._worker = None
-                    self._thread = None
-                    self._pending_cleanup = False
-                    self._loading = False
-                    self._set_controls_enabled(True)
-            except RuntimeError:
-                pass
-        # Thread ref already cleared but _loading still True
-        if self._loading and self._thread is None:
-            self._worker = None
-            self._pending_cleanup = False
-            self._loading = False
-            self._set_controls_enabled(True)
-
-    # ── Cleanup / shutdown ───────────────────────────────────────────
+    # ── Cleanup / shutdown (mirrors DashboardPage) ───────────────────
 
     def _cleanup_worker(self) -> None:
-        if self._thread is not None:
-            try:
-                if self._thread.isRunning():
-                    self._thread.quit()
-                    self._thread.wait(2000)
-            except RuntimeError:
-                pass  # C++ wrapper already deleted — safe to discard
+        """Called at the start of refresh from IDLE state."""
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(2000)
         self._worker = None
         self._thread = None
 
     def shutdown(self) -> bool:
-        if self._thread is None:
+        if self._thread is None or not self._thread.isRunning():
             return True
-        try:
-            if not self._thread.isRunning():
-                return True
-        except RuntimeError:
-            # C++ wrapper already deleted — nothing to stop
-            self._thread = None
-            self._worker = None
-            return True
-
         try:
             self._worker.finished.disconnect(self._on_data_ready)
         except (RuntimeError, TypeError):
@@ -601,7 +467,6 @@ class StockLotIntegrityPage(BasePage):
         self._filtered_count_lbl.setText("")
 
     def _render_error(self, error_message: str) -> None:
-        """Show error while preserving the complete previous view."""
         self._state_lbl.setText(error_message)
         self._state_lbl.setStyleSheet(
             f"color: {styles.RED}; font-size: 14px; padding: 20px;")
@@ -613,7 +478,6 @@ class StockLotIntegrityPage(BasePage):
             self._next_btn.setEnabled(False)
             self._filtered_count_lbl.setText("")
         else:
-            # Restore complete previous view: table, pagination, summary
             self._table.show()
             self._render_summary(self._current_snapshot)
             self._render_table()
@@ -744,17 +608,11 @@ class StockLotIntegrityPage(BasePage):
 
     @staticmethod
     def _status_color(p: ProductLotIntegrity) -> QColor | None:
-        if p.lot_overage_qty > 0:
+        if p.lot_overage_qty > 0 or p.expired_lot_qty > 0 \
+                or p.qty_in_invalid_date_lots > 0:
             return QColor(styles.RED)
-        if p.expired_lot_qty > 0:
-            return QColor(styles.RED)
-        if p.qty_in_invalid_date_lots > 0:
-            return QColor(styles.RED)
-        if p.expiring_soon_lot_qty > 0:
-            return QColor(styles.AMBER)
-        if p.untracked_qty > 0:
-            return QColor(styles.AMBER)
-        if p.qty_in_undated_lots > 0:
+        if p.expiring_soon_lot_qty > 0 or p.untracked_qty > 0 \
+                or p.qty_in_undated_lots > 0:
             return QColor(styles.AMBER)
         return None
 

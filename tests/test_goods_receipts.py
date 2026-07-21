@@ -792,7 +792,7 @@ class TestGoodsReceiptPageStructural:
                     "supplier_reorder"}
         missing = required - keys
         assert not missing, f"Missing keys: {missing}"
-        assert len(NAV_ITEMS) == 11
+        assert len(NAV_ITEMS) == 12, f"Expected 12 items, got {len(NAV_ITEMS)}"
 
 
 # ═══════════════════════════════════════════════════════════════════════
