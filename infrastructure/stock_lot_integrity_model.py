@@ -40,9 +40,12 @@ _DATE_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$")
 def _validate_date_str(value: str) -> date | None:
     """Return a ``date`` if *value* is canonical YYYY-MM-DD, else ``None``.
 
-    Rejects out-of-range months/days (e.g. 2026-02-30) that
-    ``date.fromisoformat`` silently normalises in Python 3.11.
+    Returns ``None`` for every non-string input (``None``, ``int``, …)
+    instead of raising.  The regex rejects out-of-range months/days
+    (e.g. 2026-02-30) before ``date.fromisoformat`` raises in >= 3.12.
     """
+    if not isinstance(value, str):
+        return None
     if not _DATE_RE.match(value):
         return None
     try:
@@ -287,14 +290,26 @@ def load_stock_lot_integrity(
             "Απαιτείται YYYY-MM-DD."
         )
 
-    if not isinstance(alert_days, int) or alert_days < 0:
+    # ── Validate alert_days ─────────────────────────────────────────
+    if isinstance(alert_days, bool) or not isinstance(alert_days, int):
         return StockLotIntegrityResult.failure(
-            f"Το alert_days πρέπει να είναι μη αρνητικός ακέραιος, "
+            "Το alert_days πρέπει να είναι μη αρνητικός ακέραιος, "
+            f"όχι '{type(alert_days).__name__}'."
+        )
+    if alert_days < 0:
+        return StockLotIntegrityResult.failure(
+            "Το alert_days πρέπει να είναι μη αρνητικός ακέραιος, "
             f"όχι '{alert_days}'."
         )
 
     # Compute cutoff: business_date + alert_days
-    cutoff = date.fromordinal(bd.toordinal() + alert_days)
+    try:
+        cutoff = date.fromordinal(bd.toordinal() + alert_days)
+    except (ValueError, OverflowError):
+        return StockLotIntegrityResult.failure(
+            "Η ημερομηνία λήξης του παραθύρου ειδοποιήσεων υπερχείλισε. "
+            f"business_date={business_date}, alert_days={alert_days}."
+        )
     bd_str = bd.isoformat()
     cutoff_str = cutoff.isoformat()
 
@@ -415,22 +430,28 @@ def load_stock_lot_integrity(
         # ── Deterministic final sort ────────────────────────────────
         per_product.sort(key=lambda pi: pi.severity_key())
 
-        # ── Aggregate totals ────────────────────────────────────────
+        # ── Aggregate totals (from numeric fields, NOT primary status) ──
         total_with_stock = sum(1 for p in per_product if p.master_stock > 0)
         fully_covered = sum(
-            1 for p in per_product if p.status == "Πλήρως Καταγεγραμμένο"
+            1 for p in per_product
+            if p.master_stock > 0
+            and p.untracked_qty == 0
+            and p.lot_overage_qty == 0
+            and p.qty_in_undated_lots == 0
+            and p.qty_in_invalid_date_lots == 0
+            and p.qty_in_dated_lots == p.master_stock
         )
         untracked_products = sum(
-            1 for p in per_product if p.status == "Απαρακολούθητο Απόθεμα"
+            1 for p in per_product if p.untracked_qty > 0
         )
         undated_lot_products = sum(
-            1 for p in per_product if p.status == "Αχρονολόγητες Παρτίδες"
+            1 for p in per_product if p.qty_in_undated_lots > 0
         )
         invalid_date_products = sum(
-            1 for p in per_product if p.status == "Μη Έγκυρη Ημερομηνία"
+            1 for p in per_product if p.qty_in_invalid_date_lots > 0
         )
         lot_overage_products = sum(
-            1 for p in per_product if p.status == "Λάθος: Υπερβολική Ποσότητα Παρτίδας"
+            1 for p in per_product if p.lot_overage_qty > 0
         )
         expired_units = sum(p.expired_lot_qty for p in per_product)
         expiring_units = sum(p.expiring_soon_lot_qty for p in per_product)

@@ -168,6 +168,76 @@ class TestBusinessDateValidation:
         r = load_stock_lot_integrity(db, business_date="2026-06-01", alert_days="30")
         assert not r.ok
 
+    def test_bool_alert_days_rejected(self, tmp_path):
+        db = str(tmp_path / "test.db")
+        _make_db(db)
+        r = load_stock_lot_integrity(db, business_date="2026-06-01", alert_days=True)
+        assert not r.ok
+        r2 = load_stock_lot_integrity(db, business_date="2026-06-01", alert_days=False)
+        assert not r2.ok
+
+    def test_float_alert_days_rejected(self, tmp_path):
+        db = str(tmp_path / "test.db")
+        _make_db(db)
+        r = load_stock_lot_integrity(db, business_date="2026-06-01", alert_days=30.5)
+        assert not r.ok
+
+    def test_business_date_none_returns_error(self, tmp_path):
+        db = str(tmp_path / "test.db")
+        _make_db(db)
+        r = load_stock_lot_integrity(db, business_date=None)
+        assert not r.ok
+        assert r.snapshot is None
+
+    def test_business_date_int_returns_error(self, tmp_path):
+        db = str(tmp_path / "test.db")
+        _make_db(db)
+        r = load_stock_lot_integrity(db, business_date=20260601)
+        assert not r.ok
+        assert r.snapshot is None
+
+    def test_cutoff_overflow_returns_error(self, tmp_path):
+        db = str(tmp_path / "test.db")
+        _make_db(db)
+        r = load_stock_lot_integrity(db, business_date="9999-12-31", alert_days=1)
+        assert not r.ok
+        assert "υπερχείλισε" in r.error_message
+
+    def test_large_alert_days_returns_error(self, tmp_path):
+        db = str(tmp_path / "test.db")
+        _make_db(db)
+        r = load_stock_lot_integrity(db, business_date="2026-06-01", alert_days=10**9)
+        assert not r.ok
+
+    def test_zero_alert_days_is_valid(self, tmp_path):
+        db = str(tmp_path / "test.db")
+        conn = _make_db(db)
+        _add_product(conn, "A", "Alpha", 50)
+        _add_lot(conn, "A", 50, "2027-06-01")
+        conn.commit()
+        conn.close()
+        r = load_stock_lot_integrity(db, business_date="2026-06-01", alert_days=0)
+        assert r.ok
+
+    def test_no_exception_for_any_input(self, tmp_path):
+        """All invalid inputs must return StockLotIntegrityResult with ok=False."""
+        db = str(tmp_path / "test.db")
+        _make_db(db)
+        for bd, ad in [
+            (None, 30),
+            ("not-a-date", 30),
+            ("2026-06-01", True),
+            ("2026-06-01", False),
+            ("2026-06-01", -5),
+            ("2026-06-01", "30"),
+            ("2026-06-01", 30.0),
+            ("9999-12-31", 1),
+            ("2026-06-01", 10**9),
+        ]:
+            r = load_stock_lot_integrity(db, business_date=bd, alert_days=ad)
+            assert not r.ok, f"Expected failure for bd={bd!r} ad={ad!r}"
+            assert r.snapshot is None
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # stock_lots table absent
@@ -197,6 +267,16 @@ class TestStockLotsTableAbsent:
         assert "stock_lots" in snap.tracking.reason.lower()
         assert snap.total_products_with_stock == 0
         assert len(snap.per_product) == 0
+
+        # Verify stock_lots was NOT created by the query
+        conn2 = sqlite3.connect(db)
+        tables = {
+            r[0] for r in conn2.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        conn2.close()
+        assert "stock_lots" not in tables
 
     def test_missing_db_returns_error(self, tmp_path):
         db = str(tmp_path / "nonexistent.db")
@@ -684,21 +764,49 @@ class TestAggregateTotals:
     def test_aggregates_reflect_all_products(self, tmp_path):
         db = str(tmp_path / "test.db")
         conn = _make_db(db)
+        # A — fully covered, far future (fully_covered + future only)
         _add_product(conn, "A", "Alpha Full", 100)
-        _add_lot(conn, "A", 100, "2027-06-01")  # covered
+        _add_lot(conn, "A", 100, "2027-06-01")
 
-        _add_product(conn, "B", "Beta Untracked", 50)  # no lots
+        # B — no lots (untracked only)
+        _add_product(conn, "B", "Beta Untracked", 50)
 
+        # C — undated only (undated_lot_products)
         _add_product(conn, "C", "Gamma Undated", 30)
-        _add_lot(conn, "C", 30, "")  # undated
+        _add_lot(conn, "C", 30, "")
 
+        # D — expired + undated + untracked: master=40, lots=10(e)+10(u)+15(f)=35
+        #     untracked = 5 → counts as ALL THREE: expired_lot_units, undated_lot_products,
+        #     untracked_products
         _add_product(conn, "D", "Delta Mixed", 40)
         _add_lot(conn, "D", 10, "2025-01-01")  # expired
-        _add_lot(conn, "D", 10, "")  # undated
+        _add_lot(conn, "D", 10, "")            # undated
         _add_lot(conn, "D", 15, "2027-01-01")  # future
 
+        # E — overage (lot_overage_products)
         _add_product(conn, "E", "Epsilon Overage", 10)
-        _add_lot(conn, "E", 20, "2027-01-01")  # overage
+        _add_lot(conn, "E", 20, "2027-01-01")
+
+        # F — fully covered by dated lots but CONTAINS expired units
+        #     master=50, lots=10(e expired)+40(f future)=50, untracked=0,
+        #     undated=0, invalid=0, dated=50.  qty_in_dated_lots == master_stock
+        #     → fully_covered=TRUE; expired_lot_units also counts
+        _add_product(conn, "F", "Zeta Full But Expired", 50)
+        _add_lot(conn, "F", 10, "2025-01-01")  # expired
+        _add_lot(conn, "F", 40, "2027-06-01")  # future
+
+        # G — fully covered by dated lots but expires SOON
+        #     master=60, lots=20(expiring)+40(future)=60, untracked=0
+        #     → fully_covered=TRUE; expiring_soon_lot_units also counts
+        _add_product(conn, "G", "Eta Full But Expiring", 60)
+        _add_lot(conn, "G", 20, "2026-07-10")  # expiring (bd=2026-06-15, cutoff=2026-07-15)
+        _add_lot(conn, "G", 40, "2027-06-01")  # future
+
+        # H — invalid dates + untracked stock (counts in BOTH aggregates)
+        #     master=100, lots=15(invalid)+50(future)=65, untracked=35
+        _add_product(conn, "H", "Theta Invalid Untracked", 100)
+        _add_lot(conn, "H", 15, "bad-date")   # invalid
+        _add_lot(conn, "H", 50, "2027-06-01")  # future
 
         conn.commit()
         conn.close()
@@ -707,15 +815,24 @@ class TestAggregateTotals:
         assert r.ok
         snap = r.snapshot
 
-        assert snap.total_products_with_stock == 5
-        assert snap.fully_covered == 1          # A
-        assert snap.untracked_products == 1     # B
-        assert snap.undated_lot_products == 1   # C
-        assert snap.lot_overage_products == 1   # E
-        # Delta has expired qty, so its status is "Ληγμένο", not invalid dates
-        # Delta also has undated lots, but expired takes priority
-        assert snap.expired_lot_units == 10     # D's expired lot
-        assert snap.expiring_soon_lot_units == 0
+        assert snap.total_products_with_stock == 8  # all 8 have master > 0
+        assert snap.fully_covered == 3               # A, F, G
+        assert snap.untracked_products == 3          # B, D, H
+        assert snap.undated_lot_products == 2        # C, D
+        assert snap.lot_overage_products == 1        # E
+        assert snap.invalid_date_products == 1       # H
+        assert snap.expired_lot_units == 20          # D(10) + F(10)
+        assert snap.expiring_soon_lot_units == 20    # G(20)
+
+        # Verify product F has primary status "Ληγμένο" despite being fully_covered
+        p_f = next(p for p in snap.per_product if p.barcode == "F")
+        assert p_f.status == "Ληγμένο"
+        # Verify product G has primary status "Λήγει Σύντομα" despite being fully_covered
+        p_g = next(p for p in snap.per_product if p.barcode == "G")
+        assert p_g.status == "Λήγει Σύντομα"
+        # Verify H has primary status "Μη Έγκυρη Ημερομηνία" (higher severity than untracked)
+        p_h = next(p for p in snap.per_product if p.barcode == "H")
+        assert p_h.status == "Μη Έγκυρη Ημερομηνία"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -732,41 +849,10 @@ class TestQueryOnly:
         _add_lot(conn, "A", 50, "2027-06-01")
         conn.commit()
 
-        # Capture schema before
-        tables_before = {
-            r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        conn.close()
-
-        r = load_stock_lot_integrity(db, business_date="2026-06-15")
-        assert r.ok
-
-        conn2 = sqlite3.connect(db)
-        tables_after = {
-            r[0] for r in conn2.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        conn2.close()
-
-        assert tables_before == tables_after
-
-    def test_no_row_mutations(self, tmp_path):
-        """Row data must be unchanged after the call."""
-        db = str(tmp_path / "test.db")
-        conn = _make_db(db)
-        _add_product(conn, "A", "Alpha", 50)
-        _add_lot(conn, "A", 50, "2027-06-01")
-        conn.commit()
-
-        # Capture row data before
-        rows_before = conn.execute(
-            "SELECT * FROM ProductMaster ORDER BY Barcode"
-        ).fetchall()
-        lot_rows_before = conn.execute(
-            "SELECT * FROM stock_lots ORDER BY id"
+        # Capture complete schema definitions before
+        defs_before = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE type='table' ORDER BY name"
         ).fetchall()
         conn.close()
 
@@ -775,16 +861,58 @@ class TestQueryOnly:
 
         conn2 = sqlite3.connect(db)
         conn2.row_factory = sqlite3.Row
-        rows_after = conn2.execute(
-            "SELECT * FROM ProductMaster ORDER BY Barcode"
-        ).fetchall()
-        lot_rows_after = conn2.execute(
-            "SELECT * FROM stock_lots ORDER BY id"
+        defs_after = conn2.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE type='table' ORDER BY name"
         ).fetchall()
         conn2.close()
 
-        assert len(rows_before) == len(rows_after)
-        assert len(lot_rows_before) == len(lot_rows_after)
+        assert len(defs_before) == len(defs_after)
+        for b, a in zip(defs_before, defs_after):
+            assert tuple(b) == tuple(a), (
+                f"Schema changed: {dict(b)} → {dict(a)}"
+            )
+
+    def test_no_row_mutations(self, tmp_path):
+        """Row data must be unchanged after the call — compare full content."""
+        db = str(tmp_path / "test.db")
+        conn = _make_db(db)
+        _add_product(conn, "A", "Alpha", 50)
+        _add_lot(conn, "A", 50, "2027-06-01")
+        conn.commit()
+
+        # Capture full ProductMaster rows before
+        pm_before = [
+            tuple(r) for r in conn.execute(
+                "SELECT * FROM ProductMaster ORDER BY Barcode"
+            ).fetchall()
+        ]
+        lot_before = [
+            tuple(r) for r in conn.execute(
+                "SELECT * FROM stock_lots ORDER BY id"
+            ).fetchall()
+        ]
+        conn.close()
+
+        r = load_stock_lot_integrity(db, business_date="2026-06-15")
+        assert r.ok
+
+        conn2 = sqlite3.connect(db)
+        conn2.row_factory = sqlite3.Row
+        pm_after = [
+            tuple(r) for r in conn2.execute(
+                "SELECT * FROM ProductMaster ORDER BY Barcode"
+            ).fetchall()
+        ]
+        lot_after = [
+            tuple(r) for r in conn2.execute(
+                "SELECT * FROM stock_lots ORDER BY id"
+            ).fetchall()
+        ]
+        conn2.close()
+
+        assert pm_before == pm_after, "ProductMaster rows changed!"
+        assert lot_before == lot_after, "stock_lots rows changed!"
 
     def test_no_reliance_on_productmaster_expirydate(self, tmp_path):
         """The model should work correctly even if ProductMaster.ExpiryDate
