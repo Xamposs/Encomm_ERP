@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
 from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QFrame, QPushButton,
@@ -402,20 +402,25 @@ class StockLotIntegrityPage(BasePage):
         self._render_table()
 
     def _on_thread_done(self) -> None:
-        """Clear refs synchronously (same pattern as DashboardPage).
+        """Deferred ref-drop to avoid C++ wrapper race with deleteLater.
 
-        Runs inside the thread.finished dispatch, after deleteLater slots
-        have queued their events but before they execute.  It is safe to
-        clear our Python references now because the C++ objects are still
-        alive until the next event-loop iteration.
+        The ``deleteLater`` slots run during the same ``thread.finished``
+        dispatch, but their DeferredDelete events are not processed until
+        the next event-loop iteration.  Deferring our Python reference
+        clearing by one tick ensures the C++ wrappers live long enough for
+        the deleteLater machinery to reference them safely.
         """
-        self._worker = None
-        self._thread = None
-        self._loading = False
-        self._set_controls_enabled(True)
-        if self._close_pending:
-            self._close_pending = False
-            self.shutdown_ready.emit()
+
+        def _drop_refs() -> None:
+            self._worker = None
+            self._thread = None
+            self._loading = False
+            self._set_controls_enabled(True)
+            if self._close_pending:
+                self._close_pending = False
+                self.shutdown_ready.emit()
+
+        QTimer.singleShot(0, _drop_refs)
 
     # ── Shutdown (mirrors DashboardPage) ─────────────────────────────
 

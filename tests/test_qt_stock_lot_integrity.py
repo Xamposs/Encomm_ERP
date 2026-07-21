@@ -38,7 +38,7 @@ from qt_app.pages.stock_lot_integrity_page import (
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Bounded event pumping
+# Bounded event pumping — no global state mutation
 # ═══════════════════════════════════════════════════════════════════════
 
 def _spin(n: int = 5) -> None:
@@ -55,17 +55,6 @@ def _wait_for(predicate, *, timeout_ms: int = 3000) -> bool:
             return True
     QCoreApplication.processEvents()
     return bool(predicate())
-
-
-def _drain_deferred_deletes() -> None:
-    """Globally drain queued DeferredDelete events from completed workers.
-
-    Call only after the page has reached true IDLE.  Prevents stale
-    QThread/worker C++ objects from accumulating across test cycles.
-    """
-    for _ in range(3):
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        QCoreApplication.processEvents()
 
 
 @pytest.fixture(autouse=True)
@@ -142,14 +131,26 @@ def _is_idle(page) -> bool:
 
 
 def _drain_initial_load(page) -> None:
-    """Pump events until the worker completes and page is IDLE."""
-    if not _wait_for(lambda: _is_idle(page), timeout_ms=5000):
+    """Pump events until the worker completes and page is IDLE.
+
+    Waits in two stages: first for _loading to clear (which requires
+    the deferred QTimer.singleShot(0) to fire), then for thread/worker
+    refs to be None.
+    """
+    if not _wait_for(lambda: not page._loading, timeout_ms=5000):
         raise AssertionError(
-            f"Initial load drain timeout: "
+            f"Initial load drain timeout (_loading): "
             f"_loading={page._loading}, _thread={page._thread is not None}, "
             f"_worker={page._worker is not None}"
         )
-    _spin(5)
+    _spin(10)  # let deferred QTimer fire, then thread.finished cleanup
+    if not _is_idle(page):
+        if not _wait_for(lambda: _is_idle(page), timeout_ms=2000):
+            raise AssertionError(
+                f"Initial load drain timeout (_is_idle): "
+                f"_loading={page._loading}, _thread={page._thread is not None}, "
+                f"_worker={page._worker is not None}"
+            )
 
 
 def _make_page(db_path: str) -> StockLotIntegrityPage:
@@ -177,10 +178,10 @@ def _teardown_page(page) -> None:
             f"Teardown failed: page not idle after shutdown: "
             f"_loading={page._loading}, _thread={page._thread is not None}"
         )
-    _drain_deferred_deletes()
     page.close()
     page.deleteLater()
-    _drain_deferred_deletes()
+    # Pump generously to ensure DeferredDelete processes before next test
+    _spin(20)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -276,22 +277,30 @@ class TestNavigationRegistration:
             assert hasattr(PAGE_CLASSES[key], "build_ui")
 
     def test_lazy_creation_no_duplicate(self, qapp, tmp_path):
-        """Navigate to page twice — same instance reused with safe teardown."""
+        """Navigate twice — same instance reused. Strict teardown, no swallow."""
         from qt_app.main_window import MainWindow
 
-        mw = MainWindow()
+        db_path = str(tmp_path / "nav_test.db")
+        conn = _make_db(db_path)
+        conn.close()
+
+        mw = MainWindow(config={"db_path": db_path})
+        dash_sli = []  # track worker pages for safe teardown
+
         try:
             _spin(3)
-
-            # Let DashboardPage finish its initial load
+            # Wait for DashboardPage to reach IDLE
             dash = mw._pages.get("dashboard")
             if dash and hasattr(dash, "_loading"):
-                _wait_for(lambda: not dash._loading, timeout_ms=5000)
-            _drain_deferred_deletes()
+                _wait_for(lambda: _is_idle(dash), timeout_ms=5000)
+                assert _is_idle(dash)
+                dash_sli.append(("dashboard", dash))
 
             mw.navigate_to("stock_lot_integrity")
             sli = mw._pages["stock_lot_integrity"]
             _drain_initial_load(sli)
+            assert _is_idle(sli)
+            dash_sli.append(("stock_lot_integrity", sli))
             p1 = sli
 
             mw.navigate_to("dashboard")
@@ -299,38 +308,25 @@ class TestNavigationRegistration:
             p2 = mw._pages["stock_lot_integrity"]
             assert p1 is p2
 
-            # Ensure idle before close
-            if hasattr(sli, "_loading") and sli._loading:
-                _wait_for(lambda: not sli._loading, timeout_ms=5000)
-            if dash and hasattr(dash, "_loading") and dash._loading:
-                _wait_for(lambda: not dash._loading, timeout_ms=5000)
-            _drain_deferred_deletes()
+            # Both pages idle before close
+            assert _is_idle(sli)
+            if dash and hasattr(dash, "_loading"):
+                assert _is_idle(dash)
 
             mw.close()
             _spin(5)
-            _drain_deferred_deletes()
+            for _key, p in dash_sli:
+                if hasattr(p, "shutdown"):
+                    r = p.shutdown()
+                    if r is False:
+                        _spin(10)
+                        if not _wait_for(lambda: _is_idle(p), timeout_ms=5000):
+                            raise RuntimeError(f"{_key} shutdown did not complete")
         finally:
-            # Safe teardown even after assertion failure
-            try:
-                for key in list(mw._pages.keys()):
-                    p = mw._pages[key]
-                    if hasattr(p, "shutdown"):
-                        try:
-                            r = p.shutdown()
-                            if r is False:
-                                _spin(10)
-                                _wait_for(lambda: not p._loading if hasattr(p, "_loading") else True, timeout_ms=3000)
-                        except Exception:
-                            pass
-                _drain_deferred_deletes()
-                try:
-                    mw.close()
-                except Exception:
-                    pass
-                mw.deleteLater()
-                _drain_deferred_deletes()
-            except Exception:
-                pass
+            mw.close()
+            _spin(5)
+            mw.deleteLater()
+            _spin(5)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -596,7 +592,7 @@ class TestFiltering:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Pagination tests
+# Pagination tests (pure helper + real page)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestPagePagination:
@@ -749,8 +745,13 @@ class TestWorkerLifecycle:
             assert page._loading
             assert call_count == 1
 
+            _block.set()  # release
+            assert _wait_for(lambda: _is_idle(page), timeout_ms=5000), \
+                "Page did not reach IDLE after releasing blocked worker"
+            assert _is_idle(page)
+            assert call_count == 1, "Loader was called more than once"
         finally:
-            _block.set()  # release even on assertion failure
+            _block.set()  # ensure release even on assertion failure
             monkeypatch.undo()
             _teardown_page(page)
 
@@ -834,10 +835,16 @@ class TestWorkerLifecycle:
             assert page._thread is not None
             assert page._worker is not None
 
+            # Release block and verify normal cleanup
+            _block.set()
+            assert _wait_for(lambda: _is_idle(page), timeout_ms=5000), \
+                "Timed out waiting for idle after releasing blocked worker"
+            assert _is_idle(page)
+            assert page._thread is None
+            assert page._worker is None
         finally:
+            _block.set()  # ensure release even on assertion failure
             monkeypatch.undo()
-            _block.set()  # release even on assertion failure
-            _spin(10)
             _teardown_page(page)
 
     def test_shutdown_emits_ready_once(self, qapp, tmp_path, monkeypatch):
@@ -872,9 +879,8 @@ class TestWorkerLifecycle:
             _spin(5)
             assert len(ready_count) == 1, "shutdown_ready emitted >1 time"
         finally:
+            _block.set()  # ensure release even on assertion failure
             monkeypatch.undo()
-            _block.set()  # release even on assertion failure
-            _spin(10)
             _teardown_page(page)
 
     def test_no_qthread_destroyed_while_running(self, qapp, tmp_path):
@@ -944,6 +950,7 @@ class TestWorkerLifecycle:
             assert _wait_for(lambda: _is_idle(page), timeout_ms=5000)
             assert _is_idle(page)
         finally:
+            _block_b.set()
             monkeypatch.undo()
             _teardown_page(page)
 
