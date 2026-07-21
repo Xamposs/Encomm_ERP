@@ -132,6 +132,7 @@ class MainWindow(QMainWindow):
 
         # ── Sidebar ──────────────────────────────────────────────────
         sidebar = QFrame()
+        sidebar.setObjectName("sidebarFrame")
         sidebar.setFixedWidth(220)
         sidebar.setStyleSheet(
             f"QFrame {{ background: {styles.DARK_SURFACE}; }}")
@@ -183,6 +184,7 @@ class MainWindow(QMainWindow):
 
         # Subtle separator above pinned utility section
         sep = QFrame()
+        sep.setObjectName("sidebarUtilitySeparator")
         sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet(
             "QFrame { color: #2a2e36; max-height: 1px; margin: 4px 0; }")
@@ -210,8 +212,9 @@ class MainWindow(QMainWindow):
 
         self._nav_group.idClicked.connect(self._on_nav_clicked)
 
-        # Version label (above utility, beneath primary nav)
+        # Version label at the absolute bottom of the sidebar
         ver = QLabel("v1.0.0 | ENCOMM Qt")
+        ver.setObjectName("sidebarVersionLabel")
         ver.setStyleSheet(f"color: {styles.TEXT_DIM}; font-size: 10px;")
         side_lay.addWidget(ver)
 
