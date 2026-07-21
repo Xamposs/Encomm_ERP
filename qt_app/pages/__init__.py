@@ -16,6 +16,7 @@ from qt_app.pages.settings_page import SettingsPage
 from qt_app.pages.ai_page import AIPage
 from qt_app.pages.goods_receipt_page import GoodsReceiptPage
 from qt_app.pages.supplier_reorder_page import SupplierReorderPage
+from qt_app.pages.stock_lot_integrity_page import StockLotIntegrityPage
 
 PAGE_CLASSES = {
     "dashboard":             DashboardPage,
@@ -29,4 +30,5 @@ PAGE_CLASSES = {
     "ai_assistant":          AIPage,
     "goods_receipts":        GoodsReceiptPage,
     "supplier_reorder":      SupplierReorderPage,
+    "stock_lot_integrity":   StockLotIntegrityPage,
 }

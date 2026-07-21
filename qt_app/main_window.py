@@ -14,7 +14,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QLineEdit, QButtonGroup,
-    QStackedWidget, QStatusBar, QSizePolicy,
+    QStackedWidget, QStatusBar, QSizePolicy, QScrollArea,
 )
 
 from qt_app import styles
@@ -34,6 +34,7 @@ NAV_ITEMS = [
     ("stock_movements",  "📋  Κινήσεις"),
     ("settings",         "⚙️  Ρυθμίσεις"),
     ("ai_assistant",     "🤖  AI Βοηθός"),
+    ("stock_lot_integrity", "⏳  Παρτίδες / Λήξεις"),
 ]
 
 PAGE_TITLES = {
@@ -48,6 +49,7 @@ PAGE_TITLES = {
     "stock_movements":  "Κινήσεις Αποθέματος",
     "settings":         "Ρυθμίσεις Συστήματος",
     "ai_assistant":     "AI Βοηθός",
+    "stock_lot_integrity": "Ακεραιότητα Παρτίδων",
 }
 
 # ── Sidebar button QSS (active state via :checked pseudo-class) ───────
@@ -145,18 +147,33 @@ class MainWindow(QMainWindow):
         self._nav_group.setExclusive(True)
         self._nav_keys: list[str] = []
 
+        # Scrollable nav area — prevents clipping when items grow
+        nav_scroll = QScrollArea()
+        nav_scroll.setWidgetResizable(True)
+        nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        nav_scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }")
+        nav_container = QWidget()
+        nav_container.setStyleSheet("background: transparent;")
+        nav_lay = QVBoxLayout(nav_container)
+        nav_lay.setContentsMargins(0, 0, 0, 0)
+        nav_lay.setSpacing(6)
+
         for idx, (key, label) in enumerate(NAV_ITEMS):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(NAV_QSS)
             self._nav_group.addButton(btn, idx)
-            side_lay.addWidget(btn)
+            nav_lay.addWidget(btn)
             self._nav_keys.append(key)
 
-        self._nav_group.idClicked.connect(self._on_nav_clicked)
+        nav_lay.addStretch()
+        nav_scroll.setWidget(nav_container)
+        side_lay.addWidget(nav_scroll, 1)
 
-        side_lay.addStretch()
+        self._nav_group.idClicked.connect(self._on_nav_clicked)
 
         # Version
         ver = QLabel("v1.0.0 | ENCOMM Qt")
