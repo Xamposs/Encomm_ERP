@@ -1,8 +1,13 @@
 """Offscreen Qt tests for inventory export UI on InventoryPage.
 
-Tests: button gating, save dialog cancellation, exact snapshot handoff,
-duplicate-export blocking, success/error messages, and safe shutdown
-while export is active.
+Tests: real lifecycle button gating, save dialog cancellation, exact
+snapshot handoff, duplicate-export blocking, success/error messages,
+concurrent overlap (export-while-refresh and refresh-while-export),
+and safe shutdown while export is active.
+
+Every button-state test exercises real production entry points and
+QThread signal lifecycle.  No manual callback invocation, no manual
+state injection masquerading as a test.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ from infrastructure.xlsx_export_service import ExportResult
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Bounded Qt event-processing helper for tests only
+# Bounded Qt event-processing helpers
 # ═══════════════════════════════════════════════════════════════════════
 
 def _pump_until(predicate, *, timeout_s: float = 3.0, tick_s: float = 0.05):
@@ -47,6 +52,14 @@ def _pump_until(predicate, *, timeout_s: float = 3.0, tick_s: float = 0.05):
         time.sleep(tick_s)
     raise AssertionError(
         f"_pump_until: predicate still False after {timeout_s:.1f}s")
+
+
+def _wait_initial_load(page):
+    """Block until the initial on-construction inventory load completes,
+    producing a non-None snapshot with loading=False."""
+    _pump_until(
+        lambda: not page._loading and page._current_snapshot is not None,
+        timeout_s=5.0)
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────
@@ -147,21 +160,14 @@ def _install_qmb(monkeypatch, question_ret=_FakeQMB.Yes):
 # ── Fake QFileDialog helper ─────────────────────────────────────────────
 
 class _FakeFileDialog:
-    """Simulates QFileDialog.  Pass ``done=False`` to simulate cancel."""
-
-    def __init__(self, done: bool = True):
-        self._done = done
+    """Simulates QFileDialog accepting a path."""
 
     @staticmethod
     def getSaveFileName(parent, title, suggested, filter_str):
-        if False:  # never — we monkey-patch the class itself
-            pass
-        # The real signature returns (path, filter_used).
-        # This fake ignores the filter.
         return ("/tmp/fake_export.xlsx", "*.xlsx")
 
 
-# ── Snapshots factory ──────────────────────────────────────────────────
+# ── Snapshot factory ──────────────────────────────────────────────────
 
 def _make_snapshot(barcode="EXP001", name="Exportable", stock=50):
     prod = InventoryProduct(
@@ -177,46 +183,179 @@ def _make_snapshot(barcode="EXP001", name="Exportable", stock=50):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test: export button gating
+# Test: real lifecycle button gating
 # ═══════════════════════════════════════════════════════════════════════
 
-class TestExportButtonGating:
+class TestLifecycleButtonGating:
 
-    def test_button_disabled_initially(self, inventory_page):
-        """No snapshot loaded yet — button must be disabled."""
-        assert inventory_page._export_btn is not None
-        assert not inventory_page._export_btn.isEnabled()
+    def test_initial_load_enables_export(self, inventory_page):
+        """Wait for the initial inventory load to complete; assert
+        the export button becomes enabled with a valid snapshot and
+        no active workers."""
+        _wait_initial_load(inventory_page)
+        assert inventory_page._export_btn.isEnabled()
+        assert inventory_page._current_snapshot is not None
 
-    def test_button_enabled_after_successful_snapshot(self, inventory_page):
-        """Inject a successful snapshot — button must become enabled."""
-        snap = _make_snapshot()
-        inventory_page._current_snapshot = snap
-        inventory_page._export_btn.setEnabled(True)
+    def test_refresh_start_clears_snapshot_and_disables_export(
+            self, inventory_page, monkeypatch):
+        """Starting a real _do_refresh() clears _current_snapshot and
+        disables the export button before the worker completes.
+
+        The read worker is intentionally blocked so we can observe the
+        intermediate cleared state.
+        """
+        import qt_app.pages.inventory_page as ip_mod
+
+        _wait_initial_load(inventory_page)
+
+        _read_block = threading.Event()
+        _read_started = threading.Event()
+        original_load = ip_mod.load_inventory_page
+
+        def _blocking_load(*args, **kwargs):
+            _read_started.set()
+            _read_block.wait(timeout=5.0)
+            return original_load(*args, **kwargs)
+
+        monkeypatch.setattr(
+            ip_mod, "load_inventory_page", _blocking_load)
+
+        try:
+            inventory_page._do_refresh()
+            _read_started.wait(timeout=2.0)
+
+            # Read worker is blocked; observe intermediate cleared state
+            assert inventory_page._current_snapshot is None
+            assert not inventory_page._export_btn.isEnabled()
+        finally:
+            _read_block.set()
+            _pump_until(lambda: not inventory_page._loading)
+
+        # After refresh completes, button must be re-enabled
+        assert inventory_page._current_snapshot is not None
         assert inventory_page._export_btn.isEnabled()
 
-    def test_button_disabled_on_no_snapshot(self, inventory_page):
-        """After an error or before first load, snapshot is None."""
-        inventory_page._current_snapshot = None
-        inventory_page._export_btn.setEnabled(False)
+    def test_error_result_leaves_export_disabled(
+            self, inventory_page, monkeypatch):
+        """A refresh that returns an error keeps _current_snapshot as
+        None and export button disabled."""
+        import qt_app.pages.inventory_page as ip_mod
+
+        _wait_initial_load(inventory_page)
+
+        def _error_load(*args, **kwargs):
+            return InventoryResult.failure(
+                "Σφάλμα βάσης δεδομένων")
+
+        monkeypatch.setattr(
+            ip_mod, "load_inventory_page", _error_load)
+
+        inventory_page._do_refresh()
+        _pump_until(lambda: not inventory_page._loading)
+
+        assert inventory_page._current_snapshot is None
         assert not inventory_page._export_btn.isEnabled()
 
-    def test_button_disabled_during_loading(self, inventory_page):
-        """Simulate loading state — button disabled."""
-        inventory_page._loading = True
-        inventory_page._refresh_btn.setEnabled(False)
-        inventory_page._export_btn.setEnabled(False)
-        assert not inventory_page._export_btn.isEnabled()
 
-    def test_button_disabled_during_export(self, inventory_page):
-        """While an export is active, clicking again must be blocked."""
-        inventory_page._export_loading = True
-        inventory_page._export_btn.setEnabled(False)
-        assert not inventory_page._export_btn.isEnabled()
-        # _on_export must return early
-        inventory_page._current_snapshot = _make_snapshot()
-        inventory_page._on_export()
-        # Still not loading a new export
-        assert inventory_page._export_loading
+# ═══════════════════════════════════════════════════════════════════════
+# Test: valid empty-snapshot lifecycle
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestEmptySnapshotLifecycle:
+
+    def test_valid_empty_snapshot_enables_export(
+            self, inventory_page, monkeypatch):
+        """A refresh returning a valid snapshot with zero products
+        (filter returned nothing) must still set _current_snapshot
+        and enable the export button."""
+        import qt_app.pages.inventory_page as ip_mod
+
+        _wait_initial_load(inventory_page)
+
+        empty_snap = InventorySnapshot(
+            total_matching=0, page=1, page_size=50,
+            products=())
+
+        def _empty_load(*args, **kwargs):
+            return InventoryResult.success(empty_snap)
+
+        monkeypatch.setattr(
+            ip_mod, "load_inventory_page", _empty_load)
+
+        inventory_page._do_refresh()
+        _pump_until(lambda: not inventory_page._loading)
+
+        assert inventory_page._current_snapshot is empty_snap
+        assert inventory_page._export_btn.isEnabled()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: exact snapshot handoff (captured at export time)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestSnapshotHandoff:
+
+    def test_export_captures_snapshot_before_refresh(
+            self, inventory_page, monkeypatch):
+        """The exported snapshot must be the exact object captured when
+        _run_export started, even if a subsequent refresh clears
+        _current_snapshot."""
+        import qt_app.pages.inventory_page as ip_mod
+
+        _wait_initial_load(inventory_page)
+        pre_refresh_snap = inventory_page._current_snapshot
+
+        # Block read worker so we can observe the intermediate state
+        _read_block = threading.Event()
+        _read_started = threading.Event()
+        original_load = ip_mod.load_inventory_page
+
+        def _blocking_load(*args, **kwargs):
+            _read_started.set()
+            _read_block.wait(timeout=5.0)
+            return original_load(*args, **kwargs)
+
+        # Block export worker to capture snapshot ref
+        _export_block = threading.Event()
+        _export_started = threading.Event()
+        received = []
+
+        def _blocking_export(snapshot, path):
+            _export_started.set()
+            _export_block.wait(timeout=5.0)
+            received.append(snapshot)
+            return ExportResult.success(path)
+
+        monkeypatch.setattr(
+            ip_mod, "export_inventory_snapshot", _blocking_export)
+        monkeypatch.setattr(
+            ip_mod, "load_inventory_page", _blocking_load)
+        monkeypatch.setattr(
+            ip_mod, "QFileDialog", _FakeFileDialog)
+        _install_qmb(monkeypatch)
+
+        try:
+            # Start export (captures snapshot, blocks in worker)
+            inventory_page._on_export()
+            _export_started.wait(timeout=2.0)
+
+            # Now start a refresh — clears _current_snapshot
+            inventory_page._do_refresh()
+            _read_started.wait(timeout=2.0)
+            assert inventory_page._current_snapshot is None
+
+            # Release export and let it complete
+            _export_block.set()
+            _pump_until(
+                lambda: inventory_page._export_thread is None)
+
+            # The export must have used the pre-refresh snapshot
+            assert len(received) == 1
+            assert received[0] is pre_refresh_snap
+        finally:
+            _export_block.set()
+            _read_block.set()
+            _pump_until(lambda: not inventory_page._loading)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -237,50 +376,12 @@ class TestSaveDialogCancellation:
         monkeypatch.setattr(
             ip_mod, "QFileDialog", _CancelDialog)
 
-        inventory_page._current_snapshot = _make_snapshot()
+        _wait_initial_load(inventory_page)
+
         inventory_page._on_export()
 
         assert not inventory_page._export_loading
         assert inventory_page._export_thread is None
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Test: exact snapshot handoff
-# ═══════════════════════════════════════════════════════════════════════
-
-class TestSnapshotHandoff:
-
-    def test_worker_receives_current_snapshot(self, inventory_page,
-                                              monkeypatch):
-        """The _ExportWorker must receive the exact snapshot stored on
-        the page at the time _run_export is called."""
-        import qt_app.pages.inventory_page as ip_mod
-
-        snap = _make_snapshot()
-        inventory_page._current_snapshot = snap
-
-        received = []
-
-        def _capture_export(snapshot, target_path):
-            received.append(snapshot)
-            return ExportResult.success(target_path)
-
-        monkeypatch.setattr(
-            ip_mod, "export_inventory_snapshot", _capture_export)
-
-        # Fake the dialog to return a path — replace QFileDialog class
-        monkeypatch.setattr(ip_mod, "QFileDialog", _FakeFileDialog)
-
-        # Also fake QMessageBox to avoid errors from the done handler
-        _install_qmb(monkeypatch)
-
-        inventory_page._on_export()
-
-        # Wait for the thread to complete
-        _pump_until(lambda: inventory_page._export_thread is None)
-
-        assert len(received) == 1
-        assert received[0] is snap  # exact same object reference
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -304,32 +405,32 @@ class TestDuplicateExportBlocking:
 
         monkeypatch.setattr(
             ip_mod, "export_inventory_snapshot", _blocking_export)
-
+        monkeypatch.setattr(
+            ip_mod, "QFileDialog", _FakeFileDialog)
         _install_qmb(monkeypatch)
 
-        # Fake the dialog to return a path — replace QFileDialog class
-        monkeypatch.setattr(ip_mod, "QFileDialog", _FakeFileDialog)
+        _wait_initial_load(inventory_page)
 
-        inventory_page._current_snapshot = _make_snapshot()
-        inventory_page._on_export()
+        try:
+            inventory_page._on_export()
 
-        # Wait until export worker is inside the blocking function
-        _started.wait(timeout=2.0)
-        assert inventory_page._export_loading
-        assert inventory_page._export_thread is not None
-        assert inventory_page._export_thread.isRunning()
+            # Wait until export worker is inside the blocking function
+            _started.wait(timeout=2.0)
+            assert inventory_page._export_loading
+            assert inventory_page._export_thread is not None
+            assert inventory_page._export_thread.isRunning()
 
-        # Simulate a second click — must be blocked
-        assert not inventory_page._export_btn.isEnabled()
+            # Button must be disabled during export
+            assert not inventory_page._export_btn.isEnabled()
 
-        # _on_export must return early due to _export_loading check
-        old_thread = inventory_page._export_thread
-        inventory_page._on_export()
-        assert inventory_page._export_thread is old_thread
-
-        # Release the block and let the thread finish
-        _block.set()
-        _pump_until(lambda: inventory_page._export_thread is None)
+            # _on_export must return early due to _export_loading check
+            old_thread = inventory_page._export_thread
+            inventory_page._on_export()
+            assert inventory_page._export_thread is old_thread
+        finally:
+            _block.set()
+            _pump_until(
+                lambda: inventory_page._export_thread is None)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -372,9 +473,185 @@ class TestExportMessages:
         inventory_page._on_export_done(
             ExportResult.success("/tmp/should_not_show.xlsx"))
 
-        # No dialogs shown
         assert len(fk.infos) == 0
         assert len(fk.warnings) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: concurrent overlap — export finishes while refresh is active
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestOverlapExportWhileRefresh:
+
+    def test_export_finishes_while_refresh_blocked(
+            self, inventory_page, monkeypatch):
+        """Order: export starts first, then refresh starts.
+
+        Export completes while read is still blocked; button stays
+        disabled until read finishes too.
+        """
+        import qt_app.pages.inventory_page as ip_mod
+
+        _read_block = threading.Event()
+        _read_started = threading.Event()
+        _export_block = threading.Event()
+        _export_started = threading.Event()
+
+        original_load = ip_mod.load_inventory_page
+        _call_count = 0
+
+        def _blocking_load(*args, **kwargs):
+            nonlocal _call_count
+            _call_count += 1
+            # First call is the construction-time initial load
+            if _call_count <= 1:
+                return original_load(*args, **kwargs)
+            _read_started.set()
+            _read_block.wait(timeout=5.0)
+            return original_load(*args, **kwargs)
+
+        def _blocking_export(snapshot, path):
+            _export_started.set()
+            _export_block.wait(timeout=5.0)
+            return ExportResult.success(path)
+
+        monkeypatch.setattr(
+            ip_mod, "export_inventory_snapshot", _blocking_export)
+        monkeypatch.setattr(
+            ip_mod, "load_inventory_page", _blocking_load)
+        monkeypatch.setattr(
+            ip_mod, "QFileDialog", _FakeFileDialog)
+        _install_qmb(monkeypatch)
+
+        _wait_initial_load(inventory_page)
+        pre_refresh_snap = inventory_page._current_snapshot
+
+        try:
+            # ── Step 1: start export (captures snapshot, blocks) ──
+            inventory_page._on_export()
+            _export_started.wait(timeout=2.0)
+            assert inventory_page._export_loading
+            assert not inventory_page._export_btn.isEnabled()
+
+            # ── Step 2: start refresh (clears snapshot, blocks) ──
+            inventory_page._do_refresh()
+            _read_started.wait(timeout=2.0)
+            assert inventory_page._loading
+            assert inventory_page._current_snapshot is None
+            # Must stay disabled after _current_snapshot is cleared
+            assert not inventory_page._export_btn.isEnabled()
+
+            # ── Step 3: let export finish ──
+            _export_block.set()
+            _pump_until(
+                lambda: inventory_page._export_thread is None)
+
+            # Export button must stay disabled: refresh still active,
+            # _current_snapshot is None
+            assert inventory_page._loading
+            assert inventory_page._current_snapshot is None
+            assert not inventory_page._export_btn.isEnabled()
+
+            # ── Step 4: let refresh finish ──
+            _read_block.set()
+            _pump_until(
+                lambda: not inventory_page._loading)
+
+            # Both workers idle; new snapshot should be present
+            assert inventory_page._current_snapshot is not None
+            assert inventory_page._export_btn.isEnabled()
+        finally:
+            _export_block.set()
+            _read_block.set()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: concurrent overlap — refresh finishes while export is active
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestOverlapRefreshWhileExport:
+
+    def test_refresh_finishes_while_export_blocked(
+            self, inventory_page, monkeypatch):
+        """Order: export starts first, then refresh starts.
+
+        Refresh completes while export is still blocked; button stays
+        disabled until export finishes too.
+        """
+        import qt_app.pages.inventory_page as ip_mod
+
+        _read_block = threading.Event()
+        _read_started = threading.Event()
+        _export_block = threading.Event()
+        _export_started = threading.Event()
+
+        original_load = ip_mod.load_inventory_page
+        _call_count = 0
+
+        def _blocking_load(*args, **kwargs):
+            nonlocal _call_count
+            _call_count += 1
+            # First call is the construction-time initial load
+            if _call_count <= 1:
+                return original_load(*args, **kwargs)
+            _read_started.set()
+            _read_block.wait(timeout=5.0)
+            return original_load(*args, **kwargs)
+
+        def _blocking_export(snapshot, path):
+            _export_started.set()
+            _export_block.wait(timeout=5.0)
+            return ExportResult.success(path)
+
+        monkeypatch.setattr(
+            ip_mod, "export_inventory_snapshot", _blocking_export)
+        monkeypatch.setattr(
+            ip_mod, "load_inventory_page", _blocking_load)
+        monkeypatch.setattr(
+            ip_mod, "QFileDialog", _FakeFileDialog)
+        _install_qmb(monkeypatch)
+
+        # Wait for construction-time load before monkeypatch applies
+        _wait_initial_load(inventory_page)
+
+        try:
+            # ── Step 1: start export (captures snapshot, blocks) ──
+            inventory_page._on_export()
+            _export_started.wait(timeout=2.0)
+            assert inventory_page._export_loading
+            assert not inventory_page._export_btn.isEnabled()
+
+            pre_export_snap = inventory_page._current_snapshot
+            assert pre_export_snap is not None
+
+            # ── Step 2: start refresh (clears snapshot, blocks) ──
+            inventory_page._do_refresh()
+            _read_started.wait(timeout=2.0)
+            assert inventory_page._loading
+            assert inventory_page._current_snapshot is None
+            assert not inventory_page._export_btn.isEnabled()
+
+            # ── Step 3: let refresh finish (while export blocked) ──
+            _read_block.set()
+            _pump_until(lambda: not inventory_page._loading)
+
+            # Refresh completed — new snapshot loaded
+            assert inventory_page._current_snapshot is not None
+            # But export is still active → button must stay disabled
+            assert inventory_page._export_loading
+            assert not inventory_page._export_btn.isEnabled()
+
+            # ── Step 4: let export finish ──
+            _export_block.set()
+            _pump_until(
+                lambda: inventory_page._export_thread is None)
+
+            # Both idle; new snapshot exists → button enabled
+            assert not inventory_page._export_loading
+            assert inventory_page._export_btn.isEnabled()
+        finally:
+            _export_block.set()
+            _read_block.set()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -384,6 +661,7 @@ class TestExportMessages:
 class TestShutdownLifecycle:
 
     def test_shutdown_with_no_export_returns_true(self, inventory_page):
+        _wait_initial_load(inventory_page)
         assert inventory_page.shutdown()
 
     def test_shutdown_with_blocking_export_then_recovers(
@@ -402,34 +680,39 @@ class TestShutdownLifecycle:
 
         monkeypatch.setattr(
             ip_mod, "export_inventory_snapshot", _blocking_export)
-
         _install_qmb(monkeypatch)
 
-        # Directly start export (bypass dialog)
-        inventory_page._current_snapshot = _make_snapshot()
-        inventory_page._run_export("/tmp/export_during_shutdown.xlsx")
+        _wait_initial_load(inventory_page)
 
-        assert inventory_page._export_thread is not None
-        assert inventory_page._export_thread.isRunning()
+        try:
+            # Directly start export (bypass dialog)
+            inventory_page._run_export(
+                "/tmp/export_during_shutdown.xlsx")
 
-        # Wait until export worker is inside the blocking function
-        _started.wait(timeout=2.0)
-        assert _started.is_set(), "Export worker never started running"
+            assert inventory_page._export_thread is not None
+            assert inventory_page._export_thread.isRunning()
 
-        # First shutdown — worker still blocked, must return False
-        result1 = inventory_page.shutdown()
-        assert result1 is False, (
-            f"Expected shutdown->False while export blocked, got {result1}")
+            # Wait until export worker is inside the blocking function
+            _started.wait(timeout=2.0)
+            assert _started.is_set(), (
+                "Export worker never started running")
 
-        # close_pending must be True
-        assert inventory_page._close_pending
+            # First shutdown — worker still blocked, must return False
+            result1 = inventory_page.shutdown()
+            assert result1 is False, (
+                f"Expected shutdown->False while export blocked, "
+                f"got {result1}")
 
-        # Release the block — the thread should finish
-        _block.set()
+            # close_pending must be True
+            assert inventory_page._close_pending
+        finally:
+            _block.set()
+
+        # Shutdown is already set to close_pending and the block
+        # was released; pump until the export thread fully stops.
         _pump_until(
             lambda: inventory_page._export_thread is None,
-            timeout_s=4.0,
-        )
+            timeout_s=4.0)
 
         # Second shutdown must return True (all workers stopped)
         result2 = inventory_page.shutdown()
@@ -449,7 +732,7 @@ class TestShutdownLifecycle:
         finished signal must not invoke _on_export_done."""
         import qt_app.pages.inventory_page as ip_mod
 
-        _block = threading.Event()  # blocks the export worker
+        _block = threading.Event()
         _started = threading.Event()
 
         def _blocking_export(snapshot, path):
@@ -459,29 +742,31 @@ class TestShutdownLifecycle:
 
         monkeypatch.setattr(
             ip_mod, "export_inventory_snapshot", _blocking_export)
-
         fk = _install_qmb(monkeypatch)
 
-        inventory_page._current_snapshot = _make_snapshot()
-        inventory_page._run_export("/tmp/callback_stale.xlsx")
+        _wait_initial_load(inventory_page)
 
-        assert inventory_page._export_thread.isRunning()
+        try:
+            inventory_page._run_export(
+                "/tmp/callback_stale.xlsx")
 
-        # Wait for worker to enter the blocking function
-        _started.wait(timeout=2.0)
-        assert _started.is_set()
+            assert inventory_page._export_thread.isRunning()
 
-        # shutdown disconnects the callback and attempts to quit
-        result = inventory_page.shutdown()
-        # The worker is blocked, so quit+wait(2000) times out -> False
-        assert result is False
+            # Wait for worker to enter the blocking function
+            _started.wait(timeout=2.0)
+            assert _started.is_set()
 
-        # Now release the block
-        _block.set()
+            # shutdown disconnects the callback and attempts to quit
+            result = inventory_page.shutdown()
+            # The worker is blocked, so quit+wait(2000) times out
+            assert result is False
+        finally:
+            _block.set()
 
         # Wait for the thread to actually finish
-        _pump_until(lambda: inventory_page._export_thread is None,
-                    timeout_s=4.0)
+        _pump_until(
+            lambda: inventory_page._export_thread is None,
+            timeout_s=4.0)
 
         # _on_export_done was disconnected, so no dialog should have
         # appeared

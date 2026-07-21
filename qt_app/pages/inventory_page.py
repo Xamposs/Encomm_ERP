@@ -773,9 +773,21 @@ class InventoryPage(BasePage):
         self._adj_thread = None
 
     # ── Export current view ──────────────────────────────────────────
+    def _sync_export_btn(self):
+        """Enable export button only when ALL preconditions are met."""
+        if self._export_btn is None:
+            return
+        enabled = (
+            self._current_snapshot is not None
+            and not self._loading
+            and not self._export_loading
+            and not self._close_pending
+        )
+        self._export_btn.setEnabled(enabled)
+
     def _on_export(self):
         """Open save-file dialog, then dispatch export worker."""
-        if self._export_loading:
+        if self._export_loading or self._loading or self._close_pending:
             return
         if self._current_snapshot is None:
             return
@@ -798,10 +810,10 @@ class InventoryPage(BasePage):
         self._run_export(path)
 
     def _run_export(self, target_path: str):
-        if self._export_loading:
+        if self._export_loading or self._loading or self._close_pending:
             return
         self._export_loading = True
-        self._export_btn.setEnabled(False)
+        self._sync_export_btn()
 
         self._cleanup_export_worker()
 
@@ -838,9 +850,7 @@ class InventoryPage(BasePage):
         if self._close_pending:
             self._maybe_finish_shutdown()
             return
-        # Re-enable export button if we still have a valid snapshot
-        if self._current_snapshot is not None:
-            self._export_btn.setEnabled(True)
+        self._sync_export_btn()
 
     def _cleanup_export_worker(self):
         if self._export_thread and self._export_thread.isRunning():
@@ -875,8 +885,9 @@ class InventoryPage(BasePage):
             return
         self._pending_req = None
         self._loading = True
+        self._current_snapshot = None
         self._refresh_btn.setEnabled(False)
-        self._export_btn.setEnabled(False)
+        self._sync_export_btn()
         self._set_state("🔄 Φόρτωση δεδομένων αποθήκης...", styles.TEXT_MUTED)
         threshold = int(self.config.get("low_stock_threshold", 10)) if self.config else 10
         alert_days = int(self.config.get("expiry_alert_days", 30)) if self.config else 30
@@ -902,7 +913,6 @@ class InventoryPage(BasePage):
             self._set_state(result.error_message, styles.RED)
             self._clear_table()
             self._summary_lbl.setText("")
-            self._export_btn.setEnabled(False)
             return
         snap = result.snapshot
         self._current_snapshot = snap
@@ -915,11 +925,9 @@ class InventoryPage(BasePage):
         if not prods:
             self._set_state("Δεν βρέθηκαν προϊόντα με τα επιλεγμένα φίλτρα.", styles.TEXT_MUTED)
             self._clear_table()
-            self._export_btn.setEnabled(True)
         else:
             self._state_lbl.hide()
             self._table.show()
-            self._export_btn.setEnabled(True)
             self._table.setRowCount(len(prods))
             for r, p in enumerate(prods):
                 self._table.setItem(r, 0, QTableWidgetItem(p.barcode))
@@ -958,6 +966,8 @@ class InventoryPage(BasePage):
             self._status_filter = req["filter"]
             self._page = req["page"]
             self._do_refresh()
+            return
+        self._sync_export_btn()
 
     # ── Shutdown ─────────────────────────────────────────────────────
     def _maybe_finish_shutdown(self):
