@@ -153,6 +153,50 @@ def _drain_initial_load(page) -> None:
             )
 
 
+def _teardown_main_window(mw, page_keys: list[str]):
+    """Strict bounded MainWindow teardown — no deleteLater on busy pages.
+
+    Calls shutdown() on every worker-owning page, waits for IDLE
+    (including deferred QTimer window), then closes and deletes
+    the MainWindow.
+    """
+    pending = []
+    for key in page_keys:
+        page = mw._pages.get(key)
+        if page is None or not hasattr(page, "shutdown"):
+            continue
+        r = page.shutdown()
+        if r is False:
+            pending.append((key, page))
+    # Wait for any timeout pages to finish
+    for key, page in pending:
+        _spin(10)
+        if not _wait_for(lambda: _is_idle(page), timeout_ms=5000):
+            raise RuntimeError(
+                f"MainWindow teardown timeout: {key} not idle after shutdown"
+            )
+    # Handle deferred QTimer window for all pages
+    for key in page_keys:
+        page = mw._pages.get(key)
+        if page is None or not hasattr(page, "_loading"):
+            continue
+        if not _is_idle(page):
+            _spin(10)
+            _wait_for(lambda: _is_idle(page), timeout_ms=2000)
+    # Verify all pages truly idle before close
+    for key in page_keys:
+        page = mw._pages.get(key)
+        if page and hasattr(page, "_loading") and not _is_idle(page):
+            raise RuntimeError(
+                f"MainWindow teardown: {key} not idle before close: "
+                f"_loading={page._loading}"
+            )
+    mw.close()
+    _spin(5)
+    mw.deleteLater()
+    _spin(10)
+
+
 def _make_page(db_path: str) -> StockLotIntegrityPage:
     page = StockLotIntegrityPage(
         db_service=None,
@@ -172,6 +216,13 @@ def _teardown_page(page) -> None:
                 f"Teardown timeout: page not idle after shutdown retry: "
                 f"_loading={page._loading}, _thread={page._thread is not None}"
             )
+    # During the deferred QTimer window, _loading may still be True
+    # even though the thread has stopped.  Pump events so the
+    # self-bound QTimer fires and completes cleanup.
+    if not _is_idle(page) and page._thread is not None \
+            and not page._thread.isRunning():
+        _spin(10)
+        _wait_for(lambda: _is_idle(page), timeout_ms=2000)
     _spin(5)
     if not _is_idle(page):
         raise RuntimeError(
@@ -277,7 +328,7 @@ class TestNavigationRegistration:
             assert hasattr(PAGE_CLASSES[key], "build_ui")
 
     def test_lazy_creation_no_duplicate(self, qapp, tmp_path):
-        """Navigate twice — same instance reused. Strict teardown, no swallow."""
+        """Navigate twice — same instance reused. Strict bounded teardown."""
         from qt_app.main_window import MainWindow
 
         db_path = str(tmp_path / "nav_test.db")
@@ -285,7 +336,6 @@ class TestNavigationRegistration:
         conn.close()
 
         mw = MainWindow(config={"db_path": db_path})
-        dash_sli = []  # track worker pages for safe teardown
 
         try:
             _spin(3)
@@ -294,13 +344,11 @@ class TestNavigationRegistration:
             if dash and hasattr(dash, "_loading"):
                 _wait_for(lambda: _is_idle(dash), timeout_ms=5000)
                 assert _is_idle(dash)
-                dash_sli.append(("dashboard", dash))
 
             mw.navigate_to("stock_lot_integrity")
             sli = mw._pages["stock_lot_integrity"]
             _drain_initial_load(sli)
             assert _is_idle(sli)
-            dash_sli.append(("stock_lot_integrity", sli))
             p1 = sli
 
             mw.navigate_to("dashboard")
@@ -308,25 +356,14 @@ class TestNavigationRegistration:
             p2 = mw._pages["stock_lot_integrity"]
             assert p1 is p2
 
-            # Both pages idle before close
+            # Both pages idle
             assert _is_idle(sli)
             if dash and hasattr(dash, "_loading"):
                 assert _is_idle(dash)
 
-            mw.close()
-            _spin(5)
-            for _key, p in dash_sli:
-                if hasattr(p, "shutdown"):
-                    r = p.shutdown()
-                    if r is False:
-                        _spin(10)
-                        if not _wait_for(lambda: _is_idle(p), timeout_ms=5000):
-                            raise RuntimeError(f"{_key} shutdown did not complete")
         finally:
-            mw.close()
-            _spin(5)
-            mw.deleteLater()
-            _spin(5)
+            _teardown_main_window(
+                mw, ["dashboard", "stock_lot_integrity"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -951,6 +988,83 @@ class TestWorkerLifecycle:
             assert _is_idle(page)
         finally:
             _block_b.set()
+            monkeypatch.undo()
+            _teardown_page(page)
+
+    def test_deferred_callback_clears_only_its_own_worker(self, qapp, tmp_path):
+        """Worker A finishes, QTimer defers. B starts. A's timer fires — B untouched."""
+        db = str(tmp_path / "test.db")
+        conn = _make_db(db)
+        _add_product(conn, "A", "Alpha", 50)
+        _add_lot(conn, "A", 50, "2027-06-01")
+        conn.commit()
+        conn.close()
+
+        page = _make_page(db)  # worker A → deferred cleanup runs
+        try:
+            assert _is_idle(page)
+
+            # Start worker B
+            page.refresh()
+            assert page._loading
+            wrk_b = page._worker
+            thr_b = page._thread
+
+            # Pump many events — any stale callback from A must not touch B
+            for _ in range(20):
+                QCoreApplication.processEvents()
+                # B's refs must be intact
+                if not page._loading:
+                    break
+
+            # Wait for B to complete
+            assert _wait_for(lambda: _is_idle(page), timeout_ms=5000)
+            assert _is_idle(page)
+        finally:
+            _teardown_page(page)
+
+    def test_shutdown_during_deferred_window(self, qapp, tmp_path):
+        """Worker finishes, deferred timer pending.  Shutdown returns True, QTimer
+        fires (self-bound), cleanup completes normally."""
+        import qt_app.pages.stock_lot_integrity_page as mod
+        import threading
+        _block = threading.Event()
+        _started = threading.Event()
+
+        orig = mod.load_stock_lot_integrity
+        def _delayed_loader(db_path, business_date, alert_days=30):
+            _started.set()
+            _block.wait(timeout=5.0)
+            return orig(db_path, business_date, alert_days)
+
+        db = str(tmp_path / "test.db")
+        conn = _make_db(db)
+        _add_product(conn, "A", "Alpha", 50)
+        _add_lot(conn, "A", 50, "2027-06-01")
+        conn.commit()
+        conn.close()
+
+        page = _make_page(db)
+        try:
+            assert _is_idle(page)
+            monkeypatch = pytest.MonkeyPatch()
+            monkeypatch.setattr(mod, "load_stock_lot_integrity", _delayed_loader)
+
+            page.refresh()
+            assert _wait_for(_started.is_set, timeout_ms=2000)
+            # Thread still running, normal shutdown
+            result = page.shutdown()
+            assert result is False  # thread blocked
+
+            _block.set()
+            # After release, thread.finished fires, _on_thread_done
+            # schedules deferred QTimer.  shutdown should now return True.
+            assert _wait_for(lambda: page._thread is not None
+                             and not page._thread.isRunning(), timeout_ms=5000)
+            result2 = page.shutdown()
+            assert result2 is True  # deferred window, QTimer self-bound
+        finally:
+            _block.set()
             monkeypatch.undo()
             _teardown_page(page)
 

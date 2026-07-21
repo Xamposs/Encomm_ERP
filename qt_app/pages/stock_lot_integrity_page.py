@@ -402,16 +402,24 @@ class StockLotIntegrityPage(BasePage):
         self._render_table()
 
     def _on_thread_done(self) -> None:
-        """Deferred ref-drop to avoid C++ wrapper race with deleteLater.
+        """Deferred ref-drop bound to page lifetime, identity-safe.
 
-        The ``deleteLater`` slots run during the same ``thread.finished``
-        dispatch, but their DeferredDelete events are not processed until
-        the next event-loop iteration.  Deferring our Python reference
-        clearing by one tick ensures the C++ wrappers live long enough for
-        the deleteLater machinery to reference them safely.
+        Captures the exact _thread/_worker identities before deferring.
+        The QTimer is bound to `self` — if the page is destroyed before
+        the timer fires, Qt cancels it automatically.
+
+        Inside the callback we verify the stored identities still match
+        the page's current references before clearing anything, so a
+        stale deferred callback can never clear a newer worker pair.
         """
+        target_worker = self._worker
+        target_thread = self._thread
 
         def _drop_refs() -> None:
+            if self._worker is not target_worker:
+                return
+            if self._thread is not target_thread:
+                return
             self._worker = None
             self._thread = None
             self._loading = False
@@ -420,13 +428,19 @@ class StockLotIntegrityPage(BasePage):
                 self._close_pending = False
                 self.shutdown_ready.emit()
 
-        QTimer.singleShot(0, _drop_refs)
+        QTimer.singleShot(0, self, _drop_refs)
 
     # ── Shutdown (mirrors DashboardPage) ─────────────────────────────
 
     def shutdown(self) -> bool:
-        if self._thread is None or not self._thread.isRunning():
+        # Truly idle — nothing to stop
+        if self._thread is None and not self._loading:
             return True
+        # Thread finished, deferred QTimer pending — timer is self-bound,
+        # auto-cancelled on page destruction.  Safe to proceed.
+        if self._thread is not None and not self._thread.isRunning():
+            return True
+        # Thread still running — normal shutdown path
         try:
             self._worker.finished.disconnect(self._on_data_ready)
         except (RuntimeError, TypeError):
