@@ -259,6 +259,28 @@ class TestNavigationRegistration:
             assert key in PAGE_CLASSES, f"Missing PAGE_CLASS for {key}"
             assert hasattr(PAGE_CLASSES[key], "build_ui")
 
+    def test_lazy_creation_no_duplicate(self, qapp, tmp_path):
+        """Navigate to page twice — same instance reused."""
+        from qt_app.main_window import MainWindow
+
+        mw = MainWindow()
+        try:
+            _spin(3)
+
+            mw.navigate_to("stock_lot_integrity")
+            p1 = mw._pages["stock_lot_integrity"]
+            _drain_initial_load(mw._pages["stock_lot_integrity"])
+
+            mw.navigate_to("dashboard")
+            mw.navigate_to("stock_lot_integrity")
+            p2 = mw._pages["stock_lot_integrity"]
+            assert p1 is p2
+
+            mw.close()
+            _spin(5)
+        finally:
+            pass  # MainWindow handles its own teardown
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Model-to-UI rendering tests
@@ -526,7 +548,8 @@ class TestFiltering:
 # Pagination tests
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestPagination:
+class TestPagePagination:
+    """Real-page pagination behavior — uses rendered rows and controls."""
 
     def test_pagination_0_rows(self):
         assert _paginate([], 1) == ([], 1, 1)
@@ -552,6 +575,75 @@ class TestPagination:
         items = [_fake_product(barcode="A")]
         page_items, total_pages, page = _paginate(items, 99)
         assert len(page_items) == 1 and total_pages == 1 and page == 1
+
+    def test_prev_next_and_count_indicator(self, qapp, tmp_path):
+        """Prev/next enablement and filtered count on a real page."""
+        db = str(tmp_path / "test.db")
+        conn = _make_db(db)
+        for i in range(55):
+            _add_product(conn, f"{i:04d}", f"Product {i}", 50)
+            _add_lot(conn, f"{i:04d}", 50, "2027-06-01")
+        conn.commit()
+        conn.close()
+
+        page = _make_page(db)
+        try:
+            assert page._page == 1
+            assert not page._prev_btn.isEnabled()
+            assert page._next_btn.isEnabled()
+            assert "Φιλτραρισμένα" in page._filtered_count_lbl.text()
+            assert "Σελίδα" in page._page_lbl.text()
+
+            page._next_btn.click()
+            _spin(3)
+            assert page._page == 2
+            assert page._prev_btn.isEnabled()
+            assert not page._next_btn.isEnabled()
+        finally:
+            _teardown_page(page)
+
+    def test_pagination_with_filter(self, qapp, tmp_path):
+        """Filter reduces pagination correctly on a real page."""
+        db = str(tmp_path / "test.db")
+        conn = _make_db(db)
+        for i in range(55):
+            _add_product(conn, f"{i:04d}", f"Product {i}", 50)
+            _add_lot(conn, f"{i:04d}", 50, "2027-06-01")
+        _add_product(conn, "EXP1", "Expired 1", 50)
+        _add_lot(conn, "EXP1", 50, "2025-01-01")
+        _add_product(conn, "EXP2", "Expired 2", 50)
+        _add_lot(conn, "EXP2", 50, "2025-01-01")
+        _add_product(conn, "EXP3", "Expired 3", 50)
+        _add_lot(conn, "EXP3", 50, "2025-01-01")
+        conn.commit()
+        conn.close()
+
+        page = _make_page(db)
+        try:
+            page._on_filter_changed(FILTER_KEYS.index("expired"))
+            _spin(3)
+            assert page._filtered_count_lbl.text().startswith("Φιλτραρισμένα: 3")
+            assert "Σελίδα 1 από 1" in page._page_lbl.text()
+        finally:
+            _teardown_page(page)
+
+    def test_page_clamping_from_real_page(self, qapp, tmp_path):
+        """Out-of-range page is clamped by the real page."""
+        db = str(tmp_path / "test.db")
+        conn = _make_db(db)
+        _add_product(conn, "A", "Alpha", 50)
+        _add_lot(conn, "A", 50, "2027-06-01")
+        conn.commit()
+        conn.close()
+
+        page = _make_page(db)
+        try:
+            page._page = 99
+            page._render_table()
+            _spin(3)
+            assert page._page == 1
+        finally:
+            _teardown_page(page)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -752,8 +844,8 @@ class TestWorkerLifecycle:
         finally:
             _teardown_page(page)
 
-    def test_stale_callback_does_not_clear_newer_worker(self, qapp, tmp_path):
-        """Generation A completes, B starts — A's late callback does not touch B."""
+    def test_old_deferred_events_do_not_clear_active_second_worker(self, qapp, tmp_path):
+        """Worker A completes.  Worker B (blocked) keeps its refs after event-pumping."""
         import qt_app.pages.stock_lot_integrity_page as mod
         _block_b = threading.Event()
         _b_started = threading.Event()
@@ -775,24 +867,29 @@ class TestWorkerLifecycle:
         conn.commit()
         conn.close()
 
-        page = _make_page(db)  # gen A completes
+        page = _make_page(db)  # worker A completes
         try:
             assert _is_idle(page)
 
             monkeypatch = pytest.MonkeyPatch()
             monkeypatch.setattr(mod, "load_stock_lot_integrity", _counting_loader)
 
-            # Start gen B (blocks)
+            # Start worker B (blocks)
             page.refresh()
             assert _wait_for(_b_started.is_set, timeout_ms=2000)
             assert page._loading
-            wrk_b = page._worker
-            thr_b = page._thread
+            worker_b = page._worker
+            thread_b = page._thread
 
-            # gen B is running — assert its refs are intact
-            assert wrk_b is not None
-            assert thr_b is not None
-            assert page._loading
+            # Pump events while B is blocked — refs must remain unchanged
+            for _ in range(20):
+                QCoreApplication.processEvents()
+                assert page._worker is worker_b
+                assert page._thread is thread_b
+                assert page._loading is True
+
+            # Exactly one B loader invocation
+            assert call_count == 1
 
             # Release B
             _block_b.set()

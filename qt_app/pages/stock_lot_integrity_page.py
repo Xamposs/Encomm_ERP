@@ -343,14 +343,12 @@ class StockLotIntegrityPage(BasePage):
     # ── Refresh (QThread-based, mirrors DashboardPage) ───────────────
 
     def refresh(self) -> None:
-        """Start a background load.  No-op when already loading."""
-        if self._loading:
+        """Start a background load.  No-op unless the page is truly IDLE."""
+        if self._loading or self._thread is not None or self._worker is not None:
             return
         self._loading = True
         self._set_controls_enabled(False)
         self._show_loading_state()
-
-        self._cleanup_worker()
 
         self._thread = QThread(self)
         self._worker = _StockLotIntegrityWorker(
@@ -419,15 +417,7 @@ class StockLotIntegrityPage(BasePage):
             self._close_pending = False
             self.shutdown_ready.emit()
 
-    # ── Cleanup / shutdown (mirrors DashboardPage) ───────────────────
-
-    def _cleanup_worker(self) -> None:
-        """Called at the start of refresh from IDLE state."""
-        if self._thread is not None and self._thread.isRunning():
-            self._thread.quit()
-            self._thread.wait(2000)
-        self._worker = None
-        self._thread = None
+    # ── Shutdown (mirrors DashboardPage) ─────────────────────────────
 
     def shutdown(self) -> bool:
         if self._thread is None or not self._thread.isRunning():
